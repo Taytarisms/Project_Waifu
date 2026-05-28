@@ -1,5 +1,6 @@
 # Project Waifu is a project that brings building an AI VTuber and "w-AI-fu" to life with customizations you can make for yourself in a dedicated UI!
-# You can run it completely online through API's or entirely Local on your PC. The best part? You can actually blend the two if you like - giving YOU as the end-user the power to build it into something your own!
+
+## You can run it completely online through API's or entirely Local on your PC. The best part? You can actually blend the two if you like - giving YOU as the end-user the power to build it into something your own!
 
 ## Overview
 Project Waifu is a project made for people to use as an on-stream companion or personal companion.
