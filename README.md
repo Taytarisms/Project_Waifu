@@ -29,7 +29,7 @@ https://www.twitch.tv/fellstartay
 - You **MUST** get your own API keys for the online services you decide to use. I do have dashboard keys inside the respective pages that'll lead you to the appropriate place to set-up an account.
 - You do NOT have to use VTube Studio and can use this app as a solely offline companion.
 - When downloading models from HuggingFace for Local LLM models, if it supports Vision, you **MUST** download the appropriate mmproj file (otherwise it will run ONLY in Text-Only mode):
-  <img width="467" height="203" alt="image" src="https://github.com/user-attachments/assets/485a21ae-7759-496a-952e-56970492590e" />
+-  <img width="467" height="203" alt="image" src="https://github.com/user-attachments/assets/485a21ae-7759-496a-952e-56970492590e" />
 
 
 # FAQ
