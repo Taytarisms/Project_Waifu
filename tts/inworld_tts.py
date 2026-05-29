@@ -1,0 +1,366 @@
+import asyncio
+import base64
+import json
+import time
+from io import BytesIO
+from typing import Any, Optional
+
+import pyaudio
+import requests
+from pydub import AudioSegment
+
+from files.system_setup.audio_tools import configure_audio_tools, tts_output_dir
+from files.system_setup.settings import get_auth, get_settings
+from files.system_setup.system_logger import Logger
+from files.main_loop import turn_control
+configure_audio_tools()
+OUTPUT_DIR = tts_output_dir("inworld")
+DEFAULT_MODEL_ID = "inworld-tts-1.5-mini"
+DEFAULT_VOICE_ID = "Ashley"
+DEFAULT_AUDIO_ENCODING = "MP3"
+DEFAULT_SAMPLE_RATE = 24000
+DEFAULT_BIT_RATE = 32000
+DEFAULT_DELIVERY_MODE = "BALANCED"
+_AUDIO = pyaudio.PyAudio()
+
+
+def request_interrupt() -> None:
+    turn_control.request_interrupt()
+
+def _setting(name: str, default: Any = "") -> Any:
+    try:
+        value = get_settings(name)
+    except Exception:
+        value = default
+    return default if value in ("", None) else value
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value in ("", None):
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"true", "1", "yes", "y", "on", "enabled"}
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        if value in ("", None):
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        if value in ("", None):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _output_device() -> Optional[int]:
+    raw = _setting("tts_output_device", None)
+    try:
+        return None if raw in ("", None, "System Default") else int(raw)
+    except Exception:
+        return None
+
+
+def check_api_key() -> Optional[str]:
+    api_key = get_auth("inworld", "token")
+    if not api_key:
+        Logger.warn("InWorld API key is not set. Add it from the InWorld TTS provider page.")
+        return None
+    return api_key
+
+
+def _active_voice_id(fallback: Optional[str] = None) -> str:
+    return str(
+        _setting("inworld_tts_voice_id", "")
+        or _setting("inworld_tts_voice", "")
+        or fallback
+        or DEFAULT_VOICE_ID
+    ).strip()
+
+
+def _active_model_id(fallback: Optional[str] = None) -> str:
+    return str(
+        _setting("inworld_tts_model_id", "")
+        or _setting("inworld_tts_model", "")
+        or fallback
+        or DEFAULT_MODEL_ID
+    ).strip()
+
+
+def _build_payload(text: str, voice_id: Optional[str] = None, model_id: Optional[str] = None) -> dict[str, Any]:
+    voice = _active_voice_id(voice_id)
+    model = _active_model_id(model_id)
+
+    audio_encoding = str(_setting("inworld_tts_audio_encoding", DEFAULT_AUDIO_ENCODING)).strip() or DEFAULT_AUDIO_ENCODING
+    sample_rate = _as_int(_setting("inworld_tts_sample_rate", DEFAULT_SAMPLE_RATE), DEFAULT_SAMPLE_RATE)
+    bit_rate = _as_int(_setting("inworld_tts_bit_rate", DEFAULT_BIT_RATE), DEFAULT_BIT_RATE)
+    language = str(_setting("inworld_tts_language", "") or "").strip()
+    delivery_mode = str(_setting("inworld_tts_delivery_mode", DEFAULT_DELIVERY_MODE) or "").strip().upper()
+    temperature = _as_float(_setting("inworld_tts_temperature", 1.0), 1.0)
+    apply_normalization = _as_bool(_setting("inworld_tts_apply_text_normalization", True), True)
+    timestamp_type = str(_setting("inworld_tts_timestamp_type", "") or "").strip()
+
+    payload: dict[str, Any] = {
+        "text": text,
+        "voiceId": voice,
+        "modelId": model,
+        "audioConfig": {
+            "audioEncoding": audio_encoding,
+        },
+        "applyTextNormalization": apply_normalization,
+    }
+
+    if sample_rate > 0:
+        payload["audioConfig"]["sampleRateHertz"] = sample_rate
+    if bit_rate > 0:
+        payload["audioConfig"]["bitRate"] = bit_rate
+    if language:
+        payload["audioConfig"]["language"] = language
+    if delivery_mode and delivery_mode != "DEFAULT":
+        payload["deliveryMode"] = delivery_mode
+
+    if temperature > 0:
+        payload["temperature"] = temperature
+
+    if timestamp_type and timestamp_type != "NONE":
+        payload["timestampType"] = timestamp_type
+
+    return payload
+
+
+def _extract_audio_from_event(event: dict[str, Any]) -> bytes:
+    candidates = [
+        event.get("audioContent"),
+        event.get("audio_content"),
+        event.get("result", {}).get("audioContent") if isinstance(event.get("result"), dict) else None,
+        event.get("result", {}).get("audio_content") if isinstance(event.get("result"), dict) else None,
+    ]
+
+    for item in candidates:
+        if not item:
+            continue
+        if isinstance(item, bytes):
+            return item
+        if isinstance(item, str):
+            try:
+                return base64.b64decode(item)
+            except Exception:
+                continue
+
+    return b""
+
+
+def _audio_segment_from_bytes(audio_bytes: bytes, payload: dict[str, Any]) -> AudioSegment:
+    audio_config = payload.get("audioConfig", {}) if isinstance(payload, dict) else {}
+    encoding = str(audio_config.get("audioEncoding", DEFAULT_AUDIO_ENCODING)).strip().upper()
+    sample_rate = _as_int(audio_config.get("sampleRateHertz", DEFAULT_SAMPLE_RATE), DEFAULT_SAMPLE_RATE)
+
+    if encoding in {"PCM", "LINEAR16", "LINEAR_16"}:
+        return AudioSegment(
+            data=audio_bytes,
+            sample_width=2,
+            frame_rate=sample_rate,
+            channels=1,
+        )
+
+    # MP3 and other encoded formats are delegated to ffmpeg/pydub.
+    fmt = "mp3" if encoding in {"MP3", "MPEG"} else None
+    return AudioSegment.from_file(BytesIO(audio_bytes), format=fmt)
+
+
+def _play_audio_segment(audio_segment: AudioSegment) -> None:
+    output_device = _output_device()
+    stream = None
+    chunk_size = max(1, audio_segment.frame_width * 2048)
+
+    try:
+        stream = _AUDIO.open(
+            format=_AUDIO.get_format_from_width(audio_segment.sample_width),
+            channels=audio_segment.channels,
+            rate=audio_segment.frame_rate,
+            output=True,
+            output_device_index=output_device,
+        )
+        raw = audio_segment.raw_data
+        for offset in range(0, len(raw), chunk_size):
+            if turn_control.is_interrupted():
+                break
+            stream.write(raw[offset:offset + chunk_size])
+    finally:
+        if stream is not None:
+            try:
+                stream.stop_stream()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+def _notify_captions(audio_segment: AudioSegment) -> None:
+    try:
+        wav_path = OUTPUT_DIR / "inworld_last_caption.wav"
+        audio_segment.export(str(wav_path), format="wav")
+        from files.closed_captions import caption_coordinator
+        caption_coordinator.audio_ready(str(wav_path))
+    except Exception as exc:
+        Logger.warn(f"InWorld caption timing failed: {exc}")
+        try:
+            from files.closed_captions import caption_coordinator
+            caption_coordinator.audio_ready_with_duration(max(600, int(len(audio_segment))))
+        except Exception:
+            pass
+
+
+def _stream_tts_sync(api_key: str, text: str, voice_id: Optional[str], model_id: Optional[str]) -> Optional[dict[str, Any]]:
+    if turn_control.is_interrupted():
+        return None
+    url = "https://api.inworld.ai/tts/v1/voice:stream"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {api_key}",
+    }
+
+    payload = _build_payload(text=text, voice_id=voice_id, model_id=model_id)
+
+    use_warmup = _as_bool(_setting("inworld_tts_warmup", True), True)
+
+    session = requests.Session()
+    session.headers.update(headers)
+
+    try:
+        if use_warmup:
+            warmup_payload = dict(payload)
+            warmup_payload["text"] = "hi"
+            try:
+                session.post(url, json=warmup_payload, timeout=15)
+            except Exception:
+                pass
+
+        start_time = time.time()
+        ttfb = None
+        audio_bytes = bytearray()
+        event_count = 0
+
+        with session.post(url, json=payload, stream=True, timeout=90) as response:
+            response.raise_for_status()
+
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if turn_control.is_interrupted():
+                    return None
+                if not raw_line:
+                    continue
+
+                line = raw_line.strip()
+                if line.startswith("data:"):
+                    line = line[len("data:"):].strip()
+
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                chunk = _extract_audio_from_event(event)
+                if not chunk:
+                    continue
+
+                if ttfb is None:
+                    ttfb = time.time() - start_time
+
+                event_count += 1
+                audio_bytes.extend(chunk)
+
+        total_time = time.time() - start_time
+
+        if not audio_bytes:
+            Logger.warn("InWorld TTS returned no audio bytes.")
+            return None
+
+        audio_segment = _audio_segment_from_bytes(bytes(audio_bytes), payload)
+        _notify_captions(audio_segment)
+        _play_audio_segment(audio_segment)
+
+        return {
+            "ttfb": ttfb,
+            "total_time": total_time,
+            "audio_bytes": len(audio_bytes),
+            "events": event_count,
+            "voice_id": payload.get("voiceId"),
+            "model_id": payload.get("modelId"),
+            "duration_ms": len(audio_segment),
+        }
+
+    except requests.exceptions.RequestException as e:
+        Logger.warn(f"InWorld HTTP error: {e}")
+        if getattr(e, "response", None) is not None:
+            try:
+                Logger.warn(f"InWorld error details: {e.response.json()}")
+            except Exception:
+                Logger.warn(f"InWorld response text: {e.response.text}")
+        return None
+    except Exception as e:
+        Logger.warn(f"InWorld TTS failed: {e}")
+        return None
+    finally:
+        session.close()
+
+
+async def stream_tts(api_key: Optional[str], text: str, voice_id: Optional[str] = None, model_id: Optional[str] = None):
+    api_key = api_key or check_api_key()
+    if not api_key:
+        return None
+
+    return await asyncio.to_thread(_stream_tts_sync, api_key, text, voice_id, model_id)
+
+
+def main():
+    print("InWorld TTS Low-Latency HTTP Streaming")
+    print("=" * 45)
+
+    api_key = check_api_key()
+    if not api_key:
+        return 1
+
+    text = "Life moves pretty fast. Look around once in a while, or you might miss it."
+    voice_id = _active_voice_id()
+    model_id = _active_model_id()
+
+    print(f"   Text: {text!r}")
+    print(f"  Voice: {voice_id}")
+    print(f"  Model: {model_id}")
+    print("\nWarming up connection, then generating audio...\n")
+
+    try:
+        result = asyncio.run(stream_tts(api_key, text, voice_id, model_id))
+
+        if result:
+            ttfb = result.get("ttfb") or 0
+            print(f"TTFB:         {ttfb * 1000:.1f} ms")
+            print(f"Total time:   {result['total_time'] * 1000:.1f} ms")
+            print(f"Audio bytes:  {result['audio_bytes']}")
+            print(f"Duration:     {result['duration_ms']} ms")
+        else:
+            print("Synthesis failed.")
+            return 1
+
+    except Exception as e:
+        print(f"\nLatency test failed: {e}")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
