@@ -7,7 +7,6 @@ Project Waifu is a project made for people to use as an on-stream companion or p
 - Host your own AI Vtuber stream. The AI can respond to stream chat with capabilities to react to stream events using Twitchio's Eventsubs.
 - Hear you directly from your mic or see your screen/images inside the UI.
 - Have a face-to-face converstaion with an AI Vtuber, whose personality and character description can be customized to your liking.
-- Lastly, you can use this 
 
 ## Installation
 I have intentionally shipped this with an embedded Python (3.13) so you don't have to install it and include other things like ffmpeg/ffmprobe for audio playback.
@@ -24,7 +23,7 @@ https://vb-audio.com/Cable/ (In your use case, you may only need two)
 - I've got a discord server where you can try this tool with other people, troubleshoot your issues and suggest features:
 https://discord.gg/5yqS3Hem4S
 - I also stream occasional updates on this app and you can follow me here:
-https://www.twitch.tv/fellstartay
+  https://www.twitch.tv/fellstartay
 
 ## Additional details
 - You **MUST** get your own API keys for the online services you decide to use. I do have dashboard keys inside the respective pages that'll lead you to the appropriate place to set-up an account.
@@ -43,6 +42,7 @@ https://www.twitch.tv/fellstartay
  ### Speech to Text Input: "thank you, you, I'm gonna, etc." ### 
 The transcriber often transcribes silence into "you". Make sure you selected the correct input device in settings and check the settings in the "STT" tab. Make sure you set everything correctly.
 
+## Dedication
 
-I would like to give a massive shoutout to:
-The entire AIVT Community as a whole for inspiring me to go ahead and create my own spin on making this project happen!
+**I would like to give a massive shoutout to:
+The entire AIVT Community as a whole for inspiring me to go ahead and create my own spin on making this project happen!**
