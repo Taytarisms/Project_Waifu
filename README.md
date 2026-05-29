@@ -20,9 +20,9 @@ You can buy the audio cables here:
 https://vb-audio.com/Cable/ (In your use case, you may only need two)
 
 ## Links
-I've got a discord server where you can try this tool with other people, troubleshoot your issues and suggest features:
+- I've got a discord server where you can try this tool with other people, troubleshoot your issues and suggest features:
 https://discord.gg/5yqS3Hem4S
-I also stream occasional updates on this app and you can follow me here:
+- I also stream occasional updates on this app and you can follow me here:
 https://www.twitch.tv/fellstartay
 
 ## Additional details
@@ -33,11 +33,11 @@ https://www.twitch.tv/fellstartay
 
 
 # FAQ
-Q: How do I know which Local LLM is best for my machine?
-A: Depends on what GPU you have inside the "Browse HuggingFace" tab - I have included a metric to measure your GPU's available VRAM. Then the corresponding model cards will tell you if the model is compatible or not.
+- Q: How do I know which Local LLM is best for my machine?
+- A: Depends on what GPU you have inside the "Browse HuggingFace" tab - I have included a metric to measure your GPU's available VRAM. Then the corresponding model cards will tell you if the model is compatible or not.
 
-Q: Do I need to worry about memories fading away?
-A: Memories will **NOT** fade unless you remove the "chroma_memories" folder inside the main memories folder.
+- Q: Do I need to worry about memories fading away?
+- A: Memories will **NOT** fade unless you remove the "chroma_memories" folder inside the main memories folder.
 
  ### Speech to Text Input: "thank you, you, I'm gonna, etc." ### 
 The transcriber often transcribes silence into "you". Make sure you selected the correct input device in settings and check the settings in the "STT" tab. Make sure you set everything correctly.
