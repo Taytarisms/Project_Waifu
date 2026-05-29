@@ -1,12 +1,13 @@
-# Project Waifu is a project that brings building an AI VTuber and "w-AI-fu" to life with customizations you can make for yourself in a dedicated UI!
+# Project Waifu is meant to bring building an AI VTuber or "w-AI-fu" to life with customizations you can make for yourself in a dedicated UI!
 
 ## You can run it completely online through API's or entirely Local on your PC. The best part? You can actually blend the two if you like - giving YOU as the end-user the power to build it into something your own!
 
 ## Overview
-Project Waifu is a project made for people to use as an on-stream companion or personal companion.
+Project Waifu is a project made for people to use as an on-stream companion or personal use offline companion!
 - Host your own AI Vtuber stream. The AI can respond to stream chat with capabilities to react to stream events using Twitchio's Eventsubs.
 - Hear you directly from your mic or see your screen/images inside the UI.
 - Have a face-to-face converstaion with an AI Vtuber, whose personality and character description can be customized to your liking.
+- Lastly, you can use this 
 
 ## Installation
 I have intentionally shipped this with an embedded Python (3.13) so you don't have to install it and include other things like ffmpeg/ffmprobe for audio playback.
