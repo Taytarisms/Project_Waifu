@@ -14,7 +14,7 @@ All you'll need to do is run the "setup.bat" file and let it install then run th
 
 ## Voice Setup
 
-https://youtu.be/yP_m6bQbSbE
+https://github.com/user-attachments/assets/63672427-165d-41b7-839c-893b0aff3358
 
 ## Usage
 For info on how to use the program, see the full demo video: (insert final link here)
