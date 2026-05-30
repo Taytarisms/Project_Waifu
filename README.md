@@ -12,6 +12,10 @@ Project Waifu is a project made for people to use as an on-stream companion or p
 I have intentionally shipped this with an embedded Python (3.13) so you don't have to install it and include other things like ffmpeg/ffmprobe for audio playback.
 All you'll need to do is run the "setup.bat" file and let it install then run the "start_bot.bat" file and the app is yours to construct as you like!
 
+## Voice Setup
+
+https://youtu.be/yP_m6bQbSbE
+
 ## Usage
 For info on how to use the program, see the full demo video: (insert final link here)
 
