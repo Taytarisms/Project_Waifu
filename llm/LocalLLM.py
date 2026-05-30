@@ -366,7 +366,7 @@ def trim_history(max_messages: int = 20) -> None:
 @dataclass(frozen=True)
 class ModelConfig:
     models_dir:              str
-    model_filename:          str
+    model_filename:          Optional[str]
     family:                  ModelFamily
     system_prompt_filename:  str
     mmproj_filename:         Optional[str] = None
@@ -407,10 +407,24 @@ def llm_directory() -> str:
 
 
 def resolve_model_path(models_dir: str, filename: str) -> str:
+    filename = str(filename or "").strip()
+    if not filename:
+        return os.path.join(models_dir, filename)
+
+    if os.path.isabs(filename) and os.path.exists(filename):
+        return filename
+
+    direct = os.path.normpath(os.path.join(models_dir, filename))
+    if os.path.exists(direct):
+        return direct
+
+    wanted = os.path.basename(filename)
+    wanted_lower = wanted.lower()
     for root, _dirs, files in os.walk(models_dir):
-        if filename in files:
-            return os.path.join(root, filename)
-    return os.path.join(models_dir, filename)
+        for fname in files:
+            if fname == wanted or fname.lower() == wanted_lower:
+                return os.path.join(root, fname)
+    return direct
 
 def resolve_mmproj(model_path: str, mmproj_filename: Optional[str], models_dir: str) -> Optional[str]:
     if not mmproj_filename:
@@ -435,6 +449,13 @@ def _settings_bool(key: str, default: bool = False) -> bool:
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
+def _setting_value(key: str, default: Any = None) -> Any:
+    value = get_settings(key)
+    return default if value in ("", None) else value
+
+def _settings_int(key: str, default: int) -> int:
+    return int(_setting_value(key, default))
+
 def _settings_family() -> ModelFamily:
     raw = get_settings("local_model_family") or "gemma4"
     try:
@@ -444,27 +465,78 @@ def _settings_family() -> ModelFamily:
         return ModelFamily.AUTO
 
 
-DEFAULT_CONFIG = ModelConfig(
-    models_dir=models_directory(),
-    model_filename=get_settings("local_model_filename") or None,
-    mmproj_filename=get_settings("local_mmproj_filename") or None,
-    system_prompt_filename=get_settings("local_system_prompt_filename") or "system_message_local.txt",
-    family=_settings_family(),
-    n_ctx=int(get_settings("local_n_ctx") or 16384),
-    n_gpu_layers=int(get_settings("local_n_gpu_layers") or -1),
-    n_batch=int(get_settings("local_n_batch") or 1024),
-    n_threads=int(get_settings("local_n_threads") or 12),
-    main_gpu=int(get_settings("local_main_gpu") or 0),
-    seed=int(get_settings("local_seed") or -1),
-    screen_max_dim=int(get_settings("local_screen_max_dim") or 960),
-    screenshot_quality=int(get_settings("local_screenshot_quality") or 82),
-    screenshot_subsampling=get_settings("local_screenshot_subsampling") or "4:2:0",
-    enable_thinking=_settings_bool("local_enable_thinking", False),
-)
+def build_config_from_settings() -> ModelConfig:
+    return ModelConfig(
+        models_dir=models_directory(),
+        model_filename=_setting_value("local_model_filename", None),
+        mmproj_filename=_setting_value("local_mmproj_filename", None),
+        system_prompt_filename=_setting_value("local_system_prompt_filename", "system_message_local.txt"),
+        family=_settings_family(),
+        n_ctx=_settings_int("local_n_ctx", 16384),
+        n_gpu_layers=_settings_int("local_n_gpu_layers", -1),
+        n_batch=_settings_int("local_n_batch", 1024),
+        n_threads=_settings_int("local_n_threads", 12),
+        main_gpu=_settings_int("local_main_gpu", 0),
+        seed=_settings_int("local_seed", -1),
+        screen_max_dim=_settings_int("local_screen_max_dim", 960),
+        screenshot_quality=_settings_int("local_screenshot_quality", 82),
+        screenshot_subsampling=_setting_value("local_screenshot_subsampling", "4:2:0"),
+        enable_thinking=_settings_bool("local_enable_thinking", False),
+    )
+
+def refresh_default_config() -> ModelConfig:
+    global DEFAULT_CONFIG
+    DEFAULT_CONFIG = build_config_from_settings()
+    return DEFAULT_CONFIG
+
+
+DEFAULT_CONFIG = build_config_from_settings()
 
 
 def safe_join(base: str, name: str) -> str:
     return os.path.normpath(os.path.join(base, name))
+
+def _positive_int(value: Any, default: int, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    if parsed < minimum:
+        return default
+    return parsed
+
+def _build_llama_kwargs(
+    config: ModelConfig,
+    model_path: str,
+    chat_handler: Any,
+    family: ModelFamily,
+) -> Dict[str, Any]:
+    n_ctx = _positive_int(config.n_ctx, 512, minimum=512)
+    n_batch = _positive_int(config.n_batch, min(2048, n_ctx), minimum=1)
+
+    kwargs: Dict[str, Any] = dict(
+        model_path=model_path,
+        n_ctx=n_ctx,
+        n_gpu_layers=int(config.n_gpu_layers),
+        n_batch=n_batch,
+        n_ubatch=min(512, n_batch),
+        main_gpu=int(config.main_gpu),
+        seed=int(config.seed),
+        verbose=False,
+        logits_all=False,
+    )
+
+    n_threads = int(config.n_threads or 0)
+    if n_threads > 0:
+        kwargs["n_threads"] = n_threads
+
+    if chat_handler is not None:
+        kwargs["chat_handler"] = chat_handler
+
+    if family in (ModelFamily.GEMMA4,):
+        kwargs["swa_full"] = True
+
+    return kwargs
 
 async def cleaned_response(text: str) -> str:
     if not text:
@@ -545,6 +617,7 @@ class LocalLLM:
     def __init__(self, config: ModelConfig):
         self.config = config
         self.spec = FAMILY_REGISTRY[config.family]
+        self.effective_n_ctx = config.n_ctx
 
         if not config.model_filename:
             raise FileNotFoundError(
@@ -556,6 +629,7 @@ class LocalLLM:
         ensure_exists(self.model_path, f"{config.family.value} model")
 
         self.mmproj_path: Optional[str] = None
+        effective_family = config.family
 
         if self.spec.needs_mmproj:
             self.mmproj_path = resolve_mmproj(
@@ -565,22 +639,21 @@ class LocalLLM:
             )
 
             if not self.mmproj_path:
-                raise FileNotFoundError(
-                    f"[LocalLLM] Family '{config.family.value}' requires an mmproj file, "
-                    f"but none was found.\n"
-                    f"Model path: {self.model_path}\n"
-                    f"Configured mmproj filename: {config.mmproj_filename!r}\n\n"
-                    f"Either select a matching mmproj file, or switch local_model_family "
-                    f"to a text-only family like 'qwen35' or 'auto'."
+                print(
+                    f"[LocalLLM] Family '{config.family.value}' needs an mmproj file, "
+                    f"but none was found. Loading '{os.path.basename(self.model_path)}' "
+                    "in AUTO text-only mode."
                 )
-
-            ensure_exists(self.mmproj_path, f"{config.family.value} mmproj")
+                effective_family = ModelFamily.AUTO
+                self.spec = FAMILY_REGISTRY[effective_family]
+            else:
+                ensure_exists(self.mmproj_path, f"{config.family.value} mmproj")
 
         self.token_cache:          Dict[str, int] = {}
         self.cached_system_prompt: Optional[str]  = None
         self.cached_system_tokens: int            = 0
 
-        print(f"[LocalLLM] Family: {config.family.value}")
+        print(f"[LocalLLM] Family: {effective_family.value}")
         print(f"[LocalLLM] Model:  {self.model_path}")
         if self.mmproj_path:
             print(f"[LocalLLM] mmproj: {self.mmproj_path}")
@@ -590,30 +663,55 @@ class LocalLLM:
         load_started = time.time()
 
         chat_handler = build_chat_formatter(
-            family=config.family,
+            family=effective_family,
             mmproj_path=self.mmproj_path,
             enable_thinking=config.enable_thinking,
         )
 
-        llama_kwargs: Dict[str, Any] = dict(
+        llama_kwargs = _build_llama_kwargs(
+            config=config,
             model_path=self.model_path,
-            n_ctx=config.n_ctx,
-            n_gpu_layers=config.n_gpu_layers,
-            n_batch=config.n_batch,
-            n_threads=config.n_threads,
-            main_gpu=config.main_gpu,
-            seed=config.seed,
-            verbose=False,
-            logits_all=False,
+            chat_handler=chat_handler,
+            family=effective_family,
         )
         if chat_handler is not None:
             llama_kwargs["chat_handler"] = chat_handler
 
         # swa_full is only valid/useful on Gemma 4 – guard it
-        if config.family in (ModelFamily.GEMMA4,):
+        if effective_family in (ModelFamily.GEMMA4,):
             llama_kwargs["swa_full"] = True
 
-        self.llm = Llama(**llama_kwargs)
+        if config.n_batch <= 0:
+            print(f"[LocalLLM] Batch size <= 0; using runtime n_batch={llama_kwargs['n_batch']}.")
+        if config.n_threads <= 0:
+            print("[LocalLLM] Threads <= 0; letting llama.cpp choose the thread count.")
+
+        self.effective_n_ctx = int(llama_kwargs["n_ctx"])
+        try:
+            self.llm = Llama(**llama_kwargs)
+        except ValueError as e:
+            if "Failed to create context with model" not in str(e):
+                raise
+            fallback_kwargs = dict(llama_kwargs)
+            fallback_kwargs["n_ctx"] = min(int(fallback_kwargs.get("n_ctx", 512)), 8192)
+            fallback_kwargs["n_batch"] = min(int(fallback_kwargs.get("n_batch", 2048)), 512)
+            fallback_kwargs["n_ubatch"] = min(
+                int(fallback_kwargs.get("n_ubatch", 512)),
+                fallback_kwargs["n_batch"],
+            )
+            print(
+                "[LocalLLM] Context creation failed; retrying with "
+                f"n_ctx={fallback_kwargs['n_ctx']}, n_batch={fallback_kwargs['n_batch']}."
+            )
+            try:
+                self.llm = Llama(**fallback_kwargs)
+                self.effective_n_ctx = int(fallback_kwargs["n_ctx"])
+            except ValueError:
+                cpu_kwargs = dict(fallback_kwargs)
+                cpu_kwargs["n_gpu_layers"] = 0
+                print("[LocalLLM] Retry failed; retrying with CPU-only offload.")
+                self.llm = Llama(**cpu_kwargs)
+                self.effective_n_ctx = int(cpu_kwargs["n_ctx"])
 
         if self.monitor and load_before:
             load_after = self.monitor.snapshot()
@@ -682,9 +780,10 @@ class LocalLLM:
             return messages
 
         system_tokens = self.count_tokens(self.extract_message(system_msg))
-        available     = self.config.n_ctx - system_tokens - reserve
+        context_size  = int(getattr(self, "effective_n_ctx", self.config.n_ctx) or self.config.n_ctx)
+        available     = context_size - system_tokens - reserve
         if available < 512:
-            available = max(512, self.config.n_ctx // 2)
+            available = max(512, context_size // 2)
 
         current_tokens  = 0
         kept: List[Dict[str, Any]] = []
@@ -896,6 +995,13 @@ system_message       = date_correct
 vl_base: Optional[LocalLLM] = None
 
 
+def reset_local_model() -> None:
+    global vl_base
+    vl_base = None
+    clear_history()
+    refresh_default_config()
+
+
 def reload_system_message(force: bool = True) -> str:
     global system_message
     prompt_filename = get_settings("local_system_prompt_filename") or DEFAULT_CONFIG.system_prompt_filename
@@ -916,10 +1022,15 @@ def reload_system_message(force: bool = True) -> str:
 
 async def local_init() -> LocalLLM:
     global vl_base
-    if vl_base is not None:
-        return vl_base
+    config = refresh_default_config()
 
-    vl_base = LocalLLM(DEFAULT_CONFIG)
+    if vl_base is not None and vl_base.config == config:
+        return vl_base
+    if vl_base is not None:
+        clear_history()
+        vl_base = None
+
+    vl_base = LocalLLM(config)
     reload_system_message(force=True)
     vl_base.set_static_prompt(system_message)
     vl_base.warmup_system_prompt()
