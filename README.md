@@ -1,3 +1,7 @@
+## Demo
+
+https://github.com/user-attachments/assets/78c272e9-b965-413f-9c21-7d2cd50efc60
+
 # Project Waifu is meant to bring building an AI VTuber or "w-AI-fu" to life with customizations you can make for yourself in a dedicated UI!
 
 ## You can run it completely online through API's or entirely Local on your PC. The best part? You can actually blend the two if you like - giving YOU as the end-user the power to build it into something your own!
