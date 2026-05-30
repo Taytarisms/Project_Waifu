@@ -28,8 +28,10 @@ You can buy the audio cables here:
 https://vb-audio.com/Cable/ (In your use case, you may only need two)
 
 ## Links
+<img width="5000" height="5000" alt="vecteezy_discord-logo-png-discord-icon-transparent-png_18930718" src="https://github.com/user-attachments/assets/b47aacc2-c551-4997-b776-a27d33440582" />
 - I've got a discord server where you can try this tool with other people, troubleshoot your issues and suggest features:
 https://discord.gg/5yqS3Hem4S
+<img width="5000" height="5000" alt="vecteezy_twitch-logo-png-twitch-icon-transparent-png_18930502" src="https://github.com/user-attachments/assets/a7d9c61a-51e1-41d6-b0a6-e376bb603846" />
 - I also stream occasional updates on this app and you can follow me here:
   https://www.twitch.tv/fellstartay
 
