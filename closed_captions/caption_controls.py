@@ -8,6 +8,7 @@ from files.closed_captions.closed_captions import (
     is_typed_mode as _cc_is_typed_mode,
     SOURCE_NARRATOR,
     _caption_file_path,
+    default_caption_file_path,
 )
 
 def status_text() -> str:
@@ -48,7 +49,15 @@ def set_caption_llm_replies(enabled: bool) -> None:
     save_settings("captions_for_llm_replies", bool(enabled))
 
 def set_file_path(path: str) -> None:
-    save_settings("captions_file_path", str(path or "").strip())
+    raw = str(path or "").strip()
+    try:
+        selected = raw.replace("\\", "/").rstrip("/")
+        default = str(default_caption_file_path()).replace("\\", "/").rstrip("/")
+        if selected.lower() == default.lower():
+            raw = ""
+    except Exception:
+        pass
+    save_settings("captions_file_path", raw)
 
 def set_wrap_width(width: int) -> None:
     try:

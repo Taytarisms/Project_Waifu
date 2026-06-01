@@ -1,5 +1,4 @@
 import asyncio
-import os
 import textwrap
 import threading
 from pathlib import Path
@@ -22,6 +21,12 @@ _typed_interrupt = threading.Event()
 
 _DEFAULT_WRAP_WIDTH = 60
 _DEFAULT_WINDOW_LINES = 2
+
+def app_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+def default_caption_file_path() -> Path:
+    return app_root() / _DEFAULT_FILE
 
 def _get_bool_setting(name: str, default: bool = False) -> bool:
     try:
@@ -77,8 +82,13 @@ def _format_for_display(text: str) -> str:
 def _caption_file_path() -> Path:
     raw = get_settings("captions_file_path")
     if raw:
-        return Path(str(raw)).expanduser()
-    return Path(os.getcwd()) / _DEFAULT_FILE
+        path = Path(str(raw)).expanduser()
+        if not path.is_absolute():
+            return app_root() / path
+        if path.name == _DEFAULT_FILE and path.parent.name == app_root().name and path.parent != app_root():
+            return default_caption_file_path()
+        return path
+    return default_caption_file_path()
 
 def _source_enabled(source: str) -> bool:
     if source == SOURCE_CLEAR:
