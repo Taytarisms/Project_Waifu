@@ -1,8 +1,10 @@
+from dataclasses import replace
 from typing import Optional
 import re
 
 from files.system_setup.settings import get_bool_setting, get_settings
 from files.system_setup.system_logger import Logger
+from files.system_setup.gpu_compat import detect_nvidia_compute_capability
 
 try:
     from files.main_loop.main_loop import message_queue
@@ -263,10 +265,20 @@ def handle_stt_text(text: str, is_partial: bool = False):
 
 
 def build_local_config():
+    device = _setting("stt_device", "cuda")
+    compute_type = _setting("stt_compute_type", "float16")
+    if device == "cuda":
+        if detect_nvidia_compute_capability() is None:
+            Logger.warn("Local Whisper: no CUDA-capable NVIDIA GPU found; falling back to CPU.")
+            device = "cpu"
+
+        if device == "cpu" and str(compute_type).lower() == "float16":
+            compute_type = "int8"
+
     return STTConfig(
-        device=_setting("stt_device", "cuda"),
+        device=device,
         model_name=_setting("stt_model_name", "tiny"),
-        compute_type=_setting("stt_compute_type", "float16"),
+        compute_type=compute_type,
         vad_aggressiveness=int(_setting("stt_vad_aggressiveness", 1)),
         pre_speech_ms=int(_setting("stt_pre_speech_ms", 1000)),
         post_speech_ms=int(_setting("stt_post_speech_ms", 600)),
@@ -349,7 +361,22 @@ def start_stt(on_text=None) -> bool:
             return False
 
         active_engine = engine
-        active_core.start(on_text=callback)
+        try:
+            active_core.start(on_text=callback)
+        except Exception:
+            if engine != "Local Whisper" or getattr(active_core.cfg, "device", "") != "cuda":
+                raise
+            Logger.warn("Local Whisper CUDA start failed; retrying CPU as the final fallback.")
+            try:
+                active_core.stop()
+            except Exception:
+                pass
+            cpu_cfg = replace(active_core.cfg, device="cpu")
+            if str(cpu_cfg.compute_type).lower() == "float16":
+                cpu_cfg.compute_type = "int8"
+            active_core = STTCore(input_device_index=device_index, cfg=cpu_cfg)
+            active_core.start(on_text=callback)
+
         _set_ptt_active(False)
         _ptt_pressed_keys.clear()
         if _is_push_to_talk():

@@ -1,5 +1,6 @@
 import customtkinter as ctk
 from tkinter import filedialog
+from pathlib import Path
 
 from files.ui import theme
 from files.ui.components.header import SteamHeader
@@ -402,20 +403,24 @@ class CaptionsSettingsPage(ctk.CTkFrame):
         self.status_label.configure(text=caption_controls.status_text())
 
     def _on_browse(self):
+        current_path = caption_controls.get_file_path()
         path = filedialog.asksaveasfilename(
             title="Choose caption file location",
             defaultextension=".txt",
+            initialdir=str(Path(current_path).parent),
             initialfile="closed_captions.txt",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
         )
         if path:
             self.path_var.set(path)
             caption_controls.set_file_path(path)
+            self.path_var.set(caption_controls.get_file_path())
             Logger.print(f"Captions file path set to: {path}")
 
     def _on_save_path(self):
         path = self.path_var.get().strip()
         caption_controls.set_file_path(path)
+        self.path_var.set(caption_controls.get_file_path())
         Logger.print(f"Captions file path set to: {path or '(default)'}")
 
     def _on_wrap_slide(self, value):

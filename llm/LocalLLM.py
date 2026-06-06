@@ -10,24 +10,17 @@ from datetime import datetime
 from PIL import Image, ImageOps
 import mss
 from llama_cpp import Llama
-from llama_cpp.llama_chat_format import (
-    Llava15ChatHandler,
-    Llava16ChatHandler,
-    MoondreamChatHandler,
-    NanoLlavaChatHandler,
-    Llama3VisionAlphaChatHandler,
-    MiniCPMv26ChatHandler,
-    MiniCPMv45ChatHandler,
-    Gemma3ChatHandler,
-    Gemma4ChatHandler,
-    GLM41VChatHandler,
-    GLM46VChatHandler,
-    LFM2VLChatHandler,
-    Qwen25VLChatHandler,
-    Qwen3VLChatHandler,
-) # base class (for type hints)
+try:
+    from llama_cpp import llama_chat_format as _llama_chat_format
+except Exception:
+    _llama_chat_format = None
 import psutil
 from files.system_setup.settings import get_settings
+from files.system_setup.gpu_compat import (
+    cuda13_support_message,
+    detect_nvidia_compute_capability,
+    should_force_llama_cpp_cpu,
+)
 import re
 
 try:
@@ -36,6 +29,28 @@ try:
 except Exception:
     pynvml = None
     NVML_AVAILABLE = False
+
+
+def _chat_handler_class(name: str) -> Optional[type]:
+    if _llama_chat_format is None:
+        return None
+    return getattr(_llama_chat_format, name, None)
+
+
+Llava15ChatHandler = _chat_handler_class("Llava15ChatHandler")
+Llava16ChatHandler = _chat_handler_class("Llava16ChatHandler")
+MoondreamChatHandler = _chat_handler_class("MoondreamChatHandler")
+NanoLlavaChatHandler = _chat_handler_class("NanoLlavaChatHandler")
+Llama3VisionAlphaChatHandler = _chat_handler_class("Llama3VisionAlphaChatHandler")
+MiniCPMv26ChatHandler = _chat_handler_class("MiniCPMv26ChatHandler")
+MiniCPMv45ChatHandler = _chat_handler_class("MiniCPMv45ChatHandler")
+Gemma3ChatHandler = _chat_handler_class("Gemma3ChatHandler")
+Gemma4ChatHandler = _chat_handler_class("Gemma4ChatHandler")
+GLM41VChatHandler = _chat_handler_class("GLM41VChatHandler")
+GLM46VChatHandler = _chat_handler_class("GLM46VChatHandler")
+LFM2VLChatHandler = _chat_handler_class("LFM2VLChatHandler")
+Qwen25VLChatHandler = _chat_handler_class("Qwen25VLChatHandler")
+Qwen3VLChatHandler = _chat_handler_class("Qwen3VLChatHandler")
 
 ########################
 ####----------------####
@@ -297,6 +312,11 @@ FAMILY_REGISTRY: Dict[ModelFamily, FamilySpec] = {
 def build_chat_formatter(family: ModelFamily, mmproj_path: Optional[str], enable_thinking: bool):
     spec = FAMILY_REGISTRY[family]
     if spec.handler_class is None:
+        if spec.is_vision:
+            print(
+                f"[LocalLLM] llama-cpp-python does not expose a handler for "
+                f"family '{family.value}'. Falling back to the GGUF embedded template."
+            )
         return None  # AUTO – Llama will use the GGUF's embedded template
 
     base_cls = spec.handler_class
@@ -513,11 +533,22 @@ def _build_llama_kwargs(
 ) -> Dict[str, Any]:
     n_ctx = _positive_int(config.n_ctx, 512, minimum=512)
     n_batch = _positive_int(config.n_batch, min(2048, n_ctx), minimum=1)
+    n_gpu_layers = int(config.n_gpu_layers)
+    if n_gpu_layers != 0:
+        if detect_nvidia_compute_capability() is None:
+            print("[LocalLLM] No NVIDIA CUDA-capable GPU found; using CPU offload.")
+            n_gpu_layers = 0
+        elif should_force_llama_cpp_cpu():
+            message = cuda13_support_message()
+            if message:
+                print(f"[LocalLLM] {message}")
+            print("[LocalLLM] Forcing n_gpu_layers=0 for this llama-cpp CUDA 13 build.")
+            n_gpu_layers = 0
 
     kwargs: Dict[str, Any] = dict(
         model_path=model_path,
         n_ctx=n_ctx,
-        n_gpu_layers=int(config.n_gpu_layers),
+        n_gpu_layers=n_gpu_layers,
         n_batch=n_batch,
         n_ubatch=min(512, n_batch),
         main_gpu=int(config.main_gpu),
@@ -537,6 +568,36 @@ def _build_llama_kwargs(
         kwargs["swa_full"] = True
 
     return kwargs
+
+
+def _is_retryable_llama_load_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    retry_markers = (
+        "failed to create context with model",
+        "out of memory",
+        "cuda error",
+        "cublas",
+        "cudart",
+        "ggml_cuda",
+        "no kernel image",
+        "invalid device function",
+        "invalid resource handle",
+    )
+    return any(marker in message for marker in retry_markers)
+
+
+def _partial_gpu_layer_attempts(n_gpu_layers: int) -> list[int]:
+    if n_gpu_layers == 0:
+        return []
+    if n_gpu_layers < 0:
+        return [24, 12]
+
+    attempts: list[int] = []
+    for candidate in (24, 12):
+        if n_gpu_layers > candidate:
+            attempts.append(candidate)
+    return attempts
+
 
 async def cleaned_response(text: str) -> str:
     if not text:
@@ -689,8 +750,8 @@ class LocalLLM:
         self.effective_n_ctx = int(llama_kwargs["n_ctx"])
         try:
             self.llm = Llama(**llama_kwargs)
-        except ValueError as e:
-            if "Failed to create context with model" not in str(e):
+        except (ValueError, RuntimeError, OSError) as e:
+            if not _is_retryable_llama_load_error(e):
                 raise
             fallback_kwargs = dict(llama_kwargs)
             fallback_kwargs["n_ctx"] = min(int(fallback_kwargs.get("n_ctx", 512)), 8192)
@@ -703,13 +764,33 @@ class LocalLLM:
                 "[LocalLLM] Context creation failed; retrying with "
                 f"n_ctx={fallback_kwargs['n_ctx']}, n_batch={fallback_kwargs['n_batch']}."
             )
-            try:
-                self.llm = Llama(**fallback_kwargs)
-                self.effective_n_ctx = int(fallback_kwargs["n_ctx"])
-            except ValueError:
+            retry_attempts: list[tuple[str, Dict[str, Any]]] = [
+                ("reduced context", fallback_kwargs),
+            ]
+            original_gpu_layers = int(llama_kwargs.get("n_gpu_layers", 0))
+            for layers in _partial_gpu_layer_attempts(original_gpu_layers):
+                partial_kwargs = dict(fallback_kwargs)
+                partial_kwargs["n_gpu_layers"] = layers
+                retry_attempts.append((f"{layers} GPU layers", partial_kwargs))
+
+            last_error: Exception = e
+            for label, attempt_kwargs in retry_attempts:
+                try:
+                    print(f"[LocalLLM] Retrying with {label}.")
+                    self.llm = Llama(**attempt_kwargs)
+                    self.effective_n_ctx = int(attempt_kwargs["n_ctx"])
+                    break
+                except (ValueError, RuntimeError, OSError) as retry_error:
+                    if not _is_retryable_llama_load_error(retry_error):
+                        raise
+                    last_error = retry_error
+            else:
                 cpu_kwargs = dict(fallback_kwargs)
                 cpu_kwargs["n_gpu_layers"] = 0
-                print("[LocalLLM] Retry failed; retrying with CPU-only offload.")
+                print(
+                    "[LocalLLM] GPU retries failed; retrying with CPU-only offload. "
+                    f"Last error: {last_error}"
+                )
                 self.llm = Llama(**cpu_kwargs)
                 self.effective_n_ctx = int(cpu_kwargs["n_ctx"])
 

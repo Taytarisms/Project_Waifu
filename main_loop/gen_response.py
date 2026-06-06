@@ -447,7 +447,9 @@ async def speak(text):
             Logger.print(f"NovelAI TTS file ID: {file_id}")
             try:
                 from files.closed_captions import caption_coordinator
-                caption_coordinator.audio_ready(f"audio/{file_id}.mp3")
+                caption_coordinator.audio_ready(
+                    novel_tts_client.audio_path_for(file_id, "mp3")
+                )
             except Exception as _ce:
                 Logger.warn(f"Captions Error raised: {_ce}")
 

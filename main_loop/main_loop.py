@@ -440,7 +440,7 @@ async def main_loop():
 
             if allow_finetune and get_settings("enable_finetune_sampling"):
                 if cleaned_chat_pairings(text, response):
-                    create_chat_pair(text, response)
+                    await create_chat_pair(text, response)
                     Logger.print("Fine-tune sample saved.")
                     _log_info(f"Fine-tune sample saved: speaker={speaker}")
 

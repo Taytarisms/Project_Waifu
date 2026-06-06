@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 import customtkinter as ctk
 from files.ui import theme
@@ -21,6 +22,7 @@ class NovelAICharacterManager(ctk.CTkFrame):
         self.characters_dir.mkdir(parents=True, exist_ok=True)
 
         self.inputs = {}
+        self._loaded_path: Path | None = None
 
         self.grid_columnconfigure(0, weight=1)
 
@@ -114,6 +116,35 @@ class NovelAICharacterManager(ctk.CTkFrame):
 
         return self.characters_dir / name
 
+    def _safe_filename_stem(self, value: str) -> str:
+        stem = Path(str(value or "").strip()).stem
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", stem)
+        stem = re.sub(r"\s+", " ", stem).strip(" ._")
+        return stem[:120]
+
+    def _path_for_character_name(self, name: str) -> Path | None:
+        stem = self._safe_filename_stem(name)
+        if not stem:
+            return None
+        return self.characters_dir / f"{stem}.json"
+
+    def _same_path(self, left: Path | None, right: Path | None) -> bool:
+        if left is None or right is None:
+            return False
+        try:
+            return left.resolve() == right.resolve()
+        except Exception:
+            return left == right
+
+    def _unique_path(self, path: Path) -> Path:
+        if not path.exists():
+            return path
+        for idx in range(2, 1000):
+            candidate = path.with_name(f"{path.stem}-{idx}{path.suffix}")
+            if not candidate.exists():
+                return candidate
+        raise FileExistsError(f"Could not find an available filename for {path.name}.")
+
     def _get_value(self, key):
         widget = self.inputs[key]
 
@@ -152,19 +183,25 @@ class NovelAICharacterManager(ctk.CTkFrame):
         for key in self.FIELDS:
             self._set_value(key, data.get(key, ""))
 
+        self._loaded_path = path
         self.status_label.configure(text=f"Loaded {path.name}.")
 
     def save_character(self):
-        path = self._selected_path()
+        data = {key: self._get_value(key) for key in self.FIELDS}
+        name_path = self._path_for_character_name(data.get("name", ""))
+        path = name_path or self._selected_path()
 
         if not path:
-            name = self._get_value("name")
-            if not name:
-                self.status_label.configure(text="Enter a name or filename first.")
-                return
-            path = self.characters_dir / f"{name}.json"
+            self.status_label.configure(text="Enter a name or filename first.")
+            return
 
-        data = {key: self._get_value(key) for key in self.FIELDS}
+        overwriting_loaded = self._same_path(path, self._loaded_path)
+        if path.exists() and not overwriting_loaded:
+            try:
+                path = self._unique_path(path)
+            except Exception as e:
+                self.status_label.configure(text=f"Failed to save: {e}")
+                return
 
         try:
             path.write_text(
@@ -175,6 +212,7 @@ class NovelAICharacterManager(ctk.CTkFrame):
             self.status_label.configure(text=f"Failed to save: {e}")
             return
 
+        self._loaded_path = path
         self.character_var.set(path.name)
         self.refresh_character_list()
         self.status_label.configure(text=f"Saved {path.name}.")
@@ -183,6 +221,8 @@ class NovelAICharacterManager(ctk.CTkFrame):
         for key in self.FIELDS:
             self._set_value(key, "")
 
+        self._loaded_path = None
+        self.character_var.set("Select character")
         self.status_label.configure(text="Editor cleared. File was not changed.")
 
     def delete_character(self):
@@ -196,6 +236,7 @@ class NovelAICharacterManager(ctk.CTkFrame):
         path.unlink()
 
         self.clear_form()
+        self._loaded_path = None
         self.character_var.set("Select character")
         self.refresh_character_list()
         self.status_label.configure(text=f"Deleted {deleted_name}.")
