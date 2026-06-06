@@ -7,7 +7,7 @@ annotated-doc==0.0.4
 annotated-types==0.7.0
 anthropic==0.98.1
 anyio==4.13.0
-argon2-cffi==25.1.0
+argon2-cffi==23.1.0
 argon2-cffi-bindings==25.1.0
 attrs==26.1.0
 audioop-lts==0.2.2
@@ -96,9 +96,8 @@ mypy_extensions==1.1.0
 networkx==3.6.1
 num2words==0.5.14
 numba==0.65.1
-numpy==2.4.3
+numpy==2.3.2
 oauthlib==3.3.1
-omnivoice==0.1.5
 onnxruntime==1.25.1
 openai==2.34.0
 opencv-python==4.13.0.92
@@ -110,12 +109,12 @@ opentelemetry-sdk==1.41.1
 opentelemetry-semantic-conventions==0.62b1
 orjson==3.11.8
 overrides==7.7.0
-packaging==26.2
+packaging==25.0
 pandas==3.0.2
 pathvalidate==3.3.1
 phonemizer==3.3.0
 phonemizer-fork==3.3.2
-pillow==12.1.1
+pillow==10.4.0
 piper-tts==1.4.2
 platformdirs==4.9.6
 pooch==1.9.0
@@ -208,6 +207,6 @@ webrtcvad-wheels==2.0.14
 websocket-client==1.9.0
 websockets==16.0
 wheel==0.47.0
-xai-sdk==1.12.2
+xai-sdk==1.15.0
 yarl==1.23.0
 zipp==3.23.1
