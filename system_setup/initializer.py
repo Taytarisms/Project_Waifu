@@ -1,7 +1,6 @@
 from files.system_setup.settings import save_settings, get_settings, save_auth, get_auth
 from files.llm.boilerplate_novel import NovelAIClient, login_with_credentials, fetch_user_info, extract_username
 from files.llm.openai_llm import system_message
-from files.llm.LocalLLM import local_init
 
 import asyncio
 import traceback
@@ -100,11 +99,13 @@ def initialize_model(chat_model_name: str) -> None:
             loop.close()
 
     elif chat_model_name == "Local":
+        from files.llm.local_worker_client import local_init_via_worker
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             print("Loading Local Model!")
-            loop.run_until_complete(local_init())
+            loop.run_until_complete(local_init_via_worker())
             print("Local Model Loaded!")
         except Exception:
             print("Error when loading local model:")

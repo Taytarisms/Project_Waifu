@@ -74,15 +74,6 @@ def detect_nvidia_driver_cuda_version() -> tuple[int, int] | None:
 
 @lru_cache(maxsize=1)
 def detect_nvidia_compute_capability() -> tuple[int, int] | None:
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            return int(props.major), int(props.minor)
-    except Exception:
-        pass
-
     output = _run_nvidia_smi([
         "--query-gpu=compute_cap",
         "--format=csv,noheader,nounits",
@@ -97,7 +88,18 @@ def detect_nvidia_compute_capability() -> tuple[int, int] | None:
         "--format=csv,noheader",
     ])
     if output:
-        return _compute_capability_from_name(output.splitlines()[0])
+        parsed = _compute_capability_from_name(output.splitlines()[0])
+        if parsed:
+            return parsed
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            return int(props.major), int(props.minor)
+    except Exception:
+        pass
 
     return None
 

@@ -1,11 +1,10 @@
 import sys, time, threading, queue
-from dataclasses import dataclass
-from typing import Callable, Optional, Literal
+from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
 import webrtcvad
-from faster_whisper import WhisperModel
+from files.speech_to_text.stt_config import STTConfig
 
 """
 Gutted and rescripted a smaller version the RealtimeSTT from KoljaB
@@ -17,31 +16,6 @@ SampleRate   = 16000
 FrameMs      = 20
 FrameLen     = int(SampleRate * FrameMs / 1000)   # 320 samples
 BytesPerSamp = 2                                   # int16 mono
-
-
-@dataclass
-class STTConfig:
-    device: Literal["cpu", "cuda"]   = "cuda"
-    model_name: str                  = "tiny"
-    compute_type: str                = "float16"
-
-    vad_aggressiveness: int          = 1
-    pre_speech_ms: int               = 1000
-    post_speech_ms: int              = 600
-    segment_max_ms: int              = 15000
-    min_length_ms: int               = 1000
-    min_gap_ms: int                  = 400
-
-    enable_partials: bool            = True
-    partial_interval_ms: int         = 200
-
-    allowed_latency_ms: int          = 100
-    handle_overflow: bool            = True
-    input_blocksize: int             = 320
-    enforce_exact_vad_frames: bool   = False
-
-    language: Optional[str]          = "en"
-    beam_size: int                   = 1
 
 
 class STTCore:
@@ -64,7 +38,7 @@ class STTCore:
         self._asr_t:   Optional[threading.Thread] = None
         self._on_text: Optional[Callable[[str, bool], None]] = None
         self._stream:  Optional[sd.InputStream] = None
-        self._model:   Optional[WhisperModel]    = None
+        self._model:   Optional[object]          = None
 
         self._vad_frame_acc = bytearray()
 
@@ -76,6 +50,8 @@ class STTCore:
         self._paused.clear()
         self._flush_requested.clear()
         self._flush_completed.set()
+
+        from faster_whisper import WhisperModel
 
         self._model = WhisperModel(
             self.cfg.model_name,

@@ -12,7 +12,7 @@ def main() -> int:
     log_path = Path(sys.argv[1])
     command = sys.argv[separator + 1:]
     if not command:
-        print("ERROR: no command provided to run_logged.py", file=sys.stderr)
+        print("ERROR: no command provided", file=sys.stderr)
         return 2
 
     log_path.parent.mkdir(parents=True, exist_ok=True)

@@ -3,6 +3,7 @@ import traceback
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from files.system_setup.json_utils import load_json_safe
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 USERDATA_DIR = ROOT_DIR / "userdata"
@@ -262,7 +263,7 @@ DEFAULTS = {'auth': {'novelai': {'mail': '', 'username': '', 'password': '', 'to
          'grok_temperature': 1.0,
          'grok_max_tokens': 1024,
          'local_model_filename': '',
-         'local_model_family': 'gemma4',
+         'local_model_family': 'auto',
          'local_mmproj_filename': '',
          'local_system_prompt_filename': 'system_message_local.txt',
          'local_n_ctx': 16384,
@@ -428,19 +429,7 @@ def _route_for_key(key: str) -> str:
 
 
 def _read_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
-    try:
-        if not path.exists():
-            _write_json(path, deepcopy(default))
-            return deepcopy(default)
-
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        return data if isinstance(data, dict) else deepcopy(default)
-    except Exception:
-        print(f"Failed reading {path}:")
-        print(traceback.format_exc())
-        return deepcopy(default)
+    return load_json_safe(path, default, dict, logger=print)
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:

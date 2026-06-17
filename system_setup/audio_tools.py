@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-from pydub import AudioSegment
 
 
 def find_project_root() -> Path:
@@ -28,6 +27,9 @@ FFPROBE_EXE = FFMPEG_DIR / "ffprobe.exe"
 _FILES_DIR = Path(__file__).resolve().parent.parent
 TTS_OUTPUT_DIR = _FILES_DIR / "tts" / "output"
 
+if FFMPEG_DIR.exists():
+    os.environ["PATH"] = str(FFMPEG_DIR) + os.pathsep + os.environ.get("PATH", "")
+
 
 def tts_output_dir(backend: str) -> Path:
     safe = "".join(c for c in str(backend or "misc").lower() if c.isalnum() or c in "-_") or "misc"
@@ -39,6 +41,8 @@ def tts_output_dir(backend: str) -> Path:
 def configure_audio_tools() -> None:
     if FFMPEG_DIR.exists():
         os.environ["PATH"] = str(FFMPEG_DIR) + os.pathsep + os.environ.get("PATH", "")
+
+    from pydub import AudioSegment
 
     if FFMPEG_EXE.exists():
         AudioSegment.converter = str(FFMPEG_EXE)

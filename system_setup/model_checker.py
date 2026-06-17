@@ -10,7 +10,7 @@ HF_API = "https://huggingface.co/api"
 
 TIGHT_THRESHOLD       = 0.85   # 85–100 %  Tight
 COMPLIANT_THRESHOLD   = 0.85   # < 85 %   Compatible
-# > 100 %                        Non-compliant
+# > 100 %                        Non-compliant which basically means it's unusable on your system
 
 def detect_vram() -> float:
     try:
@@ -40,7 +40,6 @@ def get_gpu_name() -> str:
             return torch.cuda.get_device_name(0)
     except Exception:
         pass
-
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -50,12 +49,10 @@ def get_gpu_name() -> str:
             return result.stdout.strip().splitlines()[0]
     except Exception:
         pass
-
     return "Unknown GPU"
 
 def estimate_vram_gb(file_size_gb: float) -> float:
     return round(file_size_gb * 1.15 + 0.5, 2)
-
 
 def get_compatibility(required_vram_gb: float, available_vram_gb: float) -> str:
     if available_vram_gb <= 0:
@@ -102,7 +99,6 @@ def scan_local_models() -> list[dict[str, Any]]:
 
     return results
 
-
 def get_model_folder(model_name: str) -> Path:
     safe_name = model_name.replace("/", "_").replace(" ", "_")
     folder = MODELS_DIR / safe_name
@@ -130,7 +126,6 @@ def _has_vision(model_meta: dict) -> bool:
         return True
     return False
 
-
 def _parse_size_from_id(model_id: str) -> float | None:
     import re
     match = re.search(r"(\d+\.?\d*)[Bb]", model_id)
@@ -138,12 +133,50 @@ def _parse_size_from_id(model_id: str) -> float | None:
         return float(match.group(1))
     return None
 
+def _infer_quant_bits(filename: str) -> float | None:
+    import re
+
+    name = (filename or "").upper()
+    if any(token in name for token in ("BF16", "F16", "FP16")):
+        return 16.0
+    if "F32" in name or "FP32" in name:
+        return 32.0
+
+    match = re.search(r"(?:^|[-_.])I?Q(\d)(?:[-_.]|$)", name)
+    if match:
+        return float(match.group(1))
+
+    if re.search(r"(?:^|[-_.])TQ1", name):
+        return 1.6
+    if re.search(r"(?:^|[-_.])TQ2", name):
+        return 2.4
+
+    return None
+
+def _estimate_storage_from_params(params_b: float, bits: float) -> float:
+    bytes_needed = params_b * 1e9 * bits / 8
+    gb = bytes_needed / (1024 ** 3)
+    return round(gb * 1.08 + 0.08, 2)
+
+def estimate_gguf_storage_gb(filename: str, model_id: str = "") -> float | None:
+    params_b = _parse_size_from_id(filename) or _parse_size_from_id(model_id)
+    bits = _infer_quant_bits(filename)
+    if not params_b or not bits:
+        return None
+    return _estimate_storage_from_params(params_b, bits)
+
+def _gguf_file_role(filename: str) -> tuple[str, bool]:
+    name = (filename or "").lower()
+    if "mmproj" in name:
+        return "Aux: projector", True
+    if name.startswith("mtp/") or "-mtp" in name:
+        return "Aux: MTP", True
+    return "", False
 
 def _estimate_vram_from_params(params_b: float, bits: int = 4) -> float:
     bytes_needed = params_b * 1e9 * bits / 8
     gb = bytes_needed / (1024 ** 3)
     return round(gb * 1.10 + 0.5, 2)
-
 
 def fetch_hf_models(
     query: str = "GGUF",
@@ -197,12 +230,38 @@ def fetch_hf_models(
 
     return results
 
+def _sibling_value(sibling: Any, key: str, default: Any = None) -> Any:
+    if isinstance(sibling, dict):
+        return sibling.get(key, default)
+    return getattr(sibling, key, default)
 
-def fetch_gguf_files(model_id: str) -> list[dict[str, Any]]:
+def _sibling_size_bytes(sibling: Any) -> int | None:
+    size = _sibling_value(sibling, "size")
+    if not size and isinstance(sibling, dict):
+        lfs = sibling.get("lfs")
+        if isinstance(lfs, dict):
+            size = lfs.get("size")
+    try:
+        return int(size) if size else None
+    except (TypeError, ValueError):
+        return None
+
+def _fetch_gguf_files_with_hub(model_id: str) -> list[Any] | None:
+    try:
+        from huggingface_hub import HfApi
+        info = HfApi().model_info(repo_id=model_id, files_metadata=True)
+        return list(getattr(info, "siblings", []) or [])
+    except Exception as e:
+        print(f"HF hub metadata fetch failed for {model_id}: {e}")
+        return None
+
+def _fetch_gguf_files_with_api(model_id: str) -> list[Any]:
     try:
         import urllib.request
-        safe_id = model_id.replace("/", "%2F") if "%2F" not in model_id else model_id
-        url = f"{HF_API}/models/{model_id}"
+        import urllib.parse
+
+        safe_id = urllib.parse.quote(model_id, safe="/")
+        url = f"{HF_API}/models/{safe_id}?blobs=true"
         req = urllib.request.Request(url, headers={"User-Agent": "AICompanionApp/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
@@ -210,20 +269,42 @@ def fetch_gguf_files(model_id: str) -> list[dict[str, Any]]:
         print(f"Failed to fetch file list for {model_id}: {e}")
         return []
 
+    return data.get("siblings", [])
+
+
+def fetch_gguf_files(model_id: str) -> list[dict[str, Any]]:
+    import urllib.parse
+
+    siblings = _fetch_gguf_files_with_hub(model_id)
+    if siblings is None:
+        siblings = _fetch_gguf_files_with_api(model_id)
+
     files = []
-    for sibling in data.get("siblings", []):
-        fname = sibling.get("rfilename", "")
+    for sibling in siblings:
+        fname = _sibling_value(sibling, "rfilename", "")
         if not fname.lower().endswith(".gguf"):
             continue
-        size_bytes = sibling.get("size")
-        size_gb    = round(size_bytes / (1024 ** 3), 2) if size_bytes else None
+
+        size_bytes = _sibling_size_bytes(sibling)
+        size_gb = round(size_bytes / (1024 ** 3), 2) if size_bytes else None
+        size_is_estimate = False
+
+        if size_gb is None:
+            size_gb = estimate_gguf_storage_gb(fname, model_id)
+            size_is_estimate = size_gb is not None
+
+        role, is_auxiliary = _gguf_file_role(fname)
+        safe_model_id = urllib.parse.quote(model_id, safe="/")
+        safe_fname = urllib.parse.quote(fname, safe="/")
         files.append({
             "filename": fname,
             "size_gb":  size_gb,
-            "url":      f"https://huggingface.co/{model_id}/resolve/main/{fname}",
+            "size_is_estimate": size_is_estimate,
+            "role": role,
+            "is_auxiliary": is_auxiliary,
+            "url":      f"https://huggingface.co/{safe_model_id}/resolve/main/{safe_fname}",
         })
-    return files
-
+    return sorted(files, key=lambda item: (item.get("is_auxiliary", False), item["filename"].lower()))
 
 def download_gguf(
     model_id:  str,

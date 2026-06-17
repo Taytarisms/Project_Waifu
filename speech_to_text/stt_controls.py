@@ -5,18 +5,14 @@ import re
 from files.system_setup.settings import get_bool_setting, get_settings
 from files.system_setup.system_logger import Logger
 from files.system_setup.gpu_compat import detect_nvidia_compute_capability
+from files.speech_to_text.stt_config import STTConfig
 
 try:
     from files.main_loop.main_loop import message_queue
 except Exception:
     message_queue = None
 
-try:
-    from files.speech_to_text.local_whisper import STTCore, STTConfig
-except Exception as e:
-    print(f"Local Whisper unavailable: {e}")
-    STTCore = None
-    STTConfig = None
+STTCore = None
 
 try:
     from files.speech_to_text.openai_whisper import OpenAIWhisperCore, OpenAIWhisperConfig
@@ -313,6 +309,19 @@ def build_google_config():
     )
 
 
+def _get_local_whisper_core():
+    global STTCore
+    if STTCore is not None:
+        return STTCore
+    try:
+        from files.speech_to_text.local_whisper import STTCore as core_cls
+    except Exception as e:
+        Logger.warn(f"Local Whisper unavailable: {e}")
+        return None
+    STTCore = core_cls
+    return STTCore
+
+
 def start_stt(on_text=None) -> bool:
     global active_core, active_engine, _ptt_active
 
@@ -322,18 +331,21 @@ def start_stt(on_text=None) -> bool:
 
     engine = _setting("stt_engine", "Local Whisper")
     device_index = _input_device_index()
+    local_cfg = None
 
     callback = on_text or handle_stt_text
 
     try:
         if engine == "Local Whisper":
-            if not STTCore or not STTConfig:
+            core_cls = _get_local_whisper_core()
+            if not core_cls:
                 Logger.warn("Local Whisper backend unavailable.")
                 return False
 
-            active_core = STTCore(
+            local_cfg = build_local_config()
+            active_core = core_cls(
                 input_device_index=device_index,
-                cfg=build_local_config(),
+                cfg=local_cfg,
             )
 
         elif engine == "OpenAI Whisper":
@@ -364,17 +376,22 @@ def start_stt(on_text=None) -> bool:
         try:
             active_core.start(on_text=callback)
         except Exception:
-            if engine != "Local Whisper" or getattr(active_core.cfg, "device", "") != "cuda":
+            active_cfg = getattr(active_core, "cfg", None) or local_cfg
+            if engine != "Local Whisper" or getattr(active_cfg, "device", "") != "cuda":
                 raise
             Logger.warn("Local Whisper CUDA start failed; retrying CPU as the final fallback.")
             try:
-                active_core.stop()
+                if active_core is not None:
+                    active_core.stop()
             except Exception:
                 pass
-            cpu_cfg = replace(active_core.cfg, device="cpu")
+            cpu_cfg = replace(active_cfg, device="cpu")
             if str(cpu_cfg.compute_type).lower() == "float16":
                 cpu_cfg.compute_type = "int8"
-            active_core = STTCore(input_device_index=device_index, cfg=cpu_cfg)
+            core_cls = _get_local_whisper_core()
+            if not core_cls:
+                return False
+            active_core = core_cls(input_device_index=device_index, cfg=cpu_cfg)
             active_core.start(on_text=callback)
 
         _set_ptt_active(False)
