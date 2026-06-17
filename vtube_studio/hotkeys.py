@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from files.system_setup.json_utils import load_json_safe
 import sys
 from files.vtube_studio.idle_animations import (
     IdleAnimationEngine,
@@ -19,6 +20,9 @@ DEFAULT_VTS_MAPPING = {
     "current_emotion": "",
     "full_reset_hotkey_sequence": [],
     "emotions": {},
+}
+DEFAULT_HOTKEY_CACHE = {
+    "hotkeys": [],
 }
 
 def empty_emotion_config() -> dict[str, list[dict[str, str]]]:
@@ -378,14 +382,14 @@ class VTSHotkeyManager:
         self.logger(f"Saved hotkey cache: {self.hotkey_cache_path}")
 
     def load_cached_hotkeys(self) -> list[dict[str, Any]]:
-        if not self.hotkey_cache_path.exists():
-            return []
-        try:
-            payload = json.loads(self.hotkey_cache_path.read_text(encoding="utf-8"))
-            return payload.get("hotkeys", [])
-        except Exception as e:
-            self.logger(f"Failed to load cached hotkeys: {e}")
-            return []
+        payload = load_json_safe(
+            self.hotkey_cache_path,
+            DEFAULT_HOTKEY_CACHE,
+            dict,
+            logger=lambda message: self.logger(f"Failed to load cached hotkeys: {message}"),
+        )
+        hotkeys = payload.get("hotkeys", []) if isinstance(payload, dict) else []
+        return hotkeys if isinstance(hotkeys, list) else []
 
     def get_cached_hotkey_names(self) -> list[str]:
         return [
@@ -428,44 +432,32 @@ class VTSHotkeyManager:
         return ""
 
     def load_vts_mapping(self) -> dict[str, Any]:
-        if not self.emotion_map_path.exists():
-            return {
-                "current_emotion": "",
-                "full_reset_hotkey_sequence": [],
-                "emotions": {},
-            }
-        try:
-            payload = json.loads(self.emotion_map_path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict) and "emotions" in payload:
-                payload.setdefault("current_emotion", "")
-                payload.setdefault("full_reset_hotkey_sequence", [])
-                payload.setdefault("emotions", {})
-                return payload
-            if isinstance(payload, dict):
-                converted = {
-                    "current_emotion": "",
-                    "full_reset_hotkey_sequence": [],
-                    "emotions": {},
-                }
+        payload = load_json_safe(
+            self.emotion_map_path,
+            DEFAULT_VTS_MAPPING,
+            dict,
+            logger=lambda message: self.logger(f"Failed to load VTS mapping: {message}"),
+        )
+        if "emotions" in payload:
+            payload.setdefault("current_emotion", "")
+            payload.setdefault("full_reset_hotkey_sequence", [])
+            payload.setdefault("emotions", {})
+            return payload
 
-                for emotion_name, entry in payload.items():
-                    if not isinstance(entry, dict):
-                        continue
-
-                    converted["emotions"][emotion_name] = {
-                        "talking_hotkey_sequence": [entry],
-                        "idle_hotkey_sequence": [],
-                        "reset_hotkey_sequence": [],
-                    }
-                return converted
-        except Exception as e:
-            self.logger(f"Failed to load VTS mapping: {e}")
-
-        return {
+        converted = {
             "current_emotion": "",
             "full_reset_hotkey_sequence": [],
             "emotions": {},
         }
+        for emotion_name, entry in payload.items():
+            if not isinstance(entry, dict):
+                continue
+            converted["emotions"][emotion_name] = {
+                "talking_hotkey_sequence": [entry],
+                "idle_hotkey_sequence": [],
+                "reset_hotkey_sequence": [],
+            }
+        return converted
 
     def save_vts_mapping(self, mapping: dict[str, Any]) -> None:
         self._ensure_userdata()

@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 try:
     import websockets
-except ImportError as exc:  # pragma: no cover
+except ImportError as exc:
     websockets = None
     _WEBSOCKETS_IMPORT_ERROR = exc
 else:

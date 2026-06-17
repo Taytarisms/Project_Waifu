@@ -1,5 +1,5 @@
 {
     "TWITCH_POLICY": "latest-buffered",
     "TWITCH_PAUSED": false,
-    "TWITCH_IGNORED_PREFIXES": ""
+    "TWITCH_IGNORED_PREFIXES": "-\n,\n!"
 }

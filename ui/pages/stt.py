@@ -1,7 +1,7 @@
 import customtkinter as ctk
 from files.ui import theme
 
-from files.speech_to_text.local_whisper import STTConfig
+from files.speech_to_text.stt_config import STTConfig
 from files.speech_to_text.openai_whisper import OpenAIWhisperCore, OpenAIWhisperConfig
 from files.speech_to_text.google_stt import GoogleSTTCore, GoogleSTTConfig
 from files.speech_to_text import stt_controls

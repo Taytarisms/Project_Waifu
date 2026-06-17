@@ -1,4 +1,6 @@
 import customtkinter as ctk
+from pathlib import Path
+from tkinter import filedialog
 from files.ui import theme
 
 try:
@@ -6,6 +8,12 @@ try:
 except Exception as e:
     print(f"Failed to import memory backend: {e}")
     memory_backend = None
+
+try:
+    from files.memory import w_ai_fu_importer
+except Exception as e:
+    print(f"Failed to import w-AI-fu importer: {e}")
+    w_ai_fu_importer = None
 
 try:
     from files.system_setup.settings import get_settings, save_settings
@@ -42,6 +50,7 @@ class MemoryPage(ctk.CTkFrame):
         right.pack(fill="both", expand=True)
         self._build_recall_panel(left)
         self._build_live_recall_panel(right)
+        self._build_import_panel(right)
         self._build_store_panel(right)
 
     def _build_recall_panel(self, parent):
@@ -143,6 +152,56 @@ class MemoryPage(ctk.CTkFrame):
 
         ctk.CTkFrame(parent, fg_color="#2d3f52", height=1).pack(
             fill="x", padx=16, pady=(4, 0)
+        )
+
+    def _build_import_panel(self, parent):
+        ctk.CTkLabel(
+            parent,
+            text="Import Memories",
+            font=ctk.CTkFont(size=20, weight="bold"),
+            text_color=theme.TEXT,
+        ).pack(anchor="w", padx=16, pady=(18, 8))
+
+        ctk.CTkLabel(
+            parent,
+            text="Import persisted contextual memories from a w-AI-fu folder or zip.",
+            text_color=theme.MUTED_TEXT,
+            font=ctk.CTkFont(size=12),
+            wraplength=320,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        self.import_path_var = ctk.StringVar(value="")
+        self._entry_row(parent, "Path", self.import_path_var, pad=16)
+
+        ctk.CTkButton(
+            parent,
+            text="Choose w-AI-fu Folder",
+            command=self.choose_w_ai_fu_folder,
+            fg_color="gray30",
+        ).pack(fill="x", padx=16, pady=4)
+
+        ctk.CTkButton(
+            parent,
+            text="Choose w-AI-fu Zip",
+            command=self.choose_w_ai_fu_zip,
+            fg_color="gray30",
+        ).pack(fill="x", padx=16, pady=4)
+
+        ctk.CTkButton(
+            parent,
+            text="Preview Import",
+            command=self.preview_w_ai_fu_import,
+        ).pack(fill="x", padx=16, pady=(8, 4))
+
+        ctk.CTkButton(
+            parent,
+            text="Import w-AI-fu Memories",
+            command=self.import_w_ai_fu_memories,
+        ).pack(fill="x", padx=16, pady=4)
+
+        ctk.CTkFrame(parent, fg_color="#2d3f52", height=1).pack(
+            fill="x", padx=16, pady=(12, 0)
         )
 
     def _build_store_panel(self, parent):
@@ -335,6 +394,88 @@ class MemoryPage(ctk.CTkFrame):
         self.live_recall_distance_var.set(str(max_distance))
         save_settings("live_memory_recall_max_distance", max_distance)
         self._set_status(f"Live recall max distance saved: {max_distance}.")
+
+    def choose_w_ai_fu_folder(self):
+        path = filedialog.askdirectory(title="Choose w-AI-fu folder")
+        if path:
+            self.import_path_var.set(path)
+
+    def choose_w_ai_fu_zip(self):
+        path = filedialog.askopenfilename(
+            title="Choose w-AI-fu zip",
+            filetypes=[("Zip archives", "*.zip"), ("All files", "*.*")],
+        )
+        if path:
+            self.import_path_var.set(path)
+
+    def _import_path(self) -> Path | None:
+        raw = self.import_path_var.get().strip()
+        if not raw:
+            self._set_status("Choose a w-AI-fu folder or zip first.")
+            return None
+        path = Path(raw)
+        if not path.exists():
+            self._set_status("Selected import path does not exist.")
+            return None
+        return path
+
+    def preview_w_ai_fu_import(self):
+        if not w_ai_fu_importer:
+            self._set_status("w-AI-fu importer unavailable.")
+            return
+        path = self._import_path()
+        if path is None:
+            return
+        try:
+            preview = w_ai_fu_importer.preview_import(path)
+        except Exception as e:
+            self._set_status(f"Preview failed: {e}")
+            return
+
+        lines = [
+            "w-AI-fu import preview",
+            f"Config: {preview.config_path}",
+            f"Contextual memories: {preview.contextual_count}",
+            f"Character files found: {preview.character_count}",
+            "",
+        ]
+        if preview.sample:
+            lines.append("Sample:")
+            for item in preview.sample:
+                lines.append(f"- {item}")
+        else:
+            lines.append("No persisted contextual memories found.")
+        self._write_results("\n".join(lines))
+        self._set_status(f"Preview found {preview.contextual_count} contextual memories.")
+
+    def import_w_ai_fu_memories(self):
+        if not memory_backend:
+            self._set_status("Memory backend unavailable.")
+            return
+        if not w_ai_fu_importer:
+            self._set_status("w-AI-fu importer unavailable.")
+            return
+        path = self._import_path()
+        if path is None:
+            return
+        try:
+            result = w_ai_fu_importer.import_contextual_memories(path)
+        except Exception as e:
+            self._set_status(f"Import failed: {e}")
+            return
+
+        summary = (
+            "w-AI-fu import complete\n"
+            f"Config: {result.config_path}\n"
+            f"Found: {result.found}\n"
+            f"Imported: {result.imported}\n"
+            f"Skipped duplicates: {result.skipped}\n"
+            f"Failed: {result.failed}"
+        )
+        self._write_results(summary)
+        self._set_status(
+            f"Imported {result.imported}; skipped {result.skipped}; failed {result.failed}."
+        )
 
     def store_memory(self):
         if not memory_backend:

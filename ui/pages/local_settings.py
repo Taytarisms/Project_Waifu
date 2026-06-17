@@ -143,7 +143,7 @@ class LocalSettingsPage(ctk.CTkFrame):
         ).pack(side="left")
 
         self.family_var = ctk.StringVar(
-            value=self._setting("local_model_family", "gemma4")
+            value=self._setting("local_model_family", "auto")
         )
 
         self._combo_row(
@@ -452,6 +452,12 @@ class LocalSettingsPage(ctk.CTkFrame):
         if save_settings:
             for key, value in payload.items():
                 save_settings(key, value)
+
+        try:
+            from files.llm.local_worker_client import reset_local_worker_if_running
+            reset_local_worker_if_running()
+        except Exception:
+            pass
 
         module = sys.modules.get("files.llm.LocalLLM")
         reset_fn = getattr(module, "reset_local_model", None) if module else None

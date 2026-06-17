@@ -1,5 +1,5 @@
 {
-    "chat_model": "OpenAI",
+    "chat_model": "Local",
     "openai_model": "gpt-3.5-turbo",
     "openai_temperature": 0.7,
     "openai_max_tokens": 392,

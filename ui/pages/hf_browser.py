@@ -35,6 +35,13 @@ _COMPAT_LABELS = {
     "unknown":       "?  Unknown",
 }
 
+def _format_gb(value, estimated: bool = False) -> str:
+    if value is None:
+        return "unknown"
+    prefix = "~" if estimated else ""
+    return f"{prefix}{float(value):.1f} GB"
+
+
 def _infer_family_from_filename(filename: str) -> str:
     name = (filename or "").lower()
     if "qwen3.5" in name or "qwen35" in name:
@@ -247,12 +254,16 @@ class _ModelCard(ctk.CTkFrame):
 
 class _FilePickerDialog(ctk.CTkToplevel):
     def __init__(self, parent, model_id: str, files: list, on_choose):
-        super().__init__(parent)
+        owner = parent
+        root = parent.winfo_toplevel()
+        super().__init__(root)
+        self._owner = owner
+        self._file_scroll = None
         self.title("Choose quantisation")
-        self.geometry("520x440")
+        self.geometry("620x480")
         self.resizable(False, False)
         self.configure(fg_color="#0d1117")
-        self.transient(parent.winfo_toplevel())
+        self.transient(root)
         self.grab_set()
         self.on_choose = on_choose
 
@@ -268,25 +279,42 @@ class _FilePickerDialog(ctk.CTkToplevel):
             text=model_id,
             font=ctk.CTkFont(size=11),
             text_color="#8b949e",
-        ).pack(anchor="w", padx=20, pady=(0, 14))
+        ).pack(anchor="w", padx=20, pady=(0, 6))
+
+        available_vram = detect_vram() if _checker_ok else 0
+        gpu_text = (
+            f"Detected GPU VRAM: {available_vram:.1f} GB"
+            if available_vram
+            else "Detected GPU VRAM: unknown"
+        )
+        ctk.CTkLabel(
+            self,
+            text=gpu_text,
+            font=ctk.CTkFont(size=11),
+            text_color="#8b949e",
+        ).pack(anchor="w", padx=20, pady=(0, 10))
 
         scroll = ctk.CTkScrollableFrame(self, fg_color="#161b22", corner_radius=8)
         scroll.pack(fill="both", expand=True, padx=20, pady=(0, 16))
-
-        available_vram = detect_vram() if _checker_ok else 0
+        self._file_scroll = scroll
+        self.bind("<MouseWheel>", self._on_dialog_mousewheel, add="+")
+        self.bind("<Button-4>", self._on_dialog_mousewheel, add="+")
+        self.bind("<Button-5>", self._on_dialog_mousewheel, add="+")
 
         for f in files:
             row = ctk.CTkFrame(scroll, fg_color="transparent")
-            row.pack(fill="x", pady=4)
+            row.pack(fill="x", padx=(0, 4), pady=6)
             row.grid_columnconfigure(0, weight=1)
 
-            size_text = f"{f['size_gb']:.1f} GB" if f.get("size_gb") else "? GB"
+            size_gb = f.get("size_gb")
+            size_is_estimate = bool(f.get("size_is_estimate"))
+            size_text = _format_gb(size_gb, size_is_estimate)
+            vram_est = estimate_vram_gb(size_gb) if size_gb else None
 
             # Compatibility for this specific file
             compat_text = ""
             compat_colour = "#4a4a4a"
-            if f.get("size_gb") and available_vram:
-                vram_est = estimate_vram_gb(f["size_gb"])
+            if vram_est and available_vram:
                 compat   = get_compatibility(vram_est, available_vram)
                 compat_text   = f"  {_COMPAT_LABELS.get(compat, '')}"
                 compat_colour = _COMPAT_COLOURS.get(compat, "#4a4a4a")
@@ -297,17 +325,34 @@ class _FilePickerDialog(ctk.CTkToplevel):
                 font=ctk.CTkFont(size=12),
                 text_color="#e6edf3",
                 anchor="w",
-            ).grid(row=0, column=0, sticky="w")
+                wraplength=420,
+                justify="left",
+            ).grid(row=0, column=0, sticky="ew")
 
             info_row = ctk.CTkFrame(row, fg_color="transparent")
             info_row.grid(row=1, column=0, sticky="w")
 
             ctk.CTkLabel(
                 info_row,
-                text=size_text,
+                text=f"Disk: {size_text}",
                 font=ctk.CTkFont(size=11),
                 text_color="#8b949e",
             ).pack(side="left")
+
+            ctk.CTkLabel(
+                info_row,
+                text=f"  VRAM: {_format_gb(vram_est, True) if vram_est else 'unknown'}",
+                font=ctk.CTkFont(size=11),
+                text_color="#8b949e",
+            ).pack(side="left")
+
+            if f.get("role"):
+                ctk.CTkLabel(
+                    info_row,
+                    text=f"  {f['role']}",
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    text_color="#d29922",
+                ).pack(side="left")
 
             if compat_text:
                 ctk.CTkLabel(
@@ -337,9 +382,30 @@ class _FilePickerDialog(ctk.CTkToplevel):
         ).pack(fill="x", padx=20, pady=(0, 18))
 
         self.update_idletasks()
-        px = parent.winfo_rootx() + (parent.winfo_width()  - self.winfo_width())  // 2
-        py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        px = self._owner.winfo_rootx() + (self._owner.winfo_width()  - self.winfo_width())  // 2
+        py = self._owner.winfo_rooty() + (self._owner.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{px}+{py}")
+
+    def _on_dialog_mousewheel(self, event):
+        scroll = self._file_scroll
+        canvas = getattr(scroll, "_parent_canvas", None)
+        if canvas is None or canvas.yview() == (0.0, 1.0):
+            return "break"
+
+        if getattr(event, "num", None) == 4:
+            units = -3
+        elif getattr(event, "num", None) == 5:
+            units = 3
+        else:
+            delta = getattr(event, "delta", 0)
+            units = -int(delta / 120) if delta else 0
+            if units == 0 and delta:
+                units = -1 if delta > 0 else 1
+            units *= 3
+
+        if units:
+            canvas.yview_scroll(units, "units")
+        return "break"
 
     def _choose(self, file_info: dict):
         self.destroy()

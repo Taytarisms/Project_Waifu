@@ -5,6 +5,10 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+
+from files.system_setup.runtime_environment import configure_process_environment
+configure_process_environment()
+
 import multiprocessing
 import customtkinter as ctk
 
