@@ -9,6 +9,11 @@ from enum import Enum
 from datetime import datetime
 from PIL import Image, ImageOps
 import mss
+try:
+    from files.system_setup.runtime_environment import configure_process_environment
+    configure_process_environment()
+except Exception:
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 from llama_cpp import Llama
 try:
     from llama_cpp import llama_chat_format as _llama_chat_format
@@ -314,14 +319,14 @@ def build_chat_formatter(family: ModelFamily, mmproj_path: Optional[str], enable
     if spec.handler_class is None:
         if spec.is_vision:
             print(
-                f"[LocalLLM] llama-cpp-python does not expose a handler for "
+                f"llama-cpp-python does not expose a handler for "
                 f"family '{family.value}'. Falling back to the GGUF embedded template."
             )
         return None  # AUTO – Llama will use the GGUF's embedded template
 
     base_cls = spec.handler_class
 
-    # Build the patched CHAT_FORMAT string
+    # Build the patched version with a new string
     if spec.suppress_errors and hasattr(base_cls, "CHAT_FORMAT"):
         patched = base_cls.CHAT_FORMAT
         for token in spec.suppress_errors:
@@ -477,11 +482,11 @@ def _settings_int(key: str, default: int) -> int:
     return int(_setting_value(key, default))
 
 def _settings_family() -> ModelFamily:
-    raw = get_settings("local_model_family") or "gemma4"
+    raw = get_settings("local_model_family") or "auto"
     try:
         return ModelFamily(raw.lower())
     except ValueError:
-        print(f"[LocalLLM] Unknown model family '{raw}' in settings; falling back to AUTO.")
+        print(f"Unknown model family '{raw}' in settings; falling back to AUTO.")
         return ModelFamily.AUTO
 
 
@@ -536,13 +541,13 @@ def _build_llama_kwargs(
     n_gpu_layers = int(config.n_gpu_layers)
     if n_gpu_layers != 0:
         if detect_nvidia_compute_capability() is None:
-            print("[LocalLLM] No NVIDIA CUDA-capable GPU found; using CPU offload.")
+            print("No NVIDIA CUDA-capable GPU found; using CPU offload.")
             n_gpu_layers = 0
         elif should_force_llama_cpp_cpu():
             message = cuda13_support_message()
             if message:
-                print(f"[LocalLLM] {message}")
-            print("[LocalLLM] Forcing n_gpu_layers=0 for this llama-cpp CUDA 13 build.")
+                print(f"{message}")
+            print("Forcing GPU offloading.")
             n_gpu_layers = 0
 
     kwargs: Dict[str, Any] = dict(
@@ -599,6 +604,7 @@ def _partial_gpu_layer_attempts(n_gpu_layers: int) -> list[int]:
     return attempts
 
 
+# Attempt to remove thinking channels from most LLM's sinc they don't require it. May not work since some models don't output thinking tokens as cleanly as others.
 async def cleaned_response(text: str) -> str:
     if not text:
         return ""
@@ -653,7 +659,7 @@ def format_system_template(template: str) -> str:
     try:
         return template.format(date_str=date_str, weekday_str=weekday_str)
     except KeyError as e:
-        print(f"[LocalLLM] Missing system prompt template key: {e}")
+        print(f"Missing system prompt template key: {e}")
         return template
 
 
@@ -701,7 +707,7 @@ class LocalLLM:
 
             if not self.mmproj_path:
                 print(
-                    f"[LocalLLM] Family '{config.family.value}' needs an mmproj file, "
+                    f"Model Type '{config.family.value}' needs an mmproj file, "
                     f"but none was found. Loading '{os.path.basename(self.model_path)}' "
                     "in AUTO text-only mode."
                 )
@@ -714,10 +720,10 @@ class LocalLLM:
         self.cached_system_prompt: Optional[str]  = None
         self.cached_system_tokens: int            = 0
 
-        print(f"[LocalLLM] Family: {effective_family.value}")
-        print(f"[LocalLLM] Model:  {self.model_path}")
+        print(f" Model Type: {effective_family.value}")
+        print(f" Model:  {self.model_path}")
         if self.mmproj_path:
-            print(f"[LocalLLM] mmproj: {self.mmproj_path}")
+            print(f"mmproj: {self.mmproj_path}")
         self.monitor = Monitor(gpu_index=config.benchmark_gpu_index) if config.benchmark_enabled else None
 
         load_before  = self.monitor.snapshot() if self.monitor else None
@@ -738,14 +744,14 @@ class LocalLLM:
         if chat_handler is not None:
             llama_kwargs["chat_handler"] = chat_handler
 
-        # swa_full is only valid/useful on Gemma 4 – guard it
+        # swa_full is only really needed on Gemma 4 so we'll guard it against it
         if effective_family in (ModelFamily.GEMMA4,):
             llama_kwargs["swa_full"] = True
 
         if config.n_batch <= 0:
-            print(f"[LocalLLM] Batch size <= 0; using runtime n_batch={llama_kwargs['n_batch']}.")
+            print(f"Batch size <= 0; using runtime n_batch={llama_kwargs['n_batch']}.")
         if config.n_threads <= 0:
-            print("[LocalLLM] Threads <= 0; letting llama.cpp choose the thread count.")
+            print("Threads <= 0; letting llama.cpp choose the thread count.")
 
         self.effective_n_ctx = int(llama_kwargs["n_ctx"])
         try:
@@ -761,7 +767,7 @@ class LocalLLM:
                 fallback_kwargs["n_batch"],
             )
             print(
-                "[LocalLLM] Context creation failed; retrying with "
+                "Context creation failed; retrying with "
                 f"n_ctx={fallback_kwargs['n_ctx']}, n_batch={fallback_kwargs['n_batch']}."
             )
             retry_attempts: list[tuple[str, Dict[str, Any]]] = [
@@ -776,7 +782,7 @@ class LocalLLM:
             last_error: Exception = e
             for label, attempt_kwargs in retry_attempts:
                 try:
-                    print(f"[LocalLLM] Retrying with {label}.")
+                    print(f"Retrying with {label}.")
                     self.llm = Llama(**attempt_kwargs)
                     self.effective_n_ctx = int(attempt_kwargs["n_ctx"])
                     break
@@ -788,7 +794,7 @@ class LocalLLM:
                 cpu_kwargs = dict(fallback_kwargs)
                 cpu_kwargs["n_gpu_layers"] = 0
                 print(
-                    "[LocalLLM] GPU retries failed; retrying with CPU-only offload. "
+                    "GPU retries failed; retrying with CPU-only offload. "
                     f"Last error: {last_error}"
                 )
                 self.llm = Llama(**cpu_kwargs)
@@ -796,10 +802,23 @@ class LocalLLM:
 
         if self.monitor and load_before:
             load_after = self.monitor.snapshot()
-            print(f"[LocalLLM] Loaded in {time.time() - load_started:.2f}s")
+            print(f"Loaded in {time.time() - load_started:.2f}s")
             print(format_snapshot("LOAD BEFORE", load_before))
             print(format_snapshot("LOAD AFTER",  load_after))
-            print(f"LOAD DELTA: {self.monitor.diff(load_before, load_after)}")
+            delta = self.monitor.diff(load_before, load_after)
+            if delta.get("gpu_util_percent_delta") is None or delta.get("gpu_vram_used_gb_delta") is None:
+                if not NVML_AVAILABLE:
+                    print("GPU telemetry unavailable: install nvidia-ml-py for NVML readings.")
+                elif not self.monitor.nvml_ready:
+                    print("GPU telemetry unavailable: NVML failed to initialize.")
+                else:
+                    print("GPU telemetry unavailable: cannot confirm VRAM delta from NVML.")
+                delta = {
+                    key: value
+                    for key, value in delta.items()
+                    if not key.startswith("gpu_")
+                }
+            print(f"LOAD DELTA: {delta}")
 
     def set_static_prompt(self, system_prompt: str) -> None:
         self.cached_system_prompt  = system_prompt or ""
@@ -808,7 +827,7 @@ class LocalLLM:
     def warmup_system_prompt(self):
         if not self.cached_system_prompt:
             return
-        print("[LocalLLM] Warming KV cache with system prompt...")
+        print("Warming KV cache with system prompt...")
         self.llm.create_chat_completion(
             messages=[
                 {"role": "system", "content": self.cached_system_prompt},
@@ -818,7 +837,7 @@ class LocalLLM:
             temperature=0,
             stream=False,
         )
-        print("[LocalLLM] System prompt cached.")
+        print("System prompt cached.")
 
     def resolve_system_prompt(self, system_prompt: Optional[str]) -> str:
         if system_prompt is not None:
@@ -968,7 +987,6 @@ class LocalLLM:
         if not self.spec.is_vision:
             raise RuntimeError(
                 f"Family '{self.config.family}' does not support vision. "
-                "Use generate_text() instead."
             )
 
         history       = history or []
@@ -1073,7 +1091,7 @@ class LocalLLM:
 ########################
 
 system_message       = date_correct
-vl_base: Optional[LocalLLM] = None
+vl_base: Optional = None
 
 
 def reset_local_model() -> None:
@@ -1090,7 +1108,7 @@ def reload_system_message(force: bool = True) -> str:
         template = load_system_message(resolve_llm_file(prompt_filename))
         new_system_message = format_system_template(template)
     except Exception as e:
-        print(f"[LocalLLM] Failed to reload system prompt: {e}")
+        print(f"Failed to reload system prompt: {e}")
         new_system_message = ""
 
     if force or new_system_message != system_message:
@@ -1120,7 +1138,7 @@ async def local_init() -> LocalLLM:
         from files.vision.VisionWatcher import get_watcher
         get_watcher().set_local_vision(bool(vl_base.spec.is_vision))
     except Exception as e:
-        print(f"[LocalLLM] Could not sync vision watcher with model capabilities: {e}")
+        print(f"Could not sync vision watcher with model capabilities: {e}")
 
     return vl_base
 
@@ -1164,7 +1182,7 @@ async def response_local(
         use_vision = llm.spec.is_vision and should_use_vision()
 
         if use_vision:
-            print(f"[LocalLLM] Vision path active — capturing screen for prompt")
+            print(f"Vision path active — capturing screen for prompt")
             result = await llm.generate_vision(
                 text=text,
                 screenshot=True,

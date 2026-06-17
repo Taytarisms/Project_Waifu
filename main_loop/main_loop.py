@@ -15,6 +15,7 @@ from files.moderation.check_for_spam import is_spam_message
 from files.moderation.text_cleaner import split_message, cleaned_chat_pairings
 from files.fine_tune.fine_tune_creator import create_chat_pair
 from files.system_setup.settings import USERDATA_DIR, get_settings
+from files.system_setup.json_utils import load_json_safe
 from files.tts.narrator.backends.narrator import get_narrator
 from files.closed_captions import clear_caption, caption_coordinator, SOURCE_NARRATOR, SOURCE_USER, SOURCE_LLM
 from files.vtube_studio.hotkeys import VTSHotkeyManager
@@ -36,16 +37,14 @@ def is_turn_active() -> bool:
     return _turn_active.is_set()
 
 def load_context() -> list[dict]:
-    try:
-        if not SAVED_CHAT.exists():
-            return []
-        with SAVED_CHAT.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        turns = data.get("turns", []) if isinstance(data, dict) else []
-        return turns if isinstance(turns, list) else []
-    except Exception as e:
-        Logger.warn(f"Failed to load conversation context: {e}")
-        return []
+    data = load_json_safe(
+        SAVED_CHAT,
+        {"turns": []},
+        dict,
+        logger=lambda message: Logger.warn(f"Failed to load conversation context: {message}"),
+    )
+    turns = data.get("turns", []) if isinstance(data, dict) else []
+    return turns if isinstance(turns, list) else []
 
 def save_context(turns: list[dict]) -> None:
     try:

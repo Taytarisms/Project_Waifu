@@ -8,7 +8,6 @@ from files.system_setup.system_logger import Logger
 from files.ui.pages.logs import LogManager
 
 from files.llm.openai_llm import open_response
-from files.llm.LocalLLM import response_local
 from files.llm.boilerplate_novel import NovelAIClient
 from files.llm.grok import grok_response
 from files.llm.claude import claude_response
@@ -728,10 +727,12 @@ async def send_user_text(user_text: str) -> str:
             ),
         )
     if current_chat_model == "Local":
+        from files.llm.local_worker_client import response_local_via_worker
+
         Logger.quiet_print(user_text)
         return await _timed(
             "Local",
-            response_local(
+            response_local_via_worker(
                 text=user_text,
                 max_tokens=int(get_settings("local_max_tokens") or 220),
                 save_to_history=True,
