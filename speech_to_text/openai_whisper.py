@@ -5,12 +5,11 @@ import queue
 import threading
 from dataclasses import dataclass
 from typing import Callable, Optional
-
 import sounddevice as sd
 from openai import OpenAI
 
 from files.system_setup.settings import get_auth
-
+from files.system_setup.system_logger import Logger
 
 @dataclass
 class OpenAIWhisperConfig:
@@ -19,7 +18,6 @@ class OpenAIWhisperConfig:
     sample_rate: int = 16000
     channels: int = 1
     chunk_seconds: float = 5.0
-
 
 class OpenAIWhisperCore:
     def __init__(self, input_device_index: Optional[int] = None, cfg: Optional[OpenAIWhisperConfig] = None):
@@ -44,14 +42,25 @@ class OpenAIWhisperCore:
         self.running = True
         self.paused = False
 
-        self.stream = sd.InputStream(
-            samplerate=self.cfg.sample_rate,
-            channels=self.cfg.channels,
-            dtype="int16",
-            device=self.input_device_index,
-            callback=self._audio_callback,
+        try:
+            self.stream = sd.InputStream(
+                samplerate=self.cfg.sample_rate,
+                channels=self.cfg.channels,
+                dtype="int16",
+                device=self.input_device_index,
+                callback=self._audio_callback,
+            )
+            self.stream.start()
+        except Exception as e:
+            self.running = False
+            Logger.warn(
+                f"OpenAI STT failed to open input device {self.input_device_index!r}: {e}"
+            )
+            raise
+
+        Logger.print(
+            f"OpenAI STT capturing on device {self.input_device_index!r} (model={self.cfg.model!r})"
         )
-        self.stream.start()
 
         self.worker_thread = threading.Thread(target=self._worker, daemon=True)
         self.worker_thread.start()
@@ -115,12 +124,21 @@ class OpenAIWhisperCore:
                         audio_bytes = b""
 
                 if audio_bytes:
-                    self._transcribe(audio_bytes)
+                    try:
+                        self._transcribe(audio_bytes)
+                    except Exception as e:
+                        Logger.warn(f"OpenAI STT worker error: {e}")
 
             except queue.Empty:
                 time.sleep(0.05)
 
     def _transcribe(self, pcm_bytes: bytes):
+        if not pcm_bytes:
+            return
+        min_bytes = int(self.cfg.sample_rate * self.cfg.channels * 2 * 0.2)
+        if len(pcm_bytes) < min_bytes:
+            return
+
         wav_io = io.BytesIO()
 
         with wave.open(wav_io, "wb") as wf:
@@ -132,11 +150,15 @@ class OpenAIWhisperCore:
         wav_io.seek(0)
         wav_io.name = "speech.wav"
 
-        result = self.client.audio.transcriptions.create(
-            model=self.cfg.model,
-            file=wav_io,
-            language=self.cfg.language or None,
-        )
+        try:
+            result = self.client.audio.transcriptions.create(
+                model=self.cfg.model,
+                file=wav_io,
+                language=self.cfg.language or None,
+            )
+        except Exception as e:
+            Logger.warn(f"OpenAI STT transcription failed (model={self.cfg.model!r}): {e}")
+            return
 
         text = getattr(result, "text", "").strip()
 

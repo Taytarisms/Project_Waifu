@@ -51,7 +51,7 @@ def dedupe_memory(
         Logger.error(f"Memory deduplication failed: {e}")
         return False
 
-def add_memory(text: str, user_id: str, speaker: str, scope: str = SCOPE_CHATTER, memory_type: str = "chat", source: str = "chat", tags: Optional[List[str]] = None) -> bool:
+def add_memory(text: str, user_id: str, speaker: str, scope: str = SCOPE_CHATTER, memory_type: str = "chat", source: str = "chat", tags: Optional[List[str]] = None, created_at: Optional[str] = None) -> bool:
     if not text or not text.strip():
         return False
     if dedupe_memory(text, user_id=user_id, speaker=speaker):
@@ -64,7 +64,7 @@ def add_memory(text: str, user_id: str, speaker: str, scope: str = SCOPE_CHATTER
             "scope": scope,
             "memory_type": memory_type,
             "source": source,
-            "created_at": datetime.now(timezone.utc).isoformat()}
+            "created_at": created_at or datetime.now(timezone.utc).isoformat()}
 
         if tags:
             metadata["tags"] = ",".join(t.strip().lower() for t in tags if t.strip())
@@ -341,6 +341,7 @@ async def add_memory_main(
     memory_type: str = "chat",
     source: str = "chat",
     tags: Optional[List[str]] = None,
+    created_at: Optional[str] = None,
 ) -> bool:
     return await run_mem_loop(
         add_memory,
@@ -351,6 +352,7 @@ async def add_memory_main(
         memory_type=memory_type,
         source=source,
         tags=tags,
+        created_at=created_at,
     )
 
 

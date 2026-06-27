@@ -14,7 +14,6 @@ class GoogleSTTConfig:
     adjust_ambient: bool = True
     energy_threshold: Optional[int] = None
 
-
 class GoogleSTTCore:
     def __init__(self, input_device_index: Optional[int] = None, cfg: Optional[GoogleSTTConfig] = None):
         self.input_device_index = input_device_index
@@ -63,7 +62,28 @@ class GoogleSTTCore:
 
     def _listen_loop(self):
         try:
-            with sr.Microphone(device_index=self.input_device_index) as source:
+            device_index = self.input_device_index
+            try:
+                names = sr.Microphone.list_microphone_names()
+            except Exception:
+                names = []
+
+            if device_index is not None:
+                if names and 0 <= int(device_index) < len(names):
+                    Logger.print(
+                        f"Google STT input device [{device_index}]: {names[int(device_index)]}"
+                    )
+                else:
+                    Logger.warn(
+                        f"Google STT device index {device_index} is out of range for its audio "
+                        f"backend (PyAudio sees {len(names)} devices). The 'List Input Devices' "
+                        f"button uses sounddevice, which numbers devices differently than Google's "
+                        f"PyAudio backend, so the index may not match. Falling back to the default "
+                        f"microphone."
+                    )
+                    device_index = None
+
+            with sr.Microphone(device_index=device_index) as source:
                 if self.cfg.adjust_ambient:
                     try:
                         self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
