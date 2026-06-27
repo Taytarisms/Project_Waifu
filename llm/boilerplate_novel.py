@@ -12,7 +12,7 @@ except Exception:
 
 from novelai_api.Preset import Model, Preset
 from novelai_api.Tokenizer import Tokenizer
-from novelai_api.utils import b64_to_tokens, tokens_to_b64, get_access_key
+from novelai_api.utils import b64_to_tokens, tokens_to_b64
 
 try:
     from novelai_api import NovelAIAPI
@@ -715,34 +715,11 @@ def extract_username(user_info: dict) -> str:
         or "Unknown"
     )
 
-async def login_with_credentials(email: str, password: str) -> str:
-    access_key = get_access_key(email, password)
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            "https://api.novelai.net/user/login",
-            json={"key": access_key},
-        )
-    if response.status_code not in (200, 201):
-        Logger.error(f"Login failed {response.status_code}: {response.text}")
-        return ""
-    data = response.json()
-    return data.get("accessToken") or data.get("token") or ""
-
 async def main() -> None:
-    print("Login method:  1. API token   2. Email + password")
-    choice = input("Choice: ").strip()
-
-    if choice == "2":
-        email = input("Email: ").strip()
-        password = input("Password: ").strip()
-        token = await login_with_credentials(email, password)
-
-        if not token:
-            print("Login failed.")
-            return
-    else:
-        token = input("Token: ").strip()
+    token = input("NovelAI API token: ").strip()
+    if not token:
+        print("NovelAI API token is required.")
+        return
 
     client = NovelAIClient(api_token=token)
     print(f"Tier: {await client.detect_tier()}")

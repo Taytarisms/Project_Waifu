@@ -23,7 +23,9 @@ import psutil
 from files.system_setup.settings import get_settings
 from files.system_setup.gpu_compat import (
     cuda13_support_message,
+    detect_amd_gpu_names,
     detect_nvidia_compute_capability,
+    format_gpu_names,
     should_force_llama_cpp_cpu,
 )
 import re
@@ -540,14 +542,21 @@ def _build_llama_kwargs(
     n_batch = _positive_int(config.n_batch, min(2048, n_ctx), minimum=1)
     n_gpu_layers = int(config.n_gpu_layers)
     if n_gpu_layers != 0:
-        if detect_nvidia_compute_capability() is None:
-            print("No NVIDIA CUDA-capable GPU found; using CPU offload.")
-            n_gpu_layers = 0
-        elif should_force_llama_cpp_cpu():
+        nvidia_cc = detect_nvidia_compute_capability()
+        amd_gpus = detect_amd_gpu_names()
+        if nvidia_cc is not None and should_force_llama_cpp_cpu():
             message = cuda13_support_message()
             if message:
                 print(f"{message}")
-            print("Forcing GPU offloading.")
+            print("Forcing CPU-only local model load.")
+            n_gpu_layers = 0
+        elif nvidia_cc is None and amd_gpus:
+            print(
+                "AMD GPU detected; allowing llama.cpp GPU offload if the "
+                f"installed runtime has Vulkan/HIP support: {format_gpu_names(amd_gpus)}"
+            )
+        elif nvidia_cc is None:
+            print("No NVIDIA CUDA-capable or AMD GPU found; using CPU-only local model load.")
             n_gpu_layers = 0
 
     kwargs: Dict[str, Any] = dict(
@@ -584,6 +593,13 @@ def _is_retryable_llama_load_error(exc: Exception) -> bool:
         "cublas",
         "cudart",
         "ggml_cuda",
+        "ggml_vulkan",
+        "ggml_hip",
+        "ggml_backend",
+        "vulkan",
+        "hip",
+        "rocblas",
+        "no gpu support",
         "no kernel image",
         "invalid device function",
         "invalid resource handle",
