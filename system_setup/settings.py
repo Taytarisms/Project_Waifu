@@ -24,8 +24,6 @@ sections: dict[str, dict[str, Any]] = {}
 
 KEY_ROUTES = {'NOVELAI_TOKEN': 'auth',
  'NOVELAI_USERNAME': 'auth',
- 'NOVELAI_EMAIL': 'auth',
- 'NOVELAI_PASS': 'auth',
  'OPENAI_API_KEY': 'auth',
  'ANTHROPIC_API_KEY': 'auth',
  'GEMINI_API_KEY': 'auth',
@@ -211,7 +209,7 @@ KEY_ROUTES = {'NOVELAI_TOKEN': 'auth',
  'TWITCH_PAUSED': 'twitch',
  'TWITCH_IGNORED_PREFIXES': 'twitch'}
 
-DEFAULTS = {'auth': {'novelai': {'mail': '', 'username': '', 'password': '', 'token': ''},
+DEFAULTS = {'auth': {'novelai': {'username': '', 'token': ''},
           'openai': {'token': ''},
           'anthropic': {'token': ''},
           'google': {'token': ''},
@@ -408,8 +406,6 @@ DEFAULTS = {'auth': {'novelai': {'mail': '', 'username': '', 'password': '', 'to
             'TWITCH_IGNORED_PREFIXES': ''}}
 
 AUTH_ALIASES = {'NOVELAI_USERNAME': ('novelai', 'username'),
- 'NOVELAI_EMAIL': ('novelai', 'mail'),
- 'NOVELAI_PASS': ('novelai', 'password'),
  'NOVELAI_TOKEN': ('novelai', 'token'),
  'OPENAI_API_KEY': ('openai', 'token'),
  'ANTHROPIC_API_KEY': ('anthropic', 'token'),

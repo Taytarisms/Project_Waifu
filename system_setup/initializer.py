@@ -1,5 +1,5 @@
 from files.system_setup.settings import save_settings, get_settings, save_auth, get_auth
-from files.llm.boilerplate_novel import NovelAIClient, login_with_credentials, fetch_user_info, extract_username
+from files.llm.boilerplate_novel import NovelAIClient, fetch_user_info, extract_username
 from files.llm.openai_llm import system_message
 
 import asyncio
@@ -70,21 +70,18 @@ def initialize_model(chat_model_name: str) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            print("Logging into NovelAI!")
-            email, password = get_or_create_novelai_credentials()
-            token = loop.run_until_complete(
-                login_with_credentials(email=email, password=password)
-            )
+            print("Loading NovelAI API token!")
+            token = get_or_create_novelai_token()
             if not token:
-                print("NovelAI login failed.")
+                print("NovelAI API token is required.")
                 return
 
             save_auth("novelai", "token", token)
+            save_auth("novelai", "mail", "")
+            save_auth("novelai", "password", "")
 
             user_info = loop.run_until_complete(fetch_user_info(token))
             username = extract_username(user_info)
-            if username == "Unknown" and email:
-                username = email.split("@")[0]
 
             save_auth("novelai", "username", username)
             get_or_create_novelai_model()
@@ -93,7 +90,7 @@ def initialize_model(chat_model_name: str) -> None:
             print(f"Welcome: {username}!")
 
         except Exception:
-            print("Error when loading NovelAI credentials:")
+            print("Error when loading NovelAI token:")
             print(traceback.format_exc())
         finally:
             loop.close()
@@ -155,22 +152,20 @@ def set_fish(fish_id: str) -> str:
     fish_voiceid = fish_id
     return fish_voiceid
 
-def get_or_create_novelai_credentials() -> tuple[str, str]:
-    email = get_auth("novelai", "mail")
-    password = get_auth("novelai", "password")
+def get_or_create_novelai_token() -> str:
+    token = get_auth("novelai", "token") or get_settings("NOVELAI_TOKEN")
+    if token:
+        print("Using saved NovelAI API token.")
+        return token
 
-    if email and password:
-        print("Using saved NovelAI credentials.")
-        return email, password
-
-    print("NovelAI credentials not found. One-time login required.")
-    email    = input("📧 Email: ").strip()
-    password = input("🔒 Password: ").strip()
-
-    save_auth("novelai", "mail", email)
-    save_auth("novelai", "password", password)
-
-    return email, password
+    print("NovelAI API token not found.")
+    print("Email/password login is no longer supported; paste a NovelAI API token.")
+    token = input("NovelAI API token: ").strip()
+    if token:
+        save_auth("novelai", "token", token)
+        save_auth("novelai", "mail", "")
+        save_auth("novelai", "password", "")
+    return token
 
 if __name__ == "__main__":
     print("Press Ctrl+C to exit.")

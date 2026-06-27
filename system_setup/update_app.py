@@ -41,6 +41,16 @@ DEFAULT_PROTECTED_PATHS = (
 )
 GENERATED_DIR_NAMES = {"__pycache__"}
 GENERATED_SUFFIXES = (".pyc", ".pyo")
+IGNORED_SOURCE_PATHS = (
+    ".git/",
+    ".github/",
+    ".gitignore",
+    ".gitattributes",
+    "LICENSE",
+    "LICENSE.md",
+    "README.md",
+    "files/",
+)
 
 
 class UpdateError(RuntimeError):
@@ -54,6 +64,19 @@ def _now_iso() -> str:
 
 def _normalize_rel(path: str | Path) -> str:
     return str(path).replace("\\", "/").strip("/")
+
+def _is_ignored_source(rel_path: str | Path) -> bool:
+    rel = _normalize_rel(rel_path)
+    for ignored in IGNORED_SOURCE_PATHS:
+        norm = _normalize_rel(ignored)
+        if not norm:
+            continue
+        if ignored.endswith("/"):
+            if rel == norm or rel.startswith(norm + "/"):
+                return True
+        elif rel == norm:
+            return True
+    return False
 
 def _is_protected(rel_path: str | Path, protected_paths: tuple[str, ...]) -> bool:
     rel = _normalize_rel(rel_path)
@@ -211,6 +234,8 @@ def _iter_source_files(source_root: Path, protected_paths: tuple[str, ...]):
             continue
         rel = _normalize_rel(path.relative_to(source_root))
         if _is_protected(rel, protected_paths):
+            continue
+        if _is_ignored_source(rel):
             continue
         yield rel, path
 
