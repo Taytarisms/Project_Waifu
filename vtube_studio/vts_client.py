@@ -235,6 +235,14 @@ class VTSRawClient:
             await_response=True,
         )
 
+    async def list_input_parameters(self, *, timeout: float = 8.0) -> dict | None:
+        return await self.request(
+            "InputParameterListRequest",
+            {},
+            timeout=timeout,
+            await_response=True,
+        )
+
     async def inject_parameter_values(
         self,
         parameter_values: list[dict],

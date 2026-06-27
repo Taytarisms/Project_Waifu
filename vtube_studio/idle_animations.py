@@ -15,8 +15,12 @@ CUSTOM_PARAMS = [
     {"parameterName": "AIBodyAngleZ",  "explanation": "AI idle body tilt",     "min": -20, "max": 20, "defaultValue": 0},
     {"parameterName": "AIEyeX",        "explanation": "AI idle gaze X",        "min": -1,  "max": 1,  "defaultValue": 0},
     {"parameterName": "AIEyeY",        "explanation": "AI idle gaze Y",        "min": -1,  "max": 1,  "defaultValue": 0},
+    {"parameterName": "AIEyeLeftX",    "explanation": "AI idle gaze X",        "min": -1,  "max": 1,  "defaultValue": 0},
+    {"parameterName": "AIEyeLeftY",    "explanation": "AI idle gaze Y",        "min": -1,  "max": 1,  "defaultValue": 0},
     {"parameterName": "AIEyeOpenL",    "explanation": "AI idle L eye open",    "min": 0,   "max": 1,  "defaultValue": 1},
     {"parameterName": "AIEyeOpenR",    "explanation": "AI idle R eye open",    "min": 0,   "max": 1,  "defaultValue": 1},
+    {"parameterName": "AIEyeOpenLeft", "explanation": "AI idle L eye open",    "min": 0,   "max": 1,  "defaultValue": 1},
+    {"parameterName": "AIEyeOpenRight","explanation": "AI idle R eye open",    "min": 0,   "max": 1,  "defaultValue": 1},
     {"parameterName": "AIEyeSmileL",   "explanation": "AI idle L eye smile",   "min": 0,   "max": 1,  "defaultValue": 0},
     {"parameterName": "AIEyeSmileR",   "explanation": "AI idle R eye smile",   "min": 0,   "max": 1,  "defaultValue": 0},
     {"parameterName": "AIMouthForm",   "explanation": "AI idle mouth shape",   "min": -1,  "max": 1,  "defaultValue": 0},
@@ -24,6 +28,13 @@ CUSTOM_PARAMS = [
     {"parameterName": "AIBrowLY",      "explanation": "AI idle L brow",        "min": -1,  "max": 1,  "defaultValue": 0},
     {"parameterName": "AIBrowRY",      "explanation": "AI idle R brow",        "min": -1,  "max": 1,  "defaultValue": 0},
 ]
+CUSTOM_PARAM_NAMES = {param["parameterName"] for param in CUSTOM_PARAMS}
+PARAM_ALIASES = {
+    "AIEyeX": ("AIEyeLeftX",),
+    "AIEyeY": ("AIEyeLeftY",),
+    "AIEyeOpenL": ("AIEyeOpenLeft",),
+    "AIEyeOpenR": ("AIEyeOpenRight",),
+}
 
 IDLE_PROFILES = {
     # A relaxed state with visible movement, not a statue.
@@ -125,6 +136,15 @@ def _layered_noise(t: float, seed: int, octaves: int = 3) -> float:
 
 def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * min(1.0, max(0.0, t))
+
+def _with_param_aliases(values: dict[str, float]) -> dict[str, float]:
+    expanded = dict(values)
+    for source, aliases in PARAM_ALIASES.items():
+        if source not in values:
+            continue
+        for alias in aliases:
+            expanded.setdefault(alias, values[source])
+    return expanded
 
 def _gesture_double_blink():
     return [
@@ -381,6 +401,7 @@ class IdleAnimationEngine:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._params_registered = False
+        self._last_registration_failures: list[str] = []
         self._consecutive_send_failures = 0
         self._max_consecutive_send_failures = 8
 
@@ -419,7 +440,7 @@ class IdleAnimationEngine:
         if self._running:
             self._logger("Idle animation already running.")
             return True
-        if not await self._register_custom_params():
+        if not await self.ensure_custom_params_registered():
             self._logger("Failed to register custom params — is VTS connected?")
             return False
         self.set_idle_profile(self._current_profile_name)
@@ -523,22 +544,111 @@ class IdleAnimationEngine:
             self._profile_change_interval = (max(5.0, float(lo)), max(6.0, float(hi)))
         self._next_profile_change = time.monotonic() + random.uniform(*self._profile_change_interval)
 
-    async def _register_custom_params(self) -> bool:
+    async def ensure_custom_params_registered(self) -> bool:
         if self._params_registered:
             return True
+
+        request_completed = await self._register_custom_params()
+        if not request_completed:
+            return False
+
+        missing = await self._missing_custom_params()
+        if missing is None:
+            if self._last_registration_failures:
+                self._logger(
+                    "Custom VTS parameter registration had errors and could not be verified."
+                )
+                return False
+            self._logger("Custom VTS parameter registration completed, but verification was unavailable.")
+            self._params_registered = True
+            return True
+
+        if missing:
+            self._logger(
+                "Custom VTS parameter registration did not verify. Missing: "
+                + ", ".join(missing)
+            )
+            self._params_registered = False
+            return False
+
+        self._params_registered = True
+        if self._last_registration_failures:
+            self._logger(
+                "Some VTS parameter create requests were rejected, but all required "
+                "parameters are already present and usable."
+            )
+        self._logger(f"Registered and verified {len(CUSTOM_PARAMS)} custom VTS parameters.")
+        return True
+
+    async def _register_custom_params(self) -> bool:
+        failures: list[str] = []
+        self._last_registration_failures = []
         try:
             for p in CUSTOM_PARAMS:
-                await self._client.create_parameter(
+                response = await self._client.create_parameter(
                     parameter_name=p["parameterName"], min_value=p["min"],
                     max_value=p["max"], default_value=p["defaultValue"],
                     explanation=p.get("explanation", ""),
                 )
-            self._params_registered = True
-            self._logger(f"Registered {len(CUSTOM_PARAMS)} custom VTS parameters.")
-            return True
+                if not self._parameter_creation_ok(response, p["parameterName"]):
+                    failures.append(f"{p['parameterName']}: {self._format_vts_error(response)}")
         except Exception as e:
             self._logger(f"Custom param registration failed: {e}")
             return False
+
+        if failures:
+            self._last_registration_failures = failures
+            self._logger("Custom VTS parameter registration errors:")
+            for failure in failures:
+                self._logger(f"  {failure}")
+            self._logger("Checking whether those parameters already exist in VTube Studio...")
+
+        return True
+
+    @staticmethod
+    def _parameter_creation_ok(response, parameter_name: str) -> bool:
+        if not isinstance(response, dict):
+            return False
+        if response.get("messageType") != "ParameterCreationResponse":
+            return False
+        data = response.get("data", {})
+        return data.get("parameterName") == parameter_name
+
+    @staticmethod
+    def _format_vts_error(response) -> str:
+        if not isinstance(response, dict):
+            return "no response"
+        data = response.get("data", {})
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error") or data.get("reason")
+            error_id = data.get("errorID") or data.get("errorId") or data.get("id")
+            if message and error_id:
+                return f"{message} (error {error_id})"
+            if message:
+                return str(message)
+        return str(response)
+
+    async def _missing_custom_params(self) -> Optional[list[str]]:
+        try:
+            response = await self._client.list_input_parameters(timeout=8.0)
+        except Exception as e:
+            self._logger(f"Could not verify custom VTS parameters: {e}")
+            return None
+
+        if not isinstance(response, dict):
+            return None
+        if response.get("messageType") == "APIError":
+            self._logger(f"Could not verify custom VTS parameters: {self._format_vts_error(response)}")
+            return None
+
+        data = response.get("data", {})
+        custom_parameters = data.get("customParameters", []) if isinstance(data, dict) else []
+        existing = {
+            item.get("name")
+            for item in custom_parameters
+            if isinstance(item, dict)
+        }
+        return sorted(CUSTOM_PARAM_NAMES - existing)
 
     async def _loop(self) -> None:
         self._logger("Idle animation loop entering main cycle.")
@@ -562,7 +672,10 @@ class IdleAnimationEngine:
             self._tick_mouth(t, out)
             self._tick_gesture(now, out)
 
-            vts_params = [{"id": k, "value": float(v)} for k, v in out.items()]
+            vts_params = [
+                {"id": k, "value": float(v)}
+                for k, v in _with_param_aliases(out).items()
+            ]
             if vts_params:
                 await self._send_params(vts_params)
 

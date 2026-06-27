@@ -150,6 +150,23 @@ class VTSHotkeyManager:
         )
 
     @property
+    def custom_params_registered(self) -> bool:
+        return bool(
+            self._idle_engine is not None
+            and getattr(self._idle_engine, "_params_registered", False)
+        )
+
+    async def register_custom_parameters(self) -> bool:
+        async with self._lock:
+            if not await self._connect_locked():
+                return False
+
+            if self._idle_engine is None:
+                self._idle_engine = IdleAnimationEngine(self._client, logger=self._safe_log)
+
+            return await self._idle_engine.ensure_custom_params_registered()
+
+    @property
     def userdata_path(self) -> Path:
         return Path(self.settings.userdata_dir)
 
@@ -210,6 +227,12 @@ class VTSHotkeyManager:
 
             if self._idle_engine is None:
                 self._idle_engine = IdleAnimationEngine(self._client, logger=self._safe_log)
+
+            try:
+                if not await self._idle_engine.ensure_custom_params_registered():
+                    self.logger("Connected to VTS, but custom VTS parameters are not ready.")
+            except Exception as e:
+                self.logger(f"Custom VTS parameter registration failed: {e}")
 
             return True
 
