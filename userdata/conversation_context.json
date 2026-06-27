@@ -1,4 +1,12 @@
 {
-  "updated_at": "2026-06-17T07:31:03.260792+00:00",
-  "turns": []
+  "updated_at": "2026-06-27T07:54:18.629998+00:00",
+  "turns": [
+    {
+      "source": "stt",
+      "speaker": "User",
+      "user": "hello how are you",
+      "assistant": "Error in OpenAI generation: OpenAI API key is missing. Add it in the OpenAI provider settings first.",
+      "created_at": "2026-06-27T07:54:18.629871+00:00"
+    }
+  ]
 }

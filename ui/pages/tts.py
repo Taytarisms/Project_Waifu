@@ -268,8 +268,8 @@ class TTSProviderPage(ctk.CTkFrame):
             "NovelAI": {
                 "group": "novelai",
                 "key": "token",
-                "title": "NovelAI Token Required",
-                "label": "NovelAI TTS needs a NovelAI token before it can be used.",
+                "title": "NovelAI API Token Required",
+                "label": "NovelAI now requires an API token. Paste your NovelAI API token before using NovelAI LLM or TTS.",
             },
             "InWorld": {
                 "group": "inworld",
@@ -387,16 +387,19 @@ class TTSProviderPage(ctk.CTkFrame):
         if existing:
             return True
 
-        AuthTokenDialog(
-            self,
-            title=requirement["title"],
-            label=requirement["label"],
-            on_save=lambda token: self._save_auth_and_activate(requirement, token),
-        )
+        self._prompt_auth_token(requirement)
         return False
 
     def _save_auth_and_activate(self, requirement, token):
         save_auth(requirement["group"], requirement["key"], token)
+        if requirement["group"] == "novelai":
+            save_auth("novelai", "mail", "")
+            save_auth("novelai", "password", "")
+        if hasattr(self, "auth_status_label"):
+            self.auth_status_label.configure(
+                text="Token saved.",
+                text_color=theme.SUCCESS,
+            )
         self.status_label.configure(text="Token saved. Activating provider...")
         self.activate_provider()
 
@@ -456,10 +459,24 @@ class TTSProviderPage(ctk.CTkFrame):
             command=lambda: self._clear_auth_token(requirement),
         ).pack(fill="x", padx=16, pady=4)
 
+        ctk.CTkButton(
+            parent,
+            text="Set Token",
+            command=lambda: self._prompt_auth_token(requirement),
+        ).pack(fill="x", padx=16, pady=4)
+
     def _clear_auth_token(self, requirement):
         if save_auth:
             save_auth(requirement["group"], requirement["key"], "")
         self.auth_status_label.configure(text="Token cleared.", text_color=theme.MUTED_TEXT)
+
+    def _prompt_auth_token(self, requirement):
+        AuthTokenDialog(
+            self,
+            title=requirement["title"],
+            label=requirement["label"],
+            on_save=lambda token: self._save_auth_and_activate(requirement, token),
+        )
 
     def _build_test_speak_tools(self, parent):
         ctk.CTkLabel(

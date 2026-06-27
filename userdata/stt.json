@@ -1,6 +1,6 @@
 {
     "stt_mode": "Hot Mic",
-    "stt_engine": "Local Whisper",
+    "stt_engine": "Google",
     "stt_openai_model": "gpt-4o-transcribe",
     "stt_openai_chunk_seconds": 5.0,
     "stt_device_index": "1",

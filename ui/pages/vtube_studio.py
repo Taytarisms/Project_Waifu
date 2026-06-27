@@ -52,6 +52,7 @@ class VTubeStudioPage(ctk.CTkFrame):
             self.manager.set_logger(self._log_async_safe)
         self.status_var = ctk.StringVar(value="VTube Studio page ready.")
         self.hotkey_count_var = ctk.StringVar(value="Cached hotkeys: 0")
+        self.param_status_var = ctk.StringVar(value="Params: Unknown")
         self.connection_var = ctk.StringVar(value="Disconnected")
         self.idle_status_var = ctk.StringVar(value="Idle: Off")
         self.slot_dropdowns = {}
@@ -123,6 +124,9 @@ class VTubeStudioPage(ctk.CTkFrame):
                 self._ac_port = connected_port
                 self.port_var.set(str(connected_port))
                 self.connection_var.set(f"Connected (:{connected_port})")
+                self.param_status_var.set(
+                    "Params: Ready" if self.manager.custom_params_registered else "Params: Failed"
+                )
                 self._log(f"Auto-connected to VTS on port {connected_port}.")
 
                 if self.autoconnect_var.get():
@@ -130,6 +134,7 @@ class VTubeStudioPage(ctk.CTkFrame):
 
                 return
             self.connection_var.set("Auto-connect failed")
+            self.param_status_var.set("Params: Unknown")
             if (
                 self.autoconnect_var.get()
                 and self._autoconnect_attempt < self._autoconnect_max_attempts
@@ -157,6 +162,7 @@ class VTubeStudioPage(ctk.CTkFrame):
         ctk.CTkButton(controls, text="Connect", command=self.connect_clicked).pack(side="left", padx=12, pady=12)
         ctk.CTkButton(controls, text="Close", command=self.close_clicked).pack(side="left", padx=(0, 12), pady=12)
         ctk.CTkButton(controls, text="Refresh Hotkeys", command=self.refresh_hotkeys_clicked).pack(side="left", padx=(0, 12), pady=12)
+        ctk.CTkButton(controls, text="Register Parameters", command=self.register_params_clicked).pack(side="left", padx=(0, 12), pady=12)
         ctk.CTkButton(controls, text="Save Mapping", command=self.save_mapping_clicked).pack(side="left", padx=(0, 12), pady=12)
         ctk.CTkButton(controls, text="Test First Mapped", command=self.test_selected_clicked).pack(side="left", padx=(0, 12), pady=12)
         ctk.CTkButton(controls, text="Full Reset", command=self.full_reset_clicked, fg_color=getattr(theme, "DANGER", "#8b2f2f")).pack(side="left", padx=(0, 12), pady=12)
@@ -181,6 +187,7 @@ class VTubeStudioPage(ctk.CTkFrame):
         info_row.pack(fill="x", pady=(0, 12))
         ctk.CTkLabel(info_row, textvariable=self.connection_var, text_color=theme.MUTED_TEXT).pack(side="left", padx=(0, 18))
         ctk.CTkLabel(info_row, textvariable=self.hotkey_count_var, text_color=theme.MUTED_TEXT).pack(side="left", padx=(0, 18))
+        ctk.CTkLabel(info_row, textvariable=self.param_status_var, text_color=theme.MUTED_TEXT).pack(side="left", padx=(0, 18))
         ctk.CTkLabel(info_row, textvariable=self.idle_status_var, text_color=theme.MUTED_TEXT).pack(side="left")
 
         self.status_label = ctk.CTkLabel(outer, textvariable=self.status_var, text_color=theme.MUTED_TEXT)
@@ -240,6 +247,9 @@ class VTubeStudioPage(ctk.CTkFrame):
         def update_ui():
             if ok:
                 self.connection_var.set(f"Connected (:{selected_port})")
+                self.param_status_var.set(
+                    "Params: Ready" if self.manager.custom_params_registered else "Params: Failed"
+                )
                 self._log(f"Reconnected to VTS on port {selected_port}.")
 
                 if self.autoconnect_var.get():
@@ -247,6 +257,7 @@ class VTubeStudioPage(ctk.CTkFrame):
 
             else:
                 self.connection_var.set("Reconnect failed")
+                self.param_status_var.set("Params: Unknown")
                 self.idle_status_var.set("Idle: Off")
                 detail = f" Last error: {last_error}" if last_error else ""
                 self._log(
@@ -586,6 +597,9 @@ class VTubeStudioPage(ctk.CTkFrame):
                 self._ac_port = connected_port
                 self.port_var.set(str(connected_port))
                 self.connection_var.set(f"Connected (:{connected_port})")
+                self.param_status_var.set(
+                    "Params: Ready" if self.manager.custom_params_registered else "Params: Failed"
+                )
                 self._log(f"Connected to VTS on port {connected_port}.")
 
                 if self.autoconnect_var.get():
@@ -593,6 +607,7 @@ class VTubeStudioPage(ctk.CTkFrame):
 
             else:
                 self.connection_var.set("Connection failed")
+                self.param_status_var.set("Params: Unknown")
                 detail = f" Last error: {last_error}" if last_error else ""
                 self._log(
                     "Connection failed. Check that VTube Studio is open, "
@@ -611,7 +626,24 @@ class VTubeStudioPage(ctk.CTkFrame):
         def update_ui():
             self.connection_var.set("Disconnected")
             self.idle_status_var.set("Idle: Off")
+            self.param_status_var.set("Params: Unknown")
             self._log("Closed VTS connection.")
+        self._ui(update_ui)
+
+    def register_params_clicked(self):
+        self._log("Registering VTS custom parameters...")
+        self._run_async_thread(self._register_params_async)
+
+    async def _register_params_async(self):
+        ok = await self.manager.register_custom_parameters()
+        def update_ui():
+            if ok:
+                self.param_status_var.set("Params: Ready")
+                self.connection_var.set(f"Connected (:{self.manager.settings.port})")
+                self._log("VTS custom parameters registered and verified.")
+            else:
+                self.param_status_var.set("Params: Failed")
+                self._log("VTS custom parameter registration failed. Check the console log and VTube Studio plugin permissions.")
         self._ui(update_ui)
 
     def refresh_hotkeys_clicked(self):

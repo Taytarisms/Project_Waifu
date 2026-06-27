@@ -164,7 +164,7 @@ class MemoryPage(ctk.CTkFrame):
 
         ctk.CTkLabel(
             parent,
-            text="Import persisted contextual memories from a w-AI-fu folder or zip.",
+            text="Import contextual memories and VectorDB long-term memories from a w-AI-fu folder or zip.",
             text_color=theme.MUTED_TEXT,
             font=ctk.CTkFont(size=12),
             wraplength=320,
@@ -196,7 +196,7 @@ class MemoryPage(ctk.CTkFrame):
 
         ctk.CTkButton(
             parent,
-            text="Import w-AI-fu Memories",
+            text="Import w-AI-fu / VectorDB Memories",
             command=self.import_w_ai_fu_memories,
         ).pack(fill="x", padx=16, pady=4)
 
@@ -436,6 +436,8 @@ class MemoryPage(ctk.CTkFrame):
             "w-AI-fu import preview",
             f"Config: {preview.config_path}",
             f"Contextual memories: {preview.contextual_count}",
+            f"VectorDB memories: {preview.vectordb_count}",
+            f"VectorDB database: {preview.database_path or 'not found'}",
             f"Character files found: {preview.character_count}",
             "",
         ]
@@ -444,9 +446,13 @@ class MemoryPage(ctk.CTkFrame):
             for item in preview.sample:
                 lines.append(f"- {item}")
         else:
-            lines.append("No persisted contextual memories found.")
+            lines.append("No importable memories found.")
         self._write_results("\n".join(lines))
-        self._set_status(f"Preview found {preview.contextual_count} contextual memories.")
+        self._set_status(
+            "Preview found "
+            f"{preview.contextual_count} contextual and "
+            f"{preview.vectordb_count} VectorDB memories."
+        )
 
     def import_w_ai_fu_memories(self):
         if not memory_backend:
@@ -467,7 +473,10 @@ class MemoryPage(ctk.CTkFrame):
         summary = (
             "w-AI-fu import complete\n"
             f"Config: {result.config_path}\n"
+            f"VectorDB database: {result.database_path or 'not found'}\n"
             f"Found: {result.found}\n"
+            f"Contextual found: {result.contextual_found}\n"
+            f"VectorDB found: {result.vectordb_found}\n"
             f"Imported: {result.imported}\n"
             f"Skipped duplicates: {result.skipped}\n"
             f"Failed: {result.failed}"

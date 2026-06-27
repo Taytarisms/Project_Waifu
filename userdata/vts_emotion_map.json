@@ -1,6 +1,5 @@
 {
-    "updated_at": "2026-05-26T14:24:23",
-    "current_emotion": "",
-    "full_reset_hotkey_sequence": [],
-    "emotions": {}
+  "current_emotion": "",
+  "full_reset_hotkey_sequence": [],
+  "emotions": {}
 }

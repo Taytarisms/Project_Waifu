@@ -541,6 +541,12 @@ class LLMProviderPage(ctk.CTkFrame):
                 "title": "OpenAI API Key Required",
                 "label": "OpenAI needs an API key before it can be used.",
             },
+            "NovelAI": {
+                "group": "novelai",
+                "key":   "token",
+                "title": "NovelAI API Token Required",
+                "label": "NovelAI now requires an API token. Paste your NovelAI API token before using NovelAI LLM or TTS.",
+            },
             "Claude": {
                 "group": "anthropic",
                 "key":   "token",
@@ -650,9 +656,6 @@ class LLMProviderPage(ctk.CTkFrame):
         ).pack(fill="x", padx=16, pady=(0, 16))
 
     def activate_provider(self):
-        if self.provider_name == "NovelAI":
-            self._activate_novelai()
-            return
         if not self._ensure_auth_token():
             return
         self._finish_activation()
@@ -728,58 +731,35 @@ class LLMProviderPage(ctk.CTkFrame):
 
     def _save_auth_and_activate(self, requirement, token):
         save_auth(requirement["group"], requirement["key"], token)
+        if requirement["group"] == "novelai":
+            save_auth("novelai", "mail", "")
+            save_auth("novelai", "password", "")
+            self._refresh_novelai_user_info(token)
+        if hasattr(self, "auth_status_label"):
+            self.auth_status_label.configure(
+                text="Token saved.",
+                text_color=theme.SUCCESS,
+            )
         self.status_label.configure(text="Token saved. Activating provider...")
         self.activate_provider()
 
-    def _activate_novelai(self):
-        saved_token = get_auth("novelai", "token") if get_auth else ""
-        if saved_token:
-            self._finish_activation()
+    def _refresh_novelai_user_info(self, token: str):
+        if not token or not save_auth:
             return
 
-        from files.ui.components.novel_login import NovelAILoginDialog
         import asyncio
-        from files.llm.boilerplate_novel import (
-            login_with_credentials,
-            fetch_user_info,
-            extract_username,
-        )
+        from files.llm.boilerplate_novel import fetch_user_info, extract_username
 
-        email, password = NovelAILoginDialog.prompt(self)
-        if email is None:
-            self.status_label.configure(text="Sign-in cancelled. NovelAI is not active.")
-            return
-
-        self.status_label.configure(text="Signing in…")
-        self.update_idletasks()
-
+        loop = asyncio.new_event_loop()
         try:
-            loop = asyncio.new_event_loop()
-            token = loop.run_until_complete(
-                login_with_credentials(email=email, password=password)
-            )
-            if not token:
-                self.status_label.configure(text="❌ Login failed. Check your email and password.")
-                return
-            if save_auth:
-                save_auth("novelai", "token", token)
-
             user_info = loop.run_until_complete(fetch_user_info(token))
-            username  = extract_username(user_info)
-            if username == "Unknown" and email:
-                username = email.split("@")[0]
-            if save_auth:
+            username = extract_username(user_info)
+            if username != "Unknown":
                 save_auth("novelai", "username", username)
-
-            self.status_label.configure(text=f"✅ Signed in as {username}. Activating NovelAI…")
-            self.update_idletasks()
-        except Exception as e:
-            self.status_label.configure(text=f"❌ Login error: {e}")
-            return
+        except Exception:
+            pass
         finally:
             loop.close()
-
-        self._finish_activation()
 
     def load_provider_ui(self, parent, provider):
         PAGE_MAP = {
