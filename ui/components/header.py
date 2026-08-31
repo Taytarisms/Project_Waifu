@@ -36,3 +36,33 @@ class SteamHeader(ctk.CTkFrame):
                 command=action_command,
                 width=140,
             ).pack(side="right", padx=24)
+
+
+class SubpageNavigation(ctk.CTkFrame):
+    def __init__(
+        self,
+        master,
+        *,
+        back_text="← Back",
+        back_command,
+        library_text=None,
+        library_command=None,
+    ):
+        super().__init__(master, fg_color="transparent")
+
+        ctk.CTkButton(
+            self,
+            text=back_text,
+            width=150,
+            fg_color="gray30",
+            command=back_command,
+        ).pack(side="left")
+
+        if library_text and library_command:
+            ctk.CTkButton(
+                self,
+                text=library_text,
+                width=150,
+                fg_color="gray25",
+                command=library_command,
+            ).pack(side="left", padx=(8, 0))

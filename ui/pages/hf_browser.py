@@ -1,7 +1,10 @@
 import threading
 import customtkinter as ctk
+
+from files.ui.components.scrolling import AppScrollableFrame
 from pathlib import Path
 from files.ui import theme
+from files.ui.components.header import SubpageNavigation
 
 try:
     from files.system_setup.model_checker import (
@@ -235,8 +238,8 @@ class _ModelCard(ctk.CTkFrame):
                     save_settings("local_model_filename", file_info["filename"])
                     save_settings("local_model_family", _infer_family_from_filename(file_info["filename"]))
                     try:
-                        from files.llm.LocalLLM import reset_local_model
-                        reset_local_model()
+                        from files.llm.local_worker_client import reset_local_worker_if_running
+                        reset_local_worker_if_running()
                     except Exception:
                         pass
                 if self.on_download:
@@ -294,12 +297,9 @@ class _FilePickerDialog(ctk.CTkToplevel):
             text_color="#8b949e",
         ).pack(anchor="w", padx=20, pady=(0, 10))
 
-        scroll = ctk.CTkScrollableFrame(self, fg_color="#161b22", corner_radius=8)
+        scroll = AppScrollableFrame(self, fg_color="#161b22", corner_radius=8)
         scroll.pack(fill="both", expand=True, padx=20, pady=(0, 16))
         self._file_scroll = scroll
-        self.bind("<MouseWheel>", self._on_dialog_mousewheel, add="+")
-        self.bind("<Button-4>", self._on_dialog_mousewheel, add="+")
-        self.bind("<Button-5>", self._on_dialog_mousewheel, add="+")
 
         for f in files:
             row = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -386,37 +386,17 @@ class _FilePickerDialog(ctk.CTkToplevel):
         py = self._owner.winfo_rooty() + (self._owner.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{px}+{py}")
 
-    def _on_dialog_mousewheel(self, event):
-        scroll = self._file_scroll
-        canvas = getattr(scroll, "_parent_canvas", None)
-        if canvas is None or canvas.yview() == (0.0, 1.0):
-            return "break"
-
-        if getattr(event, "num", None) == 4:
-            units = -3
-        elif getattr(event, "num", None) == 5:
-            units = 3
-        else:
-            delta = getattr(event, "delta", 0)
-            units = -int(delta / 120) if delta else 0
-            if units == 0 and delta:
-                units = -1 if delta > 0 else 1
-            units *= 3
-
-        if units:
-            canvas.yview_scroll(units, "units")
-        return "break"
-
     def _choose(self, file_info: dict):
         self.destroy()
         self.on_choose(file_info)
 
 class HFModelBrowserPage(ctk.CTkFrame):
-    def __init__(self, master, app=None):
+    def __init__(self, master, app=None, return_category: str | None = None):
         super().__init__(master, fg_color=theme.APP_BG)
         self.app = app
+        self.return_category = return_category
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 8))
@@ -424,7 +404,7 @@ class HFModelBrowserPage(ctk.CTkFrame):
 
         ctk.CTkLabel(
             header,
-            text="HuggingFace Model Browser",
+            text="Download Local Models",
             font=ctk.CTkFont(size=26, weight="bold"),
             text_color=theme.TEXT,
         ).grid(row=0, column=0, sticky="w")
@@ -434,9 +414,9 @@ class HFModelBrowserPage(ctk.CTkFrame):
             try:
                 vram  = detect_vram()
                 gname = get_gpu_name()
-                gpu_text = f"{gname}  •  {vram:.1f} GB VRAM"
+                gpu_text = f"Hugging Face GGUF browser  •  {gname}  •  {vram:.1f} GB VRAM"
             except Exception:
-                gpu_text = ""
+                gpu_text = "Search Hugging Face for GGUF models"
         else:
             gpu_text = "model_checker unavailable"
 
@@ -447,17 +427,16 @@ class HFModelBrowserPage(ctk.CTkFrame):
             text_color=theme.MUTED_TEXT,
         ).grid(row=1, column=0, sticky="w")
 
-        # Back button
-        ctk.CTkButton(
-            header,
-            text="← Back",
-            width=80,
-            fg_color="gray30",
-            command=self._go_back,
-        ).grid(row=0, column=2, rowspan=2, padx=(12, 0))
+        SubpageNavigation(
+            self,
+            back_text="← Local Models",
+            back_command=self._go_back,
+            library_text="⌂ LLM Library",
+            library_command=self._go_library,
+        ).grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 12))
 
         search_row = ctk.CTkFrame(self, fg_color="transparent")
-        search_row.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 12))
+        search_row.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 12))
         search_row.grid_columnconfigure(0, weight=1)
 
         self._search_var = ctk.StringVar(value="")
@@ -494,8 +473,8 @@ class HFModelBrowserPage(ctk.CTkFrame):
             command=self._do_search,
         ).grid(row=0, column=2, padx=(12, 0))
 
-        self._scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self._scroll.grid(row=2, column=0, sticky="nsew", padx=24, pady=(0, 16))
+        self._scroll = AppScrollableFrame(self, fg_color="transparent")
+        self._scroll.grid(row=3, column=0, sticky="nsew", padx=24, pady=(0, 16))
         self._scroll.grid_columnconfigure((0, 1), weight=1)
 
         self._status = ctk.CTkLabel(
@@ -504,7 +483,7 @@ class HFModelBrowserPage(ctk.CTkFrame):
             text_color=theme.MUTED_TEXT,
             font=ctk.CTkFont(size=12),
         )
-        self._status.grid(row=3, column=0, pady=(0, 12))
+        self._status.grid(row=4, column=0, pady=(0, 12))
 
         # Load defaults on open
         self._do_search()
@@ -557,10 +536,24 @@ class HFModelBrowserPage(ctk.CTkFrame):
             )
 
     def _on_downloaded(self, path: Path):
-        self._status.configure(text=f"✔  Downloaded to {path.parent.name}/")
+        self._status.configure(
+            text=f"Downloaded to {path.parent.name}/ and selected for Local."
+        )
 
     def _go_back(self):
-        if self.app and hasattr(self.app, "show_page"):
+        if (
+            self.return_category == "local"
+            and self.app
+            and hasattr(self.app, "show_dynamic_page")
+        ):
+            from files.ui.pages.llms import LLMCategoryPage
+
+            self.app.show_dynamic_page(LLMCategoryPage, category="local")
+        elif self.app and hasattr(self.app, "show_page"):
             self.app.show_page("LLM")
         elif self.app and hasattr(self.app, "go_back"):
             self.app.go_back()
+
+    def _go_library(self):
+        if self.app and hasattr(self.app, "show_page"):
+            self.app.show_page("LLM")

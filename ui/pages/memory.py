@@ -1,4 +1,6 @@
 import customtkinter as ctk
+
+from files.ui.components.scrolling import AppScrollableFrame
 from pathlib import Path
 from tkinter import filedialog
 from files.ui import theme
@@ -23,8 +25,8 @@ except Exception:
 
 SPEAKER_OPTIONS = ["any", "user", "assistant"]
 SCOPE_OPTIONS = ["any", "chatter", "global"]
-SOURCE_OPTIONS = ["any", "chat", "twitch", "discord", "system", "ui"]
-MEMORY_TYPE_OPTIONS = ["any", "user_fact", "assistant_response", "ai_self", "preference", "context", "chat"]
+SOURCE_OPTIONS = ["any", "chat", "twitch", "youtube", "kick", "discord", "system", "ui"]
+MEMORY_TYPE_OPTIONS = ["any", "user_fact", "assistant_response", "ai_self", "preference", "context", "chat", "w_ai_fu_long_term"]
 
 class MemoryPage(ctk.CTkFrame):
     def __init__(self, master, app):
@@ -32,7 +34,7 @@ class MemoryPage(ctk.CTkFrame):
         self.app = app
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=24, pady=20)
-        left = ctk.CTkScrollableFrame(body, fg_color=theme.CARD_BG, corner_radius=10)
+        left = AppScrollableFrame(body, fg_color=theme.CARD_BG, corner_radius=10)
         left.pack(side="left", fill="both", expand=True, padx=(0, 10))
         right_outer = ctk.CTkFrame(
             body,
@@ -42,7 +44,7 @@ class MemoryPage(ctk.CTkFrame):
         )
         right_outer.pack(side="right", fill="y", padx=(10, 0))
         right_outer.pack_propagate(False)
-        right = ctk.CTkScrollableFrame(
+        right = AppScrollableFrame(
             right_outer,
             fg_color="transparent",
             corner_radius=10,
@@ -80,11 +82,13 @@ class MemoryPage(ctk.CTkFrame):
         self.recall_speaker_var = ctk.StringVar(value="any")
         self.recall_scope_var = ctk.StringVar(value="any")
         self.recall_source_var = ctk.StringVar(value="any")
+        self.recall_memory_type_var = ctk.StringVar(value="any")
         self.recall_tag_var = ctk.StringVar(value="")
 
         self._dropdown_row(parent, "Speaker", self.recall_speaker_var, SPEAKER_OPTIONS)
         self._dropdown_row(parent, "Scope", self.recall_scope_var, SCOPE_OPTIONS)
         self._dropdown_row(parent, "Source", self.recall_source_var, SOURCE_OPTIONS)
+        self._dropdown_row(parent, "Memory Type", self.recall_memory_type_var, MEMORY_TYPE_OPTIONS)
         self._entry_row(parent, "Tag", self.recall_tag_var)
 
         self.recall_after_var = ctk.StringVar(value="")
@@ -105,18 +109,66 @@ class MemoryPage(ctk.CTkFrame):
         ctk.CTkButton(
             btn_frame,
             text="Clear Results",
-            command=lambda: self._write_results(""),
+            command=lambda: self._clear_results(),
             fg_color="gray30",
         ).pack(side="left")
 
-        self.results_box = ctk.CTkTextbox(
-            parent,
-            height=360,
-            fg_color="#0e141b",
-            text_color=theme.TEXT,
-            wrap="word",
+        selection_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        selection_frame.pack(fill="x", padx=18, pady=(4, 0))
+
+        self.select_all_button = ctk.CTkButton(
+            selection_frame,
+            text="Select All",
+            width=90,
+            command=self._select_all_results,
+            fg_color="gray30",
+            state="disabled",
         )
-        self.results_box.pack(fill="both", expand=True, padx=18, pady=(8, 18))
+        self.select_all_button.pack(side="left", padx=(0, 6))
+
+        self.clear_selection_button = ctk.CTkButton(
+            selection_frame,
+            text="Clear Selection",
+            width=110,
+            command=self._clear_selection,
+            fg_color="gray30",
+            state="disabled",
+        )
+        self.clear_selection_button.pack(side="left", padx=(0, 6))
+
+        self.delete_selected_button = ctk.CTkButton(
+            selection_frame,
+            text="Delete Selected (0)",
+            width=140,
+            command=self._on_delete_selected,
+            fg_color=theme.DANGER,
+            hover_color="#922b21",
+            state="disabled",
+        )
+        self.delete_selected_button.pack(side="left")
+
+        ctk.CTkButton(
+            selection_frame,
+            text="Clear All Memories",
+            width=130,
+            command=self._on_clear_all_memories,
+            fg_color=theme.DANGER,
+            hover_color="#922b21",
+        ).pack(side="right")
+
+        self.results_container = ctk.CTkFrame(
+            parent,
+            fg_color="#0e141b",
+            corner_radius=6,
+        )
+        self.results_container.pack(fill="x", padx=18, pady=(8, 18))
+        self._result_rows = []
+        self._memory_rows_by_id = {}
+        self._selection_vars = {}
+        self._selected_memory_ids = set()
+        self._pending_delete = None
+        self._pending_button = None
+        self._pending_bulk_delete = None
 
     def _build_live_recall_panel(self, parent):
         ctk.CTkLabel(
@@ -225,7 +277,7 @@ class MemoryPage(ctk.CTkFrame):
         self._dropdown_row(parent, "Type", self.store_memory_type_var,
                            ["user_fact", "assistant_response", "ai_self", "preference", "context", "chat"], pad=16)
         self._dropdown_row(parent, "Source", self.store_source_var,
-                           ["ui", "chat", "twitch", "discord", "system"], pad=16)
+                           ["ui", "chat", "twitch", "youtube", "kick", "discord", "system"], pad=16)
         self._entry_row(parent, "Tags", self.store_tags_var, pad=16)
 
         ctk.CTkLabel(
@@ -314,6 +366,7 @@ class MemoryPage(ctk.CTkFrame):
             return
         try:
             if label.winfo_exists():
+                kwargs.setdefault("text_color", theme.MUTED_TEXT)
                 label.configure(text=text, **kwargs)
         except Exception:
             return
@@ -357,6 +410,10 @@ class MemoryPage(ctk.CTkFrame):
         if source != "any":
             kwargs["source"] = source
 
+        memory_type = self.recall_memory_type_var.get()
+        if memory_type != "any":
+            kwargs["memory_type"] = memory_type
+
         tag = self.recall_tag_var.get().strip()
         if tag:
             kwargs["tag"] = tag
@@ -379,7 +436,8 @@ class MemoryPage(ctk.CTkFrame):
             self._write_results("No memories found.")
             return
 
-        self._write_results(self._format_results(memories))
+        self._render_memories(memories)
+        self._set_status(f"Found {len(memories)} memories.")
 
     def save_live_recall_settings(self):
         if not save_settings:
@@ -447,6 +505,13 @@ class MemoryPage(ctk.CTkFrame):
                 lines.append(f"- {item}")
         else:
             lines.append("No importable memories found.")
+
+        if preview.warnings:
+            lines.append("")
+            lines.append("Warnings:")
+            for warning in preview.warnings:
+                lines.append(f"! {warning}")
+
         self._write_results("\n".join(lines))
         self._set_status(
             "Preview found "
@@ -481,10 +546,13 @@ class MemoryPage(ctk.CTkFrame):
             f"Skipped duplicates: {result.skipped}\n"
             f"Failed: {result.failed}"
         )
+        if result.warnings:
+            summary += "\n\nWarnings:\n" + "\n".join(f"! {w}" for w in result.warnings)
         self._write_results(summary)
-        self._set_status(
-            f"Imported {result.imported}; skipped {result.skipped}; failed {result.failed}."
-        )
+        status = f"Imported {result.imported}; skipped {result.skipped}; failed {result.failed}."
+        if result.warnings:
+            status += f" {len(result.warnings)} warning(s) - see results."
+        self._set_status(status)
 
     def store_memory(self):
         if not memory_backend:
@@ -532,44 +600,315 @@ class MemoryPage(ctk.CTkFrame):
         self.store_tags_var.set("")
         self._set_status("Editor cleared.")
 
+    def _clear_results(self):
+        self._reset_pending_button()
+        self._pending_bulk_delete = None
+        for row in getattr(self, "_result_rows", []):
+            try:
+                row.destroy()
+            except Exception:
+                pass
+        self._result_rows = []
+        self._memory_rows_by_id = {}
+        self._selection_vars = {}
+        self._selected_memory_ids = set()
+        self._update_bulk_controls()
+
     def _write_results(self, text):
-        self.results_box.delete("0.0", "end")
-        self.results_box.insert("0.0", text or "")
+        self._clear_results()
+        if not text:
+            return
+        label = ctk.CTkLabel(
+            self.results_container,
+            text=text,
+            font=ctk.CTkFont(size=13),
+            text_color=theme.TEXT,
+            justify="left",
+            anchor="w",
+            wraplength=620,
+        )
+        label.pack(fill="x", padx=10, pady=8)
+        self._result_rows.append(label)
 
     @staticmethod
-    def _format_results(memories: list) -> str:
-        lines = []
-        for i, mem in enumerate(memories, 1):
-            meta = mem.get("metadata", {})
-            dist = mem.get("distance")
+    def _memory_header(mem: dict) -> str:
+        meta = mem.get("metadata", {}) or {}
+        dist = mem.get("distance")
+        parts = [f"{meta.get('speaker', '?')}/{meta.get('scope', '?')}"]
 
-            header_parts = [f"[{i}]"]
-            speaker = meta.get("speaker", "?")
-            scope = meta.get("scope", "?")
-            header_parts.append(f"{speaker}/{scope}")
+        user_id = meta.get("user_id", "")
+        if user_id and user_id != "__global__":
+            parts.append(f"user={user_id}")
 
-            user_id = meta.get("user_id", "")
-            if user_id and user_id != "__global__":
-                header_parts.append(f"user={user_id}")
+        mem_type = meta.get("memory_type", "")
+        if mem_type:
+            parts.append(f"type={mem_type}")
 
-            source = meta.get("source", "")
-            if source:
-                header_parts.append(f"src={source}")
+        source = meta.get("source", "")
+        if source:
+            parts.append(f"src={source}")
 
-            tags = meta.get("tags", "")
-            if tags:
-                header_parts.append(f"tags=[{tags}]")
+        tags = meta.get("tags", "")
+        if tags:
+            parts.append(f"tags=[{tags}]")
 
-            if dist is not None:
-                header_parts.append(f"dist={dist:.3f}")
+        if dist is not None:
+            parts.append(f"dist={dist:.3f}")
 
-            created = meta.get("created_at", "")
-            if created:
-                display_time = created[:19].replace("T", " ")
-                header_parts.append(display_time)
+        created = meta.get("created_at", "")
+        if created:
+            parts.append(created[:19].replace("T", " "))
 
-            lines.append(" ".join(header_parts))
-            lines.append(f"  {mem.get('text', '')}")
-            lines.append("")
+        return " | ".join(parts)
 
-        return "\n".join(lines).rstrip()
+    def _render_memories(self, memories: list):
+        self._clear_results()
+        for index, mem in enumerate(memories, 1):
+            self._build_memory_row(index, mem)
+        self._update_bulk_controls()
+
+    def _build_memory_row(self, index: int, mem: dict):
+        row = ctk.CTkFrame(self.results_container, fg_color=theme.CARD_BG, corner_radius=6)
+        row.pack(fill="x", padx=8, pady=(6, 0))
+
+        top = ctk.CTkFrame(row, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(8, 0))
+
+        mem_id = str(mem.get("id") or "").strip()
+        if mem_id:
+            selected_var = ctk.BooleanVar(value=False)
+            self._selection_vars[mem_id] = selected_var
+            self._memory_rows_by_id[mem_id] = row
+            ctk.CTkCheckBox(
+                top,
+                text="",
+                width=24,
+                variable=selected_var,
+                command=lambda m=mem_id: self._on_memory_selected(m),
+            ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkLabel(
+            top,
+            text=f"[{index}] {self._memory_header(mem)}",
+            font=ctk.CTkFont(size=11),
+            text_color=theme.MUTED_TEXT,
+            justify="left",
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+
+        delete_btn = ctk.CTkButton(
+            top,
+            text="Delete",
+            width=76,
+            height=26,
+            font=ctk.CTkFont(size=11),
+            fg_color="gray30",
+            hover_color="#8b2f2f",
+        )
+        if mem_id:
+            delete_btn.configure(
+                command=lambda b=delete_btn, r=row, m=mem_id: self._on_delete_clicked(b, r, m)
+            )
+        else:
+            # No id means the backend didn't surface one; deleting blind is not safe so this will stop that on it's own.
+            delete_btn.configure(state="disabled", text="No ID")
+        delete_btn.pack(side="right", padx=(8, 0))
+
+        ctk.CTkLabel(
+            row,
+            text=mem.get("text", ""),
+            font=ctk.CTkFont(size=13),
+            text_color=theme.TEXT,
+            justify="left",
+            anchor="w",
+            wraplength=600,
+        ).pack(fill="x", padx=10, pady=(4, 10))
+
+        self._result_rows.append(row)
+
+    def _on_memory_selected(self, mem_id: str):
+        selected_var = self._selection_vars.get(mem_id)
+        if selected_var is not None and selected_var.get():
+            self._selected_memory_ids.add(mem_id)
+        else:
+            self._selected_memory_ids.discard(mem_id)
+        self._pending_bulk_delete = None
+        self._update_bulk_controls()
+
+    def _select_all_results(self):
+        self._selected_memory_ids = set(self._selection_vars)
+        for selected_var in self._selection_vars.values():
+            selected_var.set(True)
+        self._pending_bulk_delete = None
+        self._update_bulk_controls()
+        self._set_status(f"Selected {len(self._selected_memory_ids)} memories.")
+
+    def _clear_selection(self):
+        for selected_var in self._selection_vars.values():
+            selected_var.set(False)
+        self._selected_memory_ids.clear()
+        self._pending_bulk_delete = None
+        self._update_bulk_controls()
+        self._set_status("Memory selection cleared.")
+
+    def _update_bulk_controls(self):
+        selected_count = len(getattr(self, "_selected_memory_ids", set()))
+        result_count = len(getattr(self, "_selection_vars", {}))
+
+        select_all_button = getattr(self, "select_all_button", None)
+        if select_all_button is not None:
+            select_all_button.configure(state="normal" if result_count else "disabled")
+
+        clear_selection_button = getattr(self, "clear_selection_button", None)
+        if clear_selection_button is not None:
+            clear_selection_button.configure(state="normal" if selected_count else "disabled")
+
+        delete_selected_button = getattr(self, "delete_selected_button", None)
+        if delete_selected_button is not None:
+            delete_selected_button.configure(
+                text=f"Delete Selected ({selected_count})",
+                state="normal" if selected_count else "disabled",
+                fg_color=theme.DANGER,
+            )
+
+    def _on_delete_selected(self):
+        self._reset_pending_button()
+        selected = frozenset(self._selected_memory_ids)
+        if not selected:
+            self._set_status("Select one or more memories first.")
+            return
+        if not memory_backend:
+            self._pending_bulk_delete = None
+            self._update_bulk_controls()
+            self._set_status("Memory backend unavailable.", text_color=theme.DANGER)
+            return
+
+        if self._pending_bulk_delete != selected:
+            self._pending_bulk_delete = selected
+            self.delete_selected_button.configure(
+                text=f"Confirm Delete ({len(selected)})?",
+                fg_color="#8b2f2f",
+            )
+            self._set_status(
+                f"Click Confirm Delete to permanently remove {len(selected)} selected memories."
+            )
+            self.after(5000, lambda ids=selected: self._expire_bulk_delete(ids))
+            return
+
+        self._pending_bulk_delete = None
+        try:
+            removed = memory_backend.delete_memories(list(selected))
+        except Exception as e:
+            self._update_bulk_controls()
+            self._set_status(f"Bulk delete failed: {e}", text_color=theme.DANGER)
+            return
+
+        self._remove_memory_rows(selected)
+        if removed:
+            self._set_status(f"Deleted {removed} selected memory(ies).")
+        else:
+            self._set_status("The selected memories were already absent from the database.")
+
+    def _expire_bulk_delete(self, selected_ids):
+        if self._pending_bulk_delete == selected_ids:
+            self._pending_bulk_delete = None
+            self._update_bulk_controls()
+
+    def _remove_memory_rows(self, memory_ids):
+        for mem_id in set(memory_ids):
+            row = self._memory_rows_by_id.pop(mem_id, None)
+            self._selection_vars.pop(mem_id, None)
+            self._selected_memory_ids.discard(mem_id)
+            if row is None:
+                continue
+            try:
+                row.destroy()
+            except Exception:
+                pass
+            if row in self._result_rows:
+                self._result_rows.remove(row)
+        self._pending_bulk_delete = None
+        self._update_bulk_controls()
+
+    def _on_clear_all_memories(self):
+        self._reset_pending_button()
+        self._pending_bulk_delete = None
+        self._update_bulk_controls()
+        if not memory_backend:
+            self._set_status("Memory backend unavailable.", text_color=theme.DANGER)
+            return
+        try:
+            count = memory_backend.count_all_memories()
+        except Exception as e:
+            self._set_status(f"Could not count memories: {e}", text_color=theme.DANGER)
+            return
+        if count <= 0:
+            self._set_status("There are no stored memories to clear.")
+            return
+
+        dialog = ctk.CTkInputDialog(
+            title="Clear All Memories",
+            text=(
+                f"This will permanently delete all {count} stored memories.\n\n"
+                "Type DELETE ALL to continue:"
+            ),
+        )
+        confirmation = dialog.get_input()
+        if str(confirmation or "").strip() != "DELETE ALL":
+            self._set_status("Clear all cancelled; no memories were deleted.")
+            return
+
+        try:
+            removed = memory_backend.clear_all_memories(confirm=True)
+        except Exception as e:
+            self._set_status(f"Clear all failed: {e}", text_color=theme.DANGER)
+            return
+
+        self._write_results(f"All stored memories were cleared ({removed} deleted).")
+        self._set_status(f"Cleared {removed} stored memory(ies).")
+
+    def _on_delete_clicked(self, button, row, mem_id):
+        if self._pending_delete != mem_id:
+            self._pending_bulk_delete = None
+            self._update_bulk_controls()
+            self._reset_pending_button()
+            self._pending_delete = mem_id
+            self._pending_button = button
+            button.configure(text="Confirm?", fg_color="#8b2f2f")
+            self._set_status("Click Confirm to permanently delete this memory.")
+            self.after(5000, lambda: self._expire_pending(mem_id))
+            return
+
+        if not memory_backend:
+            self._reset_pending_button()
+            self._set_status("Memory backend unavailable.", text_color=theme.DANGER)
+            return
+        try:
+            removed = memory_backend.delete_memories([mem_id])
+        except Exception as e:
+            self._reset_pending_button()
+            self._set_status(f"Delete failed: {e}", text_color=theme.DANGER)
+            return
+
+        self._reset_pending_button()
+        if removed:
+            self._remove_memory_rows({mem_id})
+            self._set_status("Memory deleted.")
+        else:
+            self._set_status("Nothing was deleted; the memory may already be gone.")
+
+    def _reset_pending_button(self):
+        button = getattr(self, "_pending_button", None)
+        if button is not None:
+            try:
+                if button.winfo_exists():
+                    button.configure(text="Delete", fg_color="gray30")
+            except Exception:
+                pass
+        self._pending_button = None
+        self._pending_delete = None
+
+    def _expire_pending(self, mem_id):
+        if self._pending_delete == mem_id:
+            self._pending_delete = None
+            self._reset_pending_button()

@@ -3,6 +3,8 @@ import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
 import customtkinter as ctk
+
+from files.ui.components.scrolling import AppScrollableFrame
 from files.ui import theme
 from files.system_setup.system_logger import Logger
 
@@ -51,7 +53,7 @@ def _encode_to_b64_file(words: list[str], path: Path = BAD_WORDS_FILE) -> bool:
 class _WordListFrame(ctk.CTkFrame):
     def __init__(self, master, **kw):
         super().__init__(master, fg_color=theme.APP_BG, **kw)
-        self._scroll = ctk.CTkScrollableFrame(
+        self._scroll = AppScrollableFrame(
             self,
             fg_color=theme.APP_BG,
             scrollbar_button_color=theme.MUTED_TEXT,
@@ -64,7 +66,7 @@ class _WordListFrame(ctk.CTkFrame):
 
     def set_words(self, words: list[str]):
         self._clear()
-        MAX_RENDERED_WORDS = 500
+        MAX_RENDERED_WORDS = 200
 
         shown_words = list(words[:MAX_RENDERED_WORDS])
         self._displayed_words = shown_words
@@ -117,7 +119,7 @@ class ModerationPage(ctk.CTkFrame):
 
         self._words: list[str] = []
         self._dirty: bool = False
-        self._page_size: int = 500
+        self._page_size: int = 200
         self._page_index: int = 0
         self._filtered_words: list[str] = []
 
@@ -195,7 +197,7 @@ class ModerationPage(ctk.CTkFrame):
 
         self._prev_button = ctk.CTkButton(
             bar,
-            text="← Previous 500",
+            text="← Previous 200",
             command=self._prev_page,
             width=130,
             **btn_cfg,
@@ -204,7 +206,7 @@ class ModerationPage(ctk.CTkFrame):
 
         self._next_button = ctk.CTkButton(
             bar,
-            text="Next 500 →",
+            text="Next 200 →",
             command=self._next_page,
             width=130,
             **btn_cfg,

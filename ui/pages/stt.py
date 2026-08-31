@@ -1,171 +1,265 @@
 import customtkinter as ctk
+
+from files.ui.components.scrolling import AppScrollableFrame
+from files.speech_to_text import stt_controls
+from files.speech_to_text.audio_devices import parse_preferred_patterns, resolve_input_device
+from files.system_setup.settings import get_settings, save_settings
 from files.ui import theme
 
-from files.speech_to_text.stt_config import STTConfig
-from files.speech_to_text.openai_whisper import OpenAIWhisperCore, OpenAIWhisperConfig
-from files.speech_to_text.google_stt import GoogleSTTCore, GoogleSTTConfig
-from files.speech_to_text import stt_controls
-
-try:
-    import sounddevice as sd
-except Exception:
-    sd = None
-
-try:
-    from files.system_setup.settings import get_settings, save_settings as save_setting
-except Exception:
-    get_settings = None
-    save_setting = None
-
-try:
-    from files.main_loop.main_loop import message_queue
-except Exception as e:
-    message_queue = None
-    
 
 class STTPage(ctk.CTkFrame):
     def __init__(self, master, app):
         super().__init__(master, fg_color=theme.APP_BG)
         self.app = app
-        self.core = None
         self._capturing_ptt_key = False
-        self._ptt_capture_modifiers = set()
+        self._ptt_capture_modifiers: set[str] = set()
+        self._devices = []
+        self._device_by_label = {}
+        self._provider_frames = {}
+        self._status_after_id = None
+        self._page_active = False
+
         stt_controls.bind_push_to_talk(app)
         app.bind_all("<KeyPress>", self._capture_ptt_key, add="+")
         app.bind_all("<KeyRelease>", self._capture_ptt_key_release, add="+")
 
         body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=24, pady=20)
+        body.pack(fill="both", expand=True, padx=20, pady=16)
 
-        left = ctk.CTkScrollableFrame(body, fg_color=theme.CARD_BG, corner_radius=10)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 10))
-
-        right_outer = ctk.CTkFrame(
-            body,
-            fg_color=theme.CARD_BG,
-            corner_radius=10,
-            width=360,
-        )
-        right_outer.pack(side="right", fill="y", padx=(10, 0))
-        right_outer.pack_propagate(False)
-
-        right = ctk.CTkScrollableFrame(
-            right_outer,
-            fg_color="transparent",
-            corner_radius=10,
-        )
-        right.pack(fill="both", expand=True)
+        left = AppScrollableFrame(body, fg_color="transparent")
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        right = ctk.CTkFrame(body, fg_color=theme.CARD_BG, corner_radius=10, width=350)
+        right.pack(side="right", fill="y", padx=(8, 0))
+        right.pack_propagate(False)
 
         self._build_settings(left)
         self._build_runtime(right)
+        self.refresh_devices()
+        self._show_provider_settings(self.engine_var.get())
+
+    def _setting(self, key, default):
+        value = get_settings(key)
+        return default if value in ("", None) else value
+
+    @staticmethod
+    def _card(parent, title: str, description: str = ""):
+        card = ctk.CTkFrame(parent, fg_color=theme.CARD_BG, corner_radius=10)
+        card.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(
+            card,
+            text=title,
+            font=ctk.CTkFont(size=17, weight="bold"),
+            text_color=theme.TEXT,
+        ).pack(anchor="w", padx=16, pady=(14, 2))
+        if description:
+            ctk.CTkLabel(
+                card,
+                text=description,
+                text_color=theme.MUTED_TEXT,
+                wraplength=700,
+                justify="left",
+            ).pack(anchor="w", padx=16, pady=(0, 8))
+        return card
 
     def _build_settings(self, parent):
         ctk.CTkLabel(
             parent,
-            text="Speech-to-Text Settings",
+            text="Speech-to-Text",
             font=ctk.CTkFont(size=28, weight="bold"),
             text_color=theme.TEXT,
-        ).pack(anchor="w", padx=18, pady=(18, 8))
+        ).pack(anchor="w", pady=(2, 12))
 
         self.engine_var = ctk.StringVar(value=self._setting("stt_engine", "Local Whisper"))
-        self.wake_word_enabled_var = ctk.BooleanVar(value=bool(self._setting("stt_wake_word_enabled", False)))
-        self.wake_word_var = ctk.StringVar(value=str(self._setting("stt_wake_word", "")))
-
-        self._combo_row(
-            parent,
-            "STT Engine",
-            self.engine_var,
-            ["Local Whisper", "OpenAI Whisper", "Google"],
-            command=lambda value: self._save_single_setting("stt_engine", value),
-        )
-        self.device_index_var = ctk.StringVar(value=str(self._setting("stt_device_index", "")))
+        if self.engine_var.get() == "OpenAI Whisper":
+            self.engine_var.set("OpenAI Transcription")
         self.mode_var = ctk.StringVar(value=self._setting("stt_mode", "Hot Mic"))
         self.ptt_key_var = ctk.StringVar(value=str(self._setting("stt_ptt_key", "space")))
-        self.model_var = ctk.StringVar(value=self._setting("stt_model_name", "tiny"))
-        self.device_var = ctk.StringVar(value=self._setting("stt_device", "cuda"))
-        self.compute_var = ctk.StringVar(value=self._setting("stt_compute_type", "float16"))
-        self.language_var = ctk.StringVar(value=self._setting("stt_language", "en"))
-        self.google_timeout_var = ctk.DoubleVar(value=float(self._setting("stt_google_timeout", 0.5)))
-        self.google_phrase_limit_var = ctk.DoubleVar(value=float(self._setting("stt_google_phrase_time_limit", 8.0)))
-        self.google_adjust_ambient_var = ctk.BooleanVar(value=bool(self._setting("stt_google_adjust_ambient", True)))
-        self.google_energy_var = ctk.StringVar(value=str(self._setting("stt_google_energy_threshold", "")))
+        self.language_var = ctk.StringVar(value=str(self._setting("stt_language", "en")))
+        self.wake_word_enabled_var = ctk.BooleanVar(
+            value=bool(self._setting("stt_wake_word_enabled", False))
+        )
+        self.wake_word_var = ctk.StringVar(value=str(self._setting("stt_wake_word", "")))
+        self.pause_playback_var = ctk.BooleanVar(
+            value=bool(self._setting("stt_pause_during_playback", True))
+        )
+
+        common = self._card(
+            parent,
+            "Conversation Input",
+            "Choose an engine and decide when captured speech should become a conversation turn.",
+        )
+        self._combo_row(
+            common,
+            "STT Engine",
+            self.engine_var,
+            ["Local Whisper", "OpenAI Transcription", "Google"],
+            command=self._engine_changed,
+        )
+        self._combo_row(
+            common,
+            "Capture Mode",
+            self.mode_var,
+            ["Hot Mic", "Push To Talk"],
+            command=lambda value: self._save_single("stt_mode", value),
+        )
+        self._ptt_key_row(common)
+        self._entry_row(common, "Language", self.language_var)
+        self._entry_row(common, "Wake Word", self.wake_word_var)
+        ctk.CTkCheckBox(
+            common,
+            text="Require wake word at the start of each final transcript",
+            variable=self.wake_word_enabled_var,
+            text_color=theme.TEXT,
+        ).pack(anchor="w", padx=16, pady=7)
+        ctk.CTkCheckBox(
+            common,
+            text="Pause hot-mic capture while companion audio is playing",
+            variable=self.pause_playback_var,
+            text_color=theme.TEXT,
+        ).pack(anchor="w", padx=16, pady=(7, 14))
+
+        self.device_mode_var = ctk.StringVar(
+            value=str(self._setting("stt_device_selection_mode", "automatic")).title()
+        )
+        self.device_choice_var = ctk.StringVar(value="Scanning input devices…")
+        device = self._card(
+            parent,
+            "Input Device",
+            "Automatic selection matches active input endpoints by saved identity and preferred name patterns. Device indices are resolved fresh each session.",
+        )
+        self._combo_row(
+            device,
+            "Selection",
+            self.device_mode_var,
+            ["Automatic", "Manual"],
+            command=self._device_mode_changed,
+        )
+        row = ctk.CTkFrame(device, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=6)
+        ctk.CTkLabel(row, text="Active Input", width=160, anchor="w", text_color=theme.TEXT).pack(side="left")
+        self.device_combo = ctk.CTkComboBox(
+            row,
+            variable=self.device_choice_var,
+            values=["Scanning input devices…"],
+            command=self._manual_device_selected,
+        )
+        self.device_combo.pack(side="left", fill="x", expand=True, padx=(10, 8))
+        ctk.CTkButton(row, text="Rescan", width=80, command=self.refresh_devices).pack(side="left")
+
+        ctk.CTkLabel(
+            device,
+            text="Preferred patterns (one per line)",
+            text_color=theme.TEXT,
+        ).pack(anchor="w", padx=16, pady=(8, 2))
+        self.device_patterns_box = ctk.CTkTextbox(device, height=74)
+        self.device_patterns_box.pack(fill="x", padx=16, pady=(0, 6))
+        self.device_patterns_box.insert(
+            "0.0",
+            str(self._setting("stt_device_preferred_patterns", "CABLE Output\nVB-Audio")),
+        )
+        self.device_resolution_label = ctk.CTkLabel(
+            device,
+            text="",
+            text_color=theme.MUTED_TEXT,
+            wraplength=700,
+            justify="left",
+        )
+        self.device_resolution_label.pack(anchor="w", padx=16, pady=(2, 14))
 
         self.vad_var = ctk.DoubleVar(value=float(self._setting("stt_vad_aggressiveness", 1)))
         self.pre_speech_var = ctk.DoubleVar(value=float(self._setting("stt_pre_speech_ms", 1000)))
         self.post_speech_var = ctk.DoubleVar(value=float(self._setting("stt_post_speech_ms", 600)))
         self.segment_max_var = ctk.DoubleVar(value=float(self._setting("stt_segment_max_ms", 15000)))
         self.min_length_var = ctk.DoubleVar(value=float(self._setting("stt_min_length_ms", 1000)))
-        self.partial_var = ctk.BooleanVar(value=bool(self._setting("stt_enable_partials", True)))
-
-        self._entry_row(parent, "Input Device Index", self.device_index_var)
-        self._combo_row(
+        utterance = self._card(
             parent,
-            "STT Mode",
-            self.mode_var,
-            ["Hot Mic", "Push To Talk"],
-            command=lambda value: self._save_single_setting("stt_mode", value),
+            "Utterance Detection",
+            "These shared settings define speech boundaries for every engine in Hot Mic mode.",
         )
-        self._ptt_key_row(parent)
-        self._combo_row(
-            parent,
-            "Model",
-            self.model_var,
-            ["tiny", "base", "small", "medium", "large-v3"],
-            command=lambda value: self._save_single_setting("stt_model_name", value),
-        )
-        self._combo_row(
-            parent,
-            "Device",
-            self.device_var,
-            ["cuda", "cpu"],
-            command=lambda value: self._save_single_setting("stt_device", value),
-        )
-        self._combo_row(
-            parent,
-            "Compute Type",
-            self.compute_var,
-            ["float16", "int8", "float32"],
-            command=lambda value: self._save_single_setting("stt_compute_type", value),
-        )
-        self._entry_row(parent, "Language", self.language_var)
-        self._entry_row(parent, "Wake Word", self.wake_word_var)
-        self._entry_row(parent, "Google Energy", self.google_energy_var)
+        self._slider_row(utterance, "VAD Aggressiveness", self.vad_var, 0, 3, integer=True)
+        self._slider_row(utterance, "Pre-roll ms", self.pre_speech_var, 0, 2000, integer=True)
+        self._slider_row(utterance, "End Silence ms", self.post_speech_var, 100, 2000, integer=True)
+        self._slider_row(utterance, "Maximum Utterance ms", self.segment_max_var, 3000, 30000, integer=True)
+        self._slider_row(utterance, "Minimum Voiced ms", self.min_length_var, 100, 3000, integer=True)
 
-        self._slider_row(parent, "VAD Aggressiveness", self.vad_var, 0, 3, is_int=True)
-        self._slider_row(parent, "Pre Speech ms", self.pre_speech_var, 0, 2000, is_int=True)
-        self._slider_row(parent, "Post Speech ms", self.post_speech_var, 100, 2000, is_int=True)
-        self._slider_row(parent, "Segment Max ms", self.segment_max_var, 3000, 30000, is_int=True)
-        self._slider_row(parent, "Min Length ms", self.min_length_var, 200, 3000, is_int=True)
-        self._slider_row(parent, "Google Timeout", self.google_timeout_var, 0.1, 3.0)
-        self._slider_row(parent, "Google Phrase Limit", self.google_phrase_limit_var, 1.0, 20.0)
-
-        ctk.CTkCheckBox(
-            parent,
-            text="Enable Partials",
-            variable=self.partial_var,
-            text_color=theme.TEXT,
-        ).pack(anchor="w", padx=18, pady=8)
-
-        ctk.CTkCheckBox(
-            parent,
-            text="Require Wake Word",
-            variable=self.wake_word_enabled_var,
-            text_color=theme.TEXT,
-            command=lambda: self._save_single_setting("stt_wake_word_enabled", bool(self.wake_word_enabled_var.get())),
-        ).pack(anchor="w", padx=18, pady=8)
-
-        ctk.CTkCheckBox(
-            parent,
-            text="Google Ambient Calibration",
-            variable=self.google_adjust_ambient_var,
-            text_color=theme.TEXT,
-        ).pack(anchor="w", padx=18, pady=8)
+        self._provider_container = ctk.CTkFrame(parent, fg_color="transparent")
+        self._provider_container.pack(fill="x")
+        self._build_local_settings()
+        self._build_openai_settings()
+        self._build_google_settings()
 
         ctk.CTkButton(
             parent,
             text="Save STT Settings",
             command=self.save_settings,
-        ).pack(anchor="w", padx=18, pady=(16, 8))
+            height=38,
+        ).pack(anchor="w", pady=(4, 18))
+
+    def _build_local_settings(self):
+        frame = self._card(
+            self._provider_container,
+            "Local Whisper",
+            "Runs locally through faster-whisper. Rolling partials are generated from the current utterance while VAD is active.",
+        )
+        self._provider_frames["Local Whisper"] = frame
+        self.model_var = ctk.StringVar(value=str(self._setting("stt_model_name", "tiny")))
+        self.local_device_var = ctk.StringVar(value=str(self._setting("stt_device", "cuda")))
+        self.compute_var = ctk.StringVar(value=str(self._setting("stt_compute_type", "float16")))
+        self.beam_var = ctk.DoubleVar(value=float(self._setting("stt_beam_size", 1)))
+        self.partial_var = ctk.BooleanVar(value=bool(self._setting("stt_enable_partials", True)))
+        self.partial_interval_var = ctk.DoubleVar(
+            value=float(self._setting("stt_partial_interval_ms", 500))
+        )
+        self._combo_row(frame, "Model", self.model_var, ["tiny", "base", "small", "medium", "large-v3"])
+        self._combo_row(frame, "Inference Device", self.local_device_var, ["cuda", "cpu"])
+        self._combo_row(frame, "Compute Type", self.compute_var, ["float16", "int8", "float32"])
+        self._slider_row(frame, "Beam Size", self.beam_var, 1, 5, integer=True)
+        self._slider_row(frame, "Partial Interval ms", self.partial_interval_var, 250, 2000, integer=True)
+        ctk.CTkCheckBox(
+            frame,
+            text="Enable rolling partial transcripts",
+            variable=self.partial_var,
+            text_color=theme.TEXT,
+        ).pack(anchor="w", padx=16, pady=(7, 14))
+
+    def _build_openai_settings(self):
+        frame = self._card(
+            self._provider_container,
+            "OpenAI Transcription",
+            "Completed utterances are uploaded through the Audio Transcription API. An OpenAI API key, internet connection, and available API quota are required.",
+        )
+        self._provider_frames["OpenAI Transcription"] = frame
+        self.openai_model_var = ctk.StringVar(
+            value=str(self._setting("stt_openai_model", "gpt-4o-transcribe"))
+        )
+        self._combo_row(
+            frame,
+            "Model",
+            self.openai_model_var,
+            ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"],
+        )
+        ctk.CTkLabel(
+            frame,
+            text="Audio leaves this computer only after VAD or push-to-talk completes an utterance.",
+            text_color=theme.MUTED_TEXT,
+            wraplength=700,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(6, 14))
+
+    def _build_google_settings(self):
+        frame = self._card(
+            self._provider_container,
+            "Google Recognition",
+            "Completed utterances use SpeechRecognition's Google adapter. Shared SoundDevice capture keeps device selection and PTT behavior consistent with the other engines.",
+        )
+        self._provider_frames["Google"] = frame
+        ctk.CTkLabel(
+            frame,
+            text="Google recognition is best treated as a network fallback; it does not provide partial transcripts here.",
+            text_color=theme.MUTED_TEXT,
+            wraplength=700,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(6, 14))
 
     def _build_runtime(self, parent):
         ctk.CTkLabel(
@@ -174,163 +268,266 @@ class STTPage(ctk.CTkFrame):
             font=ctk.CTkFont(size=20, weight="bold"),
             text_color=theme.TEXT,
         ).pack(anchor="w", padx=16, pady=(18, 8))
-
         self.status_label = ctk.CTkLabel(
             parent,
-            text="Stopped.",
+            text=stt_controls.status_text(),
             text_color=theme.MUTED_TEXT,
-            wraplength=280,
+            wraplength=310,
             justify="left",
         )
-        self.status_label.pack(anchor="w", padx=16, pady=8)
-
+        self.status_label.pack(anchor="w", padx=16, pady=(0, 10))
         ctk.CTkButton(parent, text="Start STT", command=self.start_stt).pack(fill="x", padx=16, pady=4)
         ctk.CTkButton(parent, text="Stop STT", fg_color=theme.DANGER, command=self.stop_stt).pack(fill="x", padx=16, pady=4)
-        ctk.CTkButton(parent, text="Pause", command=self.pause_stt).pack(fill="x", padx=16, pady=4)
-        ctk.CTkButton(parent, text="Resume", command=self.resume_stt).pack(fill="x", padx=16, pady=4)
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=4)
+        ctk.CTkButton(row, text="Pause", command=self.pause_stt).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        ctk.CTkButton(row, text="Resume", command=self.resume_stt).pack(side="left", fill="x", expand=True, padx=(3, 0))
 
-        ctk.CTkButton(
+        ctk.CTkLabel(
             parent,
-            text="List Input Devices",
-            command=self.list_devices,
-        ).pack(fill="x", padx=16, pady=(18, 4))
-
+            text="Transcript Preview",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color=theme.TEXT,
+        ).pack(anchor="w", padx=16, pady=(18, 6))
         self.preview_box = ctk.CTkTextbox(
             parent,
-            height=220,
             fg_color="#0e141b",
             text_color=theme.TEXT,
             wrap="word",
         )
-        self.preview_box.pack(fill="x", padx=16, pady=(10, 16))
+        self.preview_box.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
-    def _setting(self, key, default):
-        if not get_settings:
-            return default
-        value = get_settings(key)
-        return default if value in ("", None) else value
+    def _entry_row(self, parent, label, variable):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=6)
+        ctk.CTkLabel(row, text=label, width=160, anchor="w", text_color=theme.TEXT).pack(side="left")
+        ctk.CTkEntry(row, textvariable=variable).pack(side="left", fill="x", expand=True, padx=(10, 0))
 
-    def _entry_row(self, parent, label, var):
-        frame = ctk.CTkFrame(parent, fg_color="transparent")
-        frame.pack(fill="x", padx=18, pady=6)
-        ctk.CTkLabel(frame, text=label, text_color=theme.TEXT, width=170, anchor="w").pack(side="left")
-        ctk.CTkEntry(frame, textvariable=var).pack(side="left", fill="x", expand=True, padx=(10, 0))
-
-    def _combo_row(self, parent, label, var, values, command=None):
-        frame = ctk.CTkFrame(parent, fg_color="transparent")
-        frame.pack(fill="x", padx=18, pady=6)
-        ctk.CTkLabel(frame, text=label, text_color=theme.TEXT, width=170, anchor="w").pack(side="left")
+    def _combo_row(self, parent, label, variable, values, command=None):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=6)
+        ctk.CTkLabel(row, text=label, width=160, anchor="w", text_color=theme.TEXT).pack(side="left")
         ctk.CTkComboBox(
-            frame,
-            variable=var,
+            row,
+            variable=variable,
             values=values,
-            width=220,
             command=command,
-        ).pack(side="left", padx=(10, 0))
-
-    def _slider_row(self, parent, label, var, min_value, max_value, is_int=False):
-        frame = ctk.CTkFrame(parent, fg_color="transparent")
-        frame.pack(fill="x", padx=18, pady=6)
-        value_label = ctk.CTkLabel(
-            frame,
-            text=self._format(label, var.get(), is_int),
-            text_color=theme.TEXT,
-            width=190,
-            anchor="w",
-        )
-        value_label.pack(side="left")
-        ctk.CTkSlider(
-            frame,
-            from_=min_value,
-            to=max_value,
-            variable=var,
-            command=lambda v: value_label.configure(text=self._format(label, v, is_int)),
         ).pack(side="left", fill="x", expand=True, padx=(10, 0))
 
-    def _format(self, label, value, is_int=False):
-        return f"{label}: {int(float(value))}" if is_int else f"{label}: {float(value):.2f}"
+    def _slider_row(self, parent, label, variable, minimum, maximum, *, integer=False):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=6)
+        value_label = ctk.CTkLabel(row, width=205, anchor="w", text_color=theme.TEXT)
+        value_label.pack(side="left")
+
+        def display(value):
+            shown = str(int(float(value))) if integer else f"{float(value):.2f}"
+            value_label.configure(text=f"{label}: {shown}")
+
+        slider = ctk.CTkSlider(row, from_=minimum, to=maximum, variable=variable, command=display)
+        slider.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        display(variable.get())
+
+    def _ptt_key_row(self, parent):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=6)
+        ctk.CTkLabel(row, text="Push-To-Talk Key", width=160, anchor="w", text_color=theme.TEXT).pack(side="left")
+        ctk.CTkEntry(row, textvariable=self.ptt_key_var, state="readonly").pack(side="left", fill="x", expand=True, padx=(10, 8))
+        ctk.CTkButton(row, text="Set", width=70, command=self.start_ptt_key_capture).pack(side="left")
+
+    def _engine_changed(self, value):
+        if value == "OpenAI Whisper":
+            value = "OpenAI Transcription"
+            self.engine_var.set(value)
+        self._save_single("stt_engine", value)
+        self._show_provider_settings(value)
+        if stt_controls.is_running():
+            self.status_label.configure(text="Stop and restart STT to apply the new engine.")
+
+    def _show_provider_settings(self, engine):
+        for frame in self._provider_frames.values():
+            frame.pack_forget()
+        frame = self._provider_frames.get(engine)
+        if frame:
+            frame.pack(fill="x", pady=(0, 10))
+
+    def _device_mode_changed(self, value):
+        mode = str(value).strip().lower()
+        save_settings("stt_device_selection_mode", mode)
+        self.refresh_devices()
+
+    def refresh_devices(self):
+        self._devices = stt_controls.discover_input_devices()
+        self._device_by_label = {
+            f"[{device.index}] {device.name} — {device.host_api}": device
+            for device in self._devices
+        }
+        values = list(self._device_by_label) or ["No active input devices"]
+        self.device_combo.configure(values=values)
+
+        mode = self.device_mode_var.get().strip().lower()
+        resolution = resolve_input_device(
+            self._devices,
+            mode=mode,
+            saved_id=str(get_settings("stt_device_id") or ""),
+            saved_name=str(get_settings("stt_device_name") or ""),
+            saved_host_api=str(get_settings("stt_device_host_api") or ""),
+            preferred_patterns=parse_preferred_patterns(
+                self.device_patterns_box.get("0.0", "end-1c")
+            ),
+            legacy_index=get_settings("stt_device_index"),
+        )
+        if resolution.device:
+            selected_label = next(
+                (label for label, device in self._device_by_label.items() if device == resolution.device),
+                values[0],
+            )
+            self.device_choice_var.set(selected_label)
+            ambiguity = " Selection is ambiguous." if resolution.ambiguous else ""
+            self.device_resolution_label.configure(
+                text=f"{resolution.reason}{ambiguity} Current endpoint: {resolution.device.label}"
+            )
+        else:
+            self.device_choice_var.set(values[0])
+            self.device_resolution_label.configure(text=resolution.reason)
+        self.device_combo.configure(state="normal" if mode == "manual" else "disabled")
+
+    def _manual_device_selected(self, label):
+        device = self._device_by_label.get(label)
+        if not device:
+            return
+        self.device_mode_var.set("Manual")
+        values = {
+            "stt_device_selection_mode": "manual",
+            "stt_device_id": device.stable_id,
+            "stt_device_name": device.name,
+            "stt_device_host_api": device.host_api,
+            "stt_device_index": str(device.index),
+        }
+        for key, value in values.items():
+            save_settings(key, value)
+        self.device_resolution_label.configure(text=f"Manual endpoint selected: {device.label}")
 
     def save_settings(self):
-        if not save_setting:
-            return
-
+        engine = self.engine_var.get().strip()
         values = {
-            "stt_device_index": self.device_index_var.get().strip(),
+            "stt_engine": engine,
             "stt_mode": self.mode_var.get().strip(),
             "stt_ptt_key": stt_controls.normalize_ptt_combo(self.ptt_key_var.get()),
+            "stt_language": self.language_var.get().strip(),
             "stt_wake_word_enabled": bool(self.wake_word_enabled_var.get()),
             "stt_wake_word": self.wake_word_var.get().strip(),
-            "stt_model_name": self.model_var.get().strip(),
-            "stt_device": self.device_var.get().strip(),
-            "stt_compute_type": self.compute_var.get().strip(),
-            "stt_language": self.language_var.get().strip(),
+            "stt_pause_during_playback": bool(self.pause_playback_var.get()),
+            "stt_device_selection_mode": self.device_mode_var.get().strip().lower(),
+            "stt_device_preferred_patterns": self.device_patterns_box.get("0.0", "end-1c").strip(),
             "stt_vad_aggressiveness": int(self.vad_var.get()),
             "stt_pre_speech_ms": int(self.pre_speech_var.get()),
             "stt_post_speech_ms": int(self.post_speech_var.get()),
             "stt_segment_max_ms": int(self.segment_max_var.get()),
             "stt_min_length_ms": int(self.min_length_var.get()),
+            "stt_model_name": self.model_var.get().strip(),
+            "stt_device": self.local_device_var.get().strip(),
+            "stt_compute_type": self.compute_var.get().strip(),
+            "stt_beam_size": int(self.beam_var.get()),
             "stt_enable_partials": bool(self.partial_var.get()),
-            "stt_engine": self.engine_var.get().strip(),
-            "stt_google_timeout": float(self.google_timeout_var.get()),
-            "stt_google_phrase_time_limit": float(self.google_phrase_limit_var.get()),
-            "stt_google_adjust_ambient": bool(self.google_adjust_ambient_var.get()),
-            "stt_google_energy_threshold": self.google_energy_var.get().strip(),
+            "stt_partial_interval_ms": int(self.partial_interval_var.get()),
+            "stt_openai_model": self.openai_model_var.get().strip(),
         }
-
         for key, value in values.items():
-            save_setting(key, value)
+            save_settings(key, value)
+        self.refresh_devices()
+        stt_controls.configured_device_resolution(persist=True)
+        self.status_label.configure(text="STT settings saved. Start STT to apply capture changes.")
 
-        if hasattr(self, "status_label"):
-            self.status_label.configure(text="STT settings saved.")
+    def start_stt(self):
+        self.save_settings()
+        stt_controls.bind_push_to_talk(self.app)
+        try:
+            self.focus_set()
+        except Exception:
+            pass
+        ok = stt_controls.restart_stt(on_text=self._console_stt_callback)
+        self.status_label.configure(text=stt_controls.status_text() if ok else "Failed to start STT.")
 
-    def _ptt_key_row(self, parent):
-        frame = ctk.CTkFrame(parent, fg_color="transparent")
-        frame.pack(fill="x", padx=18, pady=6)
-        ctk.CTkLabel(
-            frame,
-            text="Push-To-Talk Key",
-            text_color=theme.TEXT,
-            width=170,
-            anchor="w",
-        ).pack(side="left")
-        ctk.CTkEntry(
-            frame,
-            textvariable=self.ptt_key_var,
-            state="readonly",
-        ).pack(side="left", fill="x", expand=True, padx=(10, 8))
-        ctk.CTkButton(
-            frame,
-            text="Set",
-            width=70,
-            command=self.start_ptt_key_capture,
-        ).pack(side="left")
+    def stop_stt(self):
+        stt_controls.stop_stt()
+        self.status_label.configure(text=stt_controls.status_text())
+
+    def pause_stt(self):
+        stt_controls.pause_stt()
+        self.status_label.configure(text=stt_controls.status_text())
+
+    def resume_stt(self):
+        stt_controls.resume_stt()
+        self.status_label.configure(text=stt_controls.status_text())
+
+    def _console_stt_callback(self, text, is_partial):
+        transcript = (text or "").strip()
+        if not transcript:
+            return
+
+        def render():
+            prefix = "Partial" if is_partial else "Final"
+            self.preview_box.insert("end", f"{prefix}: {transcript}\n")
+            self.preview_box.see("end")
+            console = getattr(self.app, "pages", {}).get("Console") if self.app else None
+            if console is not None and hasattr(console, "on_stt_text"):
+                console.on_stt_text(transcript, is_partial=is_partial)
+            else:
+                stt_controls.handle_stt_text(transcript, is_partial=is_partial)
+
+        try:
+            self.after(0, render)
+        except Exception:
+            pass
+
+    def _refresh_runtime_status(self):
+        self._status_after_id = None
+        if not self._page_active:
+            return
+        try:
+            self.status_label.configure(text=stt_controls.status_text())
+            self._status_after_id = self.after(400, self._refresh_runtime_status)
+        except Exception:
+            self._status_after_id = None
+
+    def on_show(self):
+        if self._page_active:
+            return
+        self._page_active = True
+        self._refresh_runtime_status()
+
+    def on_hide(self):
+        self._page_active = False
+        if self._status_after_id is not None:
+            try:
+                self.after_cancel(self._status_after_id)
+            except Exception:
+                pass
+            self._status_after_id = None
 
     def start_ptt_key_capture(self):
         self._capturing_ptt_key = True
         self._ptt_capture_modifiers.clear()
-        if hasattr(self, "status_label"):
-            self.status_label.configure(text="Press the key or key combo to use for Push-To-Talk.")
+        stt_controls.suspend_push_to_talk_binding(True)
+        self.status_label.configure(text="Press the key or key combination to use for push-to-talk.")
 
     def _capture_ptt_key(self, event):
         if not self._capturing_ptt_key:
             return
-        key = self._normalize_capture_key(getattr(event, "keysym", ""))
+        key = stt_controls.normalize_ptt_combo(getattr(event, "keysym", ""))
         if not key:
             return
         if key in {"ctrl", "shift", "alt"}:
             self._ptt_capture_modifiers.add(key)
-            if hasattr(self, "status_label"):
-                current = "+".join(self._ordered_capture_modifiers())
-                self.status_label.configure(text=f"Modifier held: {current}. Press the main key.")
             return "break"
-
         self._save_ptt_capture(key)
         return "break"
 
     def _capture_ptt_key_release(self, event):
         if not self._capturing_ptt_key:
             return
-        key = self._normalize_capture_key(getattr(event, "keysym", ""))
+        key = stt_controls.normalize_ptt_combo(getattr(event, "keysym", ""))
         if key not in {"ctrl", "shift", "alt"}:
             return
         self._ptt_capture_modifiers.discard(key)
@@ -338,94 +535,22 @@ class STTPage(ctk.CTkFrame):
             self._save_ptt_capture(key)
         return "break"
 
-    def _normalize_capture_key(self, key):
-        raw = str(key or "").strip()
-        if not raw:
-            return ""
-        return stt_controls.normalize_ptt_combo(raw)
-
-    def _ordered_capture_modifiers(self):
-        return [m for m in ("ctrl", "shift", "alt") if m in self._ptt_capture_modifiers]
-
     def _save_ptt_capture(self, key):
-        combo = stt_controls.normalize_ptt_combo(
-            "+".join(self._ordered_capture_modifiers() + [key])
-        )
+        ordered = [name for name in ("ctrl", "shift", "alt") if name in self._ptt_capture_modifiers]
+        combo = stt_controls.normalize_ptt_combo("+".join(ordered + [key]))
         self.ptt_key_var.set(combo)
         self._capturing_ptt_key = False
         self._ptt_capture_modifiers.clear()
-        try:
-            (self.app or self).focus_set()
-        except Exception:
-            pass
-        self._save_single_setting("stt_ptt_key", combo)
-        if hasattr(self, "status_label"):
-            self.status_label.configure(text=f"Push-To-Talk key saved: {combo}")
+        stt_controls.suspend_push_to_talk_binding(False)
+        self._save_single("stt_ptt_key", combo)
+        self.status_label.configure(text=f"Push-to-talk key saved: {combo}")
 
-    def _save_single_setting(self, key, value):
-        if save_setting:
-            save_setting(key, value)
-        if hasattr(self, "status_label"):
-            self.status_label.configure(text=f"Saved {key}.")
+    @staticmethod
+    def _save_single(key, value):
+        save_settings(key, value)
 
-    def build_config(self):
-        return STTConfig(
-            device=self.device_var.get().strip(),
-            model_name=self.model_var.get().strip(),
-            compute_type=self.compute_var.get().strip(),
-            vad_aggressiveness=int(self.vad_var.get()),
-            pre_speech_ms=int(self.pre_speech_var.get()),
-            post_speech_ms=int(self.post_speech_var.get()),
-            segment_max_ms=int(self.segment_max_var.get()),
-            min_length_ms=int(self.min_length_var.get()),
-            enable_partials=bool(self.partial_var.get()),
-            language=self.language_var.get().strip() or None,
-        )
-
-    def input_device_index(self):
-        raw = self.device_index_var.get().strip()
-        return None if raw == "" else int(raw)
-
-    def start_stt(self):
-        self.save_settings()
-        ok = stt_controls.start_stt(on_text=self._console_stt_callback)
-
-        self.status_label.configure(
-            text=stt_controls.status_text() if ok else "Failed to start STT."
-        )
-
-    def stop_stt(self):
-        stt_controls.stop_stt()
-        self.status_label.configure(text=stt_controls.status_text())
-
-
-    def pause_stt(self):
-        stt_controls.pause_stt()
-        self.status_label.configure(text=stt_controls.status_text())
-
-
-    def resume_stt(self):
-        stt_controls.resume_stt()
-        self.status_label.configure(text=stt_controls.status_text())
-
-    def _console_stt_callback(self, text, is_partial):
-        console = getattr(self.app, "pages", {}).get("Console") if self.app else None
-        if console is not None and hasattr(console, "on_stt_text"):
-            console.on_stt_text(text, is_partial=is_partial)
-            return
-        stt_controls.handle_stt_text(text, is_partial=is_partial)
-
-    def list_devices(self):
-        if not sd:
-            self.preview_box.insert("end", "sounddevice is unavailable.\n")
-            return
-
-        try:
-            devices = sd.query_devices()
-            self.preview_box.insert("end", "\nInput devices:\n")
-            for i, dev in enumerate(devices):
-                if dev.get("max_input_channels", 0) > 0:
-                    self.preview_box.insert("end", f"{i}: {dev['name']}\n")
-            self.preview_box.see("end")
-        except Exception as e:
-            self.preview_box.insert("end", f"Failed to list devices: {e}\n")
+    def destroy(self):
+        if self._capturing_ptt_key:
+            stt_controls.suspend_push_to_talk_binding(False)
+        self.on_hide()
+        super().destroy()

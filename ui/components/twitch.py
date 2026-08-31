@@ -54,10 +54,12 @@ SINGLE_ACCOUNT_SCOPES = (
 class RedirectHandler(BaseHTTPRequestHandler):
     captured_code  = None
     captured_error = None
+    captured_state = None
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+        RedirectHandler.captured_state = params.get("state", [None])[0]
 
         if "code" in params:
             RedirectHandler.captured_code  = params["code"][0]
@@ -79,9 +81,21 @@ class RedirectHandler(BaseHTTPRequestHandler):
         pass
 
 
-def server_response(timeout: int = 120) -> tuple[str | None, str | None]:
+def _validated_oauth_result(
+    code: str | None,
+    error: str | None,
+    returned_state: str | None,
+    expected_state: str,
+) -> tuple[str | None, str | None]:
+    if not returned_state or not secrets.compare_digest(returned_state, expected_state):
+        return None, "OAuth state did not match; authorization was rejected"
+    return code, error
+
+
+def server_response(expected_state: str, timeout: int = 120) -> tuple[str | None, str | None]:
     RedirectHandler.captured_code  = None
     RedirectHandler.captured_error = None
+    RedirectHandler.captured_state = None
 
     server = HTTPServer(("localhost", 3000), RedirectHandler)
     server.timeout = timeout
@@ -90,7 +104,12 @@ def server_response(timeout: int = 120) -> tuple[str | None, str | None]:
     server.handle_request()
     server.server_close()
 
-    return RedirectHandler.captured_code, RedirectHandler.captured_error
+    return _validated_oauth_result(
+        RedirectHandler.captured_code,
+        RedirectHandler.captured_error,
+        RedirectHandler.captured_state,
+        expected_state,
+    )
 
 def _build_auth_url(client_id: str, scopes: str, state: str) -> str:
     params = {
@@ -338,6 +357,7 @@ class TwitchAuthDialog(ctk.CTkToplevel):
 
 
     def _start_single_auth(self):
+        self._state = secrets.token_hex(16)
         url = _build_auth_url(
             self._client_id.get().strip(),
             SINGLE_ACCOUNT_SCOPES,
@@ -353,7 +373,7 @@ class TwitchAuthDialog(ctk.CTkToplevel):
         threading.Thread(target=self._receive_single_code, daemon=True).start()
 
     def _receive_single_code(self):
-        code, err = server_response()
+        code, err = server_response(self._state)
         if err or not code:
             self._configure_later(
                 self._single_status,
@@ -435,6 +455,7 @@ class TwitchAuthDialog(ctk.CTkToplevel):
         ).pack(anchor="w", pady=(6, 0))
 
     def _start_bot_auth(self):
+        self._state = secrets.token_hex(16)
         url = _build_auth_url(
             self._client_id.get().strip(), BOT_SCOPES, self._state)
         webbrowser.open(url)
@@ -447,7 +468,7 @@ class TwitchAuthDialog(ctk.CTkToplevel):
         threading.Thread(target=self._receive_bot_code, daemon=True).start()
 
     def _receive_bot_code(self):
-        code, err = server_response()
+        code, err = server_response(self._state)
         if err or not code:
             self._configure_later(
                 self._bot_status,
@@ -513,6 +534,7 @@ class TwitchAuthDialog(ctk.CTkToplevel):
         ).pack(anchor="w", pady=(12, 0))
 
     def _start_channel_auth(self):
+        self._state = secrets.token_hex(16)
         url = _build_auth_url(
             self._client_id.get().strip(), CHANNEL_SCOPES, self._state)
         webbrowser.open(url)
@@ -525,7 +547,7 @@ class TwitchAuthDialog(ctk.CTkToplevel):
         threading.Thread(target=self._receive_channel_code, daemon=True).start()
 
     def _receive_channel_code(self):
-        code, err = server_response()
+        code, err = server_response(self._state)
         if err or not code:
             self._configure_later(
                 self._chan_status,

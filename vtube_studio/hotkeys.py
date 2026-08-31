@@ -1,10 +1,10 @@
 import asyncio
-import json
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
-from files.system_setup.json_utils import load_json_safe
+from files.system_setup.json_utils import load_json_safe, write_json_atomic
 import sys
 from files.vtube_studio.idle_animations import (
     IdleAnimationEngine,
@@ -49,12 +49,17 @@ class VTSSettings:
 
     reconnect_delay_seconds: float = 7.5
     request_timeout_seconds: float = 8.0
-    sequence_step_delay_seconds: float = 0.03
+    open_timeout_seconds: float = 2.5
+    sequence_step_delay_seconds: float = 0.10
+    idle_fps: int = 10
+    idle_await_response: bool = True
 
 class VTSHotkeyManager:
     def __init__(self, settings: Optional[VTSSettings] = None, logger=print):
         self.settings = settings or VTSSettings()
         self._lock = asyncio.Lock()
+        self._emotion_transition_lock = asyncio.Lock()
+        self._storage_lock = threading.RLock()
         self._client: Optional[VTSRawClient] = None
         self._connected = False
         self._authenticated = False
@@ -63,6 +68,9 @@ class VTSHotkeyManager:
         self._last_triggered_emotion = ""
         self._last_emotion_trigger_time = 0.0
         self._emotion_retrigger_cooldown = 4.0
+        self._last_emotion_action = ""
+        self._connection_state = "disconnected"
+        self._last_error = ""
         self._logger = print
         self.logger = self._safe_log
         self.set_logger(logger)
@@ -74,6 +82,36 @@ class VTSHotkeyManager:
     @property
     def idle_running(self) -> bool:
         return self._idle_engine is not None and self._idle_engine.is_running
+
+    @property
+    def connected(self) -> bool:
+        return bool(
+            self._client is not None
+            and self._client.connected
+            and self._client.authenticated
+            and self._connected
+            and self._authenticated
+        )
+
+    @property
+    def connection_state(self) -> str:
+        if self.connected:
+            return "connected"
+        if self._connection_state == "connecting":
+            return "connecting"
+        if self._connection_state == "faulted" or self.last_error:
+            return "faulted"
+        return "disconnected"
+
+    @property
+    def last_error(self) -> str:
+        if self._client is not None and self._client.last_error:
+            return self._client.last_error
+        return self._last_error
+
+    @property
+    def last_emotion_action(self) -> str:
+        return self._last_emotion_action
 
     def set_logger(self, logger=print) -> None:
         self._logger = logger or print
@@ -119,7 +157,7 @@ class VTSHotkeyManager:
                 return False
 
             if self._idle_engine is None:
-                self._idle_engine = IdleAnimationEngine(self._client, logger=self._safe_log)
+                self._idle_engine = self._make_idle_engine()
 
             return await self._idle_engine.start()
 
@@ -162,7 +200,7 @@ class VTSHotkeyManager:
                 return False
 
             if self._idle_engine is None:
-                self._idle_engine = IdleAnimationEngine(self._client, logger=self._safe_log)
+                self._idle_engine = self._make_idle_engine()
 
             return await self._idle_engine.ensure_custom_params_registered()
 
@@ -192,7 +230,16 @@ class VTSHotkeyManager:
             api_name=self.settings.api_name,
             api_version=self.settings.api_version,
             request_timeout_seconds=self.settings.request_timeout_seconds,
+            open_timeout_seconds=self.settings.open_timeout_seconds,
             logger=self._safe_log,
+        )
+
+    def _make_idle_engine(self) -> IdleAnimationEngine:
+        return IdleAnimationEngine(
+            self._client,
+            logger=self._safe_log,
+            fps=self.settings.idle_fps,
+            await_response=self.settings.idle_await_response,
         )
 
     async def connect(self) -> bool:
@@ -209,6 +256,8 @@ class VTSHotkeyManager:
             return True
 
         self._ensure_userdata()
+        self._connection_state = "connecting"
+        self._last_error = ""
 
         try:
             if self._client is None:
@@ -219,25 +268,26 @@ class VTSHotkeyManager:
             self._authenticated = ok
 
             if not ok:
+                self._last_error = self._client.last_error or "VTube Studio connection failed."
+                self._connection_state = "faulted"
                 return False
 
             self._current_emotion = ""
             self._last_triggered_emotion = ""
             self._last_emotion_trigger_time = 0.0
+            self._last_emotion_action = ""
+            mapping = self.load_vts_mapping()
+            if mapping.get("current_emotion"):
+                mapping["current_emotion"] = ""
+                self.save_vts_mapping(mapping)
 
-            if self._idle_engine is None:
-                self._idle_engine = IdleAnimationEngine(self._client, logger=self._safe_log)
-
-            try:
-                if not await self._idle_engine.ensure_custom_params_registered():
-                    self.logger("Connected to VTS, but custom VTS parameters are not ready.")
-            except Exception as e:
-                self.logger(f"Custom VTS parameter registration failed: {e}")
-
+            self._connection_state = "connected"
             return True
 
         except Exception as e:
             self.logger(f"Connect/auth failed: {e}")
+            self._last_error = str(e)
+            self._connection_state = "faulted"
             self._connected = False
             self._authenticated = False
             self._client = None
@@ -264,6 +314,9 @@ class VTSHotkeyManager:
         self._connected = False
         self._authenticated = False
         self._idle_engine = None
+        self._connection_state = "disconnected"
+        self._last_error = ""
+        self._last_emotion_action = ""
         self.logger("Closed VTS connection.")
 
     async def _request_locked(
@@ -309,11 +362,18 @@ class VTSHotkeyManager:
                 return []
 
             response = await self._request_locked("HotkeysInCurrentModelRequest")
+            if not isinstance(response, dict) or response.get("messageType") == "APIError":
+                self.logger("VTS did not return a valid hotkey list; keeping the existing cache.")
+                return []
             hotkeys = self._normalize_hotkey_response(response or {})
             self.logger(f"Found {len(hotkeys)} hotkeys.")
 
-            if hotkeys:
-                self.save_hotkeys(hotkeys)
+            data = response.get("data", {})
+            self.save_hotkeys(
+                hotkeys,
+                model_id=str(data.get("modelID") or ""),
+                model_name=str(data.get("modelName") or ""),
+            )
 
             return hotkeys
 
@@ -347,7 +407,7 @@ class VTSHotkeyManager:
             )
         return normalized
 
-    def _step_is_toggle(self, step: dict[str, Any]) -> bool:
+    def _step_is_expression_toggle(self, step: dict[str, Any]) -> bool:
         if not isinstance(step, dict):
             return False
 
@@ -357,10 +417,98 @@ class VTSHotkeyManager:
             hotkey_id = step.get("hotkey_id") or step.get("hotkeyID") or step.get("name")
             hotkey_type = self._get_hotkey_type_from_cache(hotkey_id)
 
-        return str(hotkey_type).lower() in {
-            "toggleexpression",
-            "toggleitemscene",
-        }
+        return str(hotkey_type).lower() == "toggleexpression"
+
+    @staticmethod
+    def _step_hotkey_id(step: dict[str, Any]) -> str:
+        if not isinstance(step, dict):
+            return ""
+        return str(
+            step.get("hotkey_id")
+            or step.get("hotkeyID")
+            or step.get("name")
+            or ""
+        ).strip()
+
+    def _expression_file_for_step(self, step: dict[str, Any]) -> str:
+        expression_file = str(step.get("file") or "").strip()
+        if expression_file:
+            return expression_file
+        hotkey = self._find_cached_hotkey(self._step_hotkey_id(step))
+        if not hotkey:
+            return ""
+        raw = hotkey.get("raw", {}) if isinstance(hotkey.get("raw"), dict) else {}
+        return str(hotkey.get("file") or raw.get("file") or "").strip()
+
+    def _log_hotkey_api_error(
+        self,
+        hotkey_id_or_name: str,
+        response: dict[str, Any],
+        hotkey_metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        data = response.get("data", {}) if isinstance(response, dict) else {}
+        error_id = data.get("errorID", "unknown")
+        message = str(data.get("message") or "Hotkey execution failed.")
+        hotkey = dict(hotkey_metadata or {})
+        cached_hotkey = self._find_cached_hotkey(hotkey_id_or_name) or {}
+        for key, value in cached_hotkey.items():
+            hotkey.setdefault(key, value)
+        name = str(hotkey.get("name") or hotkey_id_or_name)
+        hotkey_type = str(hotkey.get("type") or "")
+        guidance = ""
+        if str(error_id) == "206":
+            if hotkey_type.lower() == "loadeffectpreset":
+                guidance = (
+                    " Close any Visual Effects configuration window in VTube Studio, "
+                    "make sure Visual Effects are enabled, and try again."
+                )
+            else:
+                guidance = (
+                    " Make sure a model is loaded and allow the VTS hotkey cooldown "
+                    "to finish before retrying."
+                )
+        detail = (
+            f"VTS could not execute hotkey '{name}'"
+            f"{f' ({hotkey_type})' if hotkey_type else ''}: "
+            f"error {error_id} - {message}{guidance}"
+        )
+        self._last_error = detail
+        self.logger(detail)
+
+    async def _set_expression_active_locked(
+        self,
+        step: dict[str, Any],
+        active: bool,
+    ) -> bool:
+        expression_file = self._expression_file_for_step(step)
+        if not expression_file:
+            self.logger(
+                "Cannot safely change expression state because its .exp3.json file "
+                f"is missing from the hotkey cache: {self._step_hotkey_id(step)}"
+            )
+            return False
+        response = await self._request_locked(
+            "ExpressionActivationRequest",
+            {
+                "expressionFile": expression_file,
+                "active": bool(active),
+                "fadeTime": 0.1,
+            },
+        )
+        if response is None:
+            return False
+        if response.get("messageType") == "APIError":
+            data = response.get("data", {})
+            detail = (
+                f"VTS could not {'activate' if active else 'deactivate'} expression "
+                f"'{expression_file}': error {data.get('errorID', 'unknown')} - "
+                f"{data.get('message', 'Expression request failed.')}"
+            )
+            self._last_error = detail
+            self.logger(detail)
+            return False
+        self._last_error = ""
+        return True
 
     async def _toggle_off_previous_emotion(self, emotion_name: str) -> bool:
         emotion_name = (emotion_name or "").strip().lower()
@@ -372,7 +520,7 @@ class VTSHotkeyManager:
         sequence = emotion_config.get("talking_hotkey_sequence", [])
         toggle_steps = [
             step for step in sequence
-            if isinstance(step, dict) and self._step_is_toggle(step)
+            if isinstance(step, dict) and self._step_is_expression_toggle(step)
         ]
 
         if not toggle_steps:
@@ -381,13 +529,28 @@ class VTSHotkeyManager:
             )
             return True
 
-        self.logger(f"Toggling off previous emotion: {emotion_name}")
-        return await self.trigger_hotkey_sequence(
-            toggle_steps,
-            label=f"{emotion_name}.toggle_off",
-        )
+        self.logger(f"Deactivating previous emotion: {emotion_name}")
+        async with self._lock:
+            if not await self._connect_locked():
+                return False
+            success_count = 0
+            for step in toggle_steps:
+                if await self._set_expression_active_locked(step, False):
+                    success_count += 1
+                await asyncio.sleep(self.settings.sequence_step_delay_seconds)
+            self.logger(
+                f"Finished {emotion_name}.deactivate: "
+                f"{success_count}/{len(toggle_steps)} expressions deactivated."
+            )
+            return success_count == len(toggle_steps)
 
-    def save_hotkeys(self, hotkeys: list[dict[str, Any]]) -> None:
+    def save_hotkeys(
+        self,
+        hotkeys: list[dict[str, Any]],
+        *,
+        model_id: str = "",
+        model_name: str = "",
+    ) -> None:
         self._ensure_userdata()
         payload = {
             "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -395,37 +558,81 @@ class VTSHotkeyManager:
             "plugin_name": self.settings.plugin_name,
             "host": self.settings.host,
             "port": self.settings.port,
+            "model_id": model_id,
+            "model_name": model_name,
             "count": len(hotkeys),
             "hotkeys": hotkeys,
         }
-        self.hotkey_cache_path.write_text(
-            json.dumps(payload, indent=4, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        with self._storage_lock:
+            write_json_atomic(self.hotkey_cache_path, payload)
         self.logger(f"Saved hotkey cache: {self.hotkey_cache_path}")
 
     def load_cached_hotkeys(self) -> list[dict[str, Any]]:
-        payload = load_json_safe(
-            self.hotkey_cache_path,
-            DEFAULT_HOTKEY_CACHE,
-            dict,
-            logger=lambda message: self.logger(f"Failed to load cached hotkeys: {message}"),
-        )
+        with self._storage_lock:
+            payload = load_json_safe(
+                self.hotkey_cache_path,
+                DEFAULT_HOTKEY_CACHE,
+                dict,
+                logger=lambda message: self.logger(f"Failed to load cached hotkeys: {message}"),
+            )
         hotkeys = payload.get("hotkeys", []) if isinstance(payload, dict) else []
         return hotkeys if isinstance(hotkeys, list) else []
 
     def get_cached_hotkey_names(self) -> list[str]:
-        return [
-            hotkey.get("name", "")
-            for hotkey in self.load_cached_hotkeys()
-            if hotkey.get("name")
-        ]
+        return [label for label, _hotkey in self.get_cached_hotkey_options()]
+
+    def get_cached_hotkey_options(self) -> list[tuple[str, dict[str, Any]]]:
+        hotkeys = [item for item in self.load_cached_hotkeys() if item.get("name")]
+        counts: dict[str, int] = {}
+        for hotkey in hotkeys:
+            name = str(hotkey.get("name") or "")
+            counts[name] = counts.get(name, 0) + 1
+
+        options = []
+        for hotkey in hotkeys:
+            name = str(hotkey.get("name") or "")
+            label = name
+            if counts.get(name, 0) > 1:
+                kind = str(hotkey.get("type") or "Hotkey")
+                hotkey_id = str(hotkey.get("hotkey_id") or "")
+                label = f"{name} · {kind} · {hotkey_id[:8]}"
+            options.append((label, hotkey))
+        return options
 
     def find_cached_hotkey_by_name(self, hotkey_name: str) -> Optional[dict[str, Any]]:
+        options = self.get_cached_hotkey_options()
+        for label, hotkey in options:
+            if label == hotkey_name:
+                return hotkey
+        raw_matches = [
+            hotkey for _label, hotkey in options
+            if hotkey.get("name") == hotkey_name
+        ]
+        if len(raw_matches) == 1:
+            return raw_matches[0]
+        if len(raw_matches) > 1:
+            self.logger(f"Hotkey name is ambiguous: {hotkey_name}")
+        return None
+
+    def _find_cached_hotkey(self, hotkey_id_or_name: str) -> Optional[dict[str, Any]]:
+        value = str(hotkey_id_or_name or "").strip()
+        if not value:
+            return None
         for hotkey in self.load_cached_hotkeys():
-            if hotkey.get("name") == hotkey_name:
+            if (
+                str(hotkey.get("hotkey_id") or "") == value
+                or str(hotkey.get("name") or "") == value
+            ):
                 return hotkey
         return None
+
+    def display_name_for_mapping_entry(self, entry: dict[str, Any]) -> str:
+        hotkey_id = str(entry.get("hotkey_id") or entry.get("hotkeyID") or "")
+        name = str(entry.get("name") or "")
+        for label, hotkey in self.get_cached_hotkey_options():
+            if hotkey_id and str(hotkey.get("hotkey_id") or "") == hotkey_id:
+                return label
+        return name
 
     def build_mapping_entry_from_name(self, hotkey_name: str) -> Optional[dict[str, str]]:
         hotkey = self.find_cached_hotkey_by_name(hotkey_name)
@@ -433,10 +640,12 @@ class VTSHotkeyManager:
         if not hotkey:
             return None
 
+        raw = hotkey.get("raw", {}) if isinstance(hotkey.get("raw"), dict) else {}
         return {
             "name": hotkey.get("name", ""),
             "hotkey_id": hotkey.get("hotkey_id", ""),
             "type": hotkey.get("type", ""),
+            "file": hotkey.get("file", "") or raw.get("file", ""),
         }
 
     def _get_hotkey_type_from_cache(self, hotkey_id_or_name: str) -> str:
@@ -445,22 +654,19 @@ class VTSHotkeyManager:
         if not hotkey_id_or_name:
             return ""
 
-        for hotkey in self.load_cached_hotkeys():
-            if (
-                hotkey.get("hotkey_id") == hotkey_id_or_name
-                or hotkey.get("name") == hotkey_id_or_name
-            ):
-                return hotkey.get("type", "") or ""
-
-        return ""
+        hotkey = self._find_cached_hotkey(hotkey_id_or_name)
+        if not hotkey:
+            return ""
+        return hotkey.get("type", "") or ""
 
     def load_vts_mapping(self) -> dict[str, Any]:
-        payload = load_json_safe(
-            self.emotion_map_path,
-            DEFAULT_VTS_MAPPING,
-            dict,
-            logger=lambda message: self.logger(f"Failed to load VTS mapping: {message}"),
-        )
+        with self._storage_lock:
+            payload = load_json_safe(
+                self.emotion_map_path,
+                DEFAULT_VTS_MAPPING,
+                dict,
+                logger=lambda message: self.logger(f"Failed to load VTS mapping: {message}"),
+            )
         if "emotions" in payload:
             payload.setdefault("current_emotion", "")
             payload.setdefault("full_reset_hotkey_sequence", [])
@@ -490,16 +696,54 @@ class VTSHotkeyManager:
         mapping.setdefault("emotions", {})
         payload = {
             "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "model_id": mapping.get("model_id", ""),
+            "model_name": mapping.get("model_name", ""),
             "current_emotion": mapping.get("current_emotion", ""),
             "full_reset_hotkey_sequence": mapping.get("full_reset_hotkey_sequence", []),
             "emotions": mapping.get("emotions", {}),
         }
-        self.emotion_map_path.write_text(
-            json.dumps(payload, indent=4, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        with self._storage_lock:
+            write_json_atomic(self.emotion_map_path, payload)
 
         self.logger(f"Saved VTS mapping: {self.emotion_map_path}")
+
+    def save_primary_mappings(
+        self,
+        emotion_entries: dict[str, Optional[dict[str, Any]]],
+        full_reset_entry: Optional[dict[str, Any]],
+    ) -> dict[str, Any]:
+        with self._storage_lock:
+            mapping = self.load_vts_mapping()
+            emotions = mapping.setdefault("emotions", {})
+
+            for emotion_name, entry in emotion_entries.items():
+                emotion_name = (emotion_name or "").strip().lower()
+                if not emotion_name:
+                    continue
+                config = emotions.setdefault(emotion_name, empty_emotion_config())
+                for key, default_value in empty_emotion_config().items():
+                    config.setdefault(key, default_value)
+                existing = list(config.get("talking_hotkey_sequence", []))
+                if entry is None:
+                    config["talking_hotkey_sequence"] = []
+                elif existing:
+                    config["talking_hotkey_sequence"] = [entry, *existing[1:]]
+                else:
+                    config["talking_hotkey_sequence"] = [entry]
+
+            reset_sequence = list(mapping.get("full_reset_hotkey_sequence", []))
+            if full_reset_entry is None:
+                mapping["full_reset_hotkey_sequence"] = []
+            elif reset_sequence:
+                mapping["full_reset_hotkey_sequence"] = [
+                    full_reset_entry,
+                    *reset_sequence[1:],
+                ]
+            else:
+                mapping["full_reset_hotkey_sequence"] = [full_reset_entry]
+
+            self.save_vts_mapping(mapping)
+        return mapping
 
     async def trigger_hotkey(self, hotkey_id_or_name: str) -> bool:
         if not hotkey_id_or_name:
@@ -507,7 +751,11 @@ class VTSHotkeyManager:
         async with self._lock:
             return await self._trigger_hotkey_locked(hotkey_id_or_name)
 
-    async def _trigger_hotkey_locked(self, hotkey_id_or_name: str) -> bool:
+    async def _trigger_hotkey_locked(
+        self,
+        hotkey_id_or_name: str,
+        hotkey_metadata: Optional[dict[str, Any]] = None,
+    ) -> bool:
         if not await self._connect_locked():
             return False
         response = await self._request_locked(
@@ -519,8 +767,13 @@ class VTSHotkeyManager:
             return False
         msg_type = response.get("messageType")
         if msg_type == "APIError":
-            self.logger(f"VTS failed to trigger hotkey '{hotkey_id_or_name}': {response}")
+            self._log_hotkey_api_error(
+                hotkey_id_or_name,
+                response,
+                hotkey_metadata,
+            )
             return False
+        self._last_error = ""
         return True
 
     async def trigger_hotkey_sequence(
@@ -529,6 +782,7 @@ class VTSHotkeyManager:
         *,
         label: str = "sequence",
         delay_seconds: Optional[float] = None,
+        expression_active: Optional[bool] = None,
     ) -> bool:
         if delay_seconds is None:
             delay_seconds = self.settings.sequence_step_delay_seconds
@@ -539,21 +793,32 @@ class VTSHotkeyManager:
             if not await self._connect_locked():
                 return False
             success_count = 0
+            attempted_count = 0
             for step in sequence:
                 if not isinstance(step, dict):
                     continue
-                hotkey_id = step.get("hotkey_id") or step.get("hotkeyID") or step.get("name")
+                hotkey_id = self._step_hotkey_id(step)
                 if not hotkey_id:
                     continue
-                ok = await self._trigger_hotkey_locked(hotkey_id)
+                attempted_count += 1
+                if (
+                    expression_active is not None
+                    and self._step_is_expression_toggle(step)
+                ):
+                    ok = await self._set_expression_active_locked(
+                        step,
+                        expression_active,
+                    )
+                else:
+                    ok = await self._trigger_hotkey_locked(hotkey_id, step)
                 if ok:
                     success_count += 1
                 if delay_seconds and delay_seconds > 0:
                     await asyncio.sleep(delay_seconds)
             self.logger(
-                f"Finished {label}: {success_count}/{len(sequence)} steps triggered."
+                f"Finished {label}: {success_count}/{attempted_count} steps triggered."
             )
-            return success_count > 0
+            return attempted_count > 0 and success_count == attempted_count
 
     def _get_emotion_config(self, emotion_name: str) -> Optional[dict[str, Any]]:
         mapping = self.load_vts_mapping()
@@ -561,15 +826,25 @@ class VTSHotkeyManager:
 
     def set_current_emotion_local(self, emotion_name: str) -> bool:
         emotion_name = (emotion_name or "").strip().lower()
-        mapping = self.load_vts_mapping()
+        with self._storage_lock:
+            mapping = self.load_vts_mapping()
 
-        if emotion_name not in mapping.get("emotions", {}):
-            self.logger(f"Tried to set undefined emotion: {emotion_name}")
-            return False
-        self._current_emotion = emotion_name
-        mapping["current_emotion"] = emotion_name
-        self.save_vts_mapping(mapping)
+            if emotion_name not in mapping.get("emotions", {}):
+                self.logger(f"Tried to set undefined emotion: {emotion_name}")
+                return False
+            self._current_emotion = emotion_name
+            mapping["current_emotion"] = emotion_name
+            self.save_vts_mapping(mapping)
         return True
+
+    def _clear_current_emotion_local(self) -> None:
+        with self._storage_lock:
+            mapping = self.load_vts_mapping()
+            mapping["current_emotion"] = ""
+            self._current_emotion = ""
+            self._last_triggered_emotion = ""
+            self._last_emotion_trigger_time = 0.0
+            self.save_vts_mapping(mapping)
 
     def get_current_emotion(self) -> str:
         return self._current_emotion
@@ -589,12 +864,18 @@ class VTSHotkeyManager:
         return await self.trigger_hotkey_sequence(
             sequence,
             label=f"{emotion_name}.{key}",
+            expression_active=sequence_type != "reset",
         )
 
     async def set_emotion_and_animate_talking(self, emotion_name: str) -> bool:
+        async with self._emotion_transition_lock:
+            return await self._set_emotion_and_animate_talking_locked(emotion_name)
+
+    async def _set_emotion_and_animate_talking_locked(self, emotion_name: str) -> bool:
         import time
         emotion_name = (emotion_name or "").strip().lower()
         if not emotion_name:
+            self._last_emotion_action = "invalid"
             return False
         previous_emotion = self.get_current_emotion()
         now = time.monotonic()
@@ -604,25 +885,42 @@ class VTSHotkeyManager:
         ):
             self.apply_emotion_to_idle(emotion_name)
             self.logger(f"Skipped duplicate emotion trigger during cooldown: {emotion_name}")
+            self._last_emotion_action = "cooldown_skipped"
             return True
         emotion_config = self._get_emotion_config(emotion_name)
         if not emotion_config:
             self.logger(f"Tried to set undefined emotion: {emotion_name}")
+            self._last_emotion_action = "unmapped"
             return False
         if previous_emotion and previous_emotion != emotion_name:
-            await self._toggle_off_previous_emotion(previous_emotion)
+            previous_config = self._get_emotion_config(previous_emotion) or {}
+            reset_sequence = previous_config.get("reset_hotkey_sequence", [])
+            if reset_sequence:
+                reset_ok = await self.play_sequence_for_emotion(previous_emotion, "reset")
+            else:
+                reset_ok = await self._toggle_off_previous_emotion(previous_emotion)
+            if not reset_ok:
+                self.logger(f"Could not reset previous emotion: {previous_emotion}")
+                self._last_emotion_action = "reset_failed"
+                return False
+            self._clear_current_emotion_local()
             await asyncio.sleep(0.08)
+        sequence = emotion_config.get("talking_hotkey_sequence", [])
+        if sequence:
+            if not await self.play_sequence_for_emotion(emotion_name, "talking"):
+                self._last_emotion_action = "trigger_failed"
+                return False
+        else:
+            self.logger(f"No talking sequence mapped for emotion: {emotion_name}")
+
         if not self.set_current_emotion_local(emotion_name):
+            self._last_emotion_action = "state_failed"
             return False
         self._last_triggered_emotion = emotion_name
         self._last_emotion_trigger_time = now
         self.apply_emotion_to_idle(emotion_name)
-        sequence = emotion_config.get("talking_hotkey_sequence", [])
-        if not sequence:
-            self.logger(f"No talking sequence mapped for emotion: {emotion_name}")
-            return True
-
-        return await self.play_sequence_for_emotion(emotion_name, "talking")
+        self._last_emotion_action = "triggered"
+        return True
 
     async def animate_talking(self) -> bool:
         current = self.get_current_emotion()
@@ -641,6 +939,10 @@ class VTSHotkeyManager:
         return await self.play_sequence_for_emotion(current, "idle")
     
     async def reset_current_emotion(self) -> bool:
+        async with self._emotion_transition_lock:
+            return await self._reset_current_emotion_locked()
+
+    async def _reset_current_emotion_locked(self) -> bool:
         current = self.get_current_emotion()
 
         if not current:
@@ -648,36 +950,40 @@ class VTSHotkeyManager:
             self.apply_emotion_to_idle("neutral")
             return True
         
-        ok = await self._toggle_off_previous_emotion(current)
-        mapping = self.load_vts_mapping()
-        mapping["current_emotion"] = ""
-        self._current_emotion = ""
-        self._last_triggered_emotion = ""
-        self._last_emotion_trigger_time = 0.0
-        self.save_vts_mapping(mapping)
+        emotion_config = self._get_emotion_config(current) or {}
+        reset_sequence = emotion_config.get("reset_hotkey_sequence", [])
+        if reset_sequence:
+            ok = await self.play_sequence_for_emotion(current, "reset")
+        else:
+            ok = await self._toggle_off_previous_emotion(current)
+        if not ok:
+            self.logger(f"Failed to reset current VTS emotion: {current}")
+            return False
+        self._clear_current_emotion_local()
         self.apply_emotion_to_idle("neutral")
 
-        if ok:
-            self.logger(f"Reset current VTS emotion: {current}")
-        else:
-            self.logger(f"Attempted to reset current VTS emotion: {current}")
-
-        return ok
+        self.logger(f"Reset current VTS emotion: {current}")
+        return True
 
     async def full_reset(self) -> bool:
+        async with self._emotion_transition_lock:
+            return await self._full_reset_locked()
+
+    async def _full_reset_locked(self) -> bool:
         mapping = self.load_vts_mapping()
         sequence = mapping.get("full_reset_hotkey_sequence", [])
-        mapping["current_emotion"] = ""
-        self._current_emotion = ""
-        self._last_triggered_emotion = ""
-        self._last_emotion_trigger_time = 0.0
-        self.save_vts_mapping(mapping)
-        self.apply_emotion_to_idle("neutral")
-
-        return await self.trigger_hotkey_sequence(
+        if not sequence:
+            self.logger("No full reset hotkey sequence is mapped.")
+            return False
+        if not await self.trigger_hotkey_sequence(
             sequence,
             label="full_reset_hotkey_sequence",
-        )
+        ):
+            return False
+        self._clear_current_emotion_local()
+        self.apply_emotion_to_idle("neutral")
+
+        return True
 
 async def main():
     manager = VTSHotkeyManager()

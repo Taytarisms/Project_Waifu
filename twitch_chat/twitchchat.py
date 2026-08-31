@@ -3,11 +3,12 @@ import asyncio
 import queue
 import uuid
 from itertools import count
-from pathlib import Path
 from threading import RLock, Thread
 
 from files.system_setup.settings import get_auth, get_settings
 from files.system_setup.system_logger import Logger
+from files.system_setup.networking import configure_dns
+from files.stream_chat import StreamChatEvent, StreamChatMessage, get_stream_chat_hub
 from twitchio.ext import commands as _commands
 from twitchio import eventsub as _eventsub
 
@@ -16,12 +17,8 @@ read_chat_thread = None
 read_chat_running = False
 _bot_loop: asyncio.AbstractEventLoop | None = None
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-FILE_PATH    = PROJECT_ROOT / "blacklist.txt"
-
 twitch_access_token  = get_auth("twitch", "access_token")
 twitch_channel       = ""
-blacklisted_users: list[str] = []
 _ui_page = None
 _queue_ids = count(1)
 _queue_lock = RLock()
@@ -41,73 +38,55 @@ def _normalize_policy(policy: str | None) -> str:
     return value if value in _VALID_POLICIES else "latest-buffered"
 
 
-def ignored_prefixes() -> list[str]:
-    raw = get_settings("TWITCH_IGNORED_PREFIXES") or ""
-    if isinstance(raw, (list, tuple)):
-        parts = raw
-    else:
-        parts = str(raw).splitlines()
-    prefixes: list[str] = []
-    for item in parts:
-        prefix = str(item or "").strip()
-        if prefix and prefix not in prefixes:
-            prefixes.append(prefix)
-    return prefixes
-
-
-def has_ignored_prefix(message: str) -> bool:
-    content = str(message or "").lstrip()
-    if not content:
-        return False
-    return any(content.startswith(prefix) for prefix in ignored_prefixes())
-
 def set_ui_page(page) -> None:
     global _ui_page
     _ui_page = page
+    get_stream_chat_hub().set_ui_page(page)
 
 def get_ui_page():
     return _ui_page
 
-def _push_chat(author: str, color: str, role: str, content: str, user_id: str = "") -> None:
-    page = _ui_page
-    if page is None:
-        Logger.warn(f"No Twitch UI page registered for chat: {author}")
-        return
-
-    pseudo_tags = {
-        "color":             color or "",
-        "mod":               "1" if role == "mod" else "0",
-        "subscriber":        "1" if role == "sub" else "0",
-        "first-msg":         "1" if role == "first" else "0",
-        "returning-chatter": "1" if role == "returning" else "0",
-        "badges":            "broadcaster" if role == "broadcaster" else "",
-        "user-id":           user_id or "",
-    }
-
-    try:
-        page.after(0, page.push_chat_message, author, pseudo_tags, content)
-    except Exception as e:
-        Logger.warn(f"Failed pushing Twitch chat from {author}: {e}")
+def _push_chat(
+    author: str,
+    color: str,
+    role: str,
+    content: str,
+    user_id: str = "",
+    native_id: str = "",
+) -> None:
+    message = StreamChatMessage(
+        provider="twitch",
+        native_id=native_id,
+        author_name=author,
+        author_id=user_id,
+        text=content,
+        role=role,
+        raw={"color": color or ""},
+    )
+    get_stream_chat_hub().emit_message(message)
 
 def _push_event(event_type: str, username: str, detail: str = "") -> None:
-    page = _ui_page
-    if page is None:
-        Logger.warn(f"No Twitch page registered for event: {event_type}")
-    else:
-        try:
-            page.after(0, page.push_event, event_type, username, detail)
-        except Exception as e:
-            Logger.warn(f"Failed pushing Twitch event {event_type}: {e}")
+    hub = get_stream_chat_hub()
+    accepted = hub.emit_event(
+        StreamChatEvent(
+            provider="twitch",
+            event_type=event_type,
+            username=username,
+            detail=detail,
+        )
+    )
+    if not accepted:
+        Logger.quiet_print(f"Twitch event ignored for blocked account: {username}")
+        return
     _enqueue_priority_event(event_type, username, detail)
 
 def _push_queue_update() -> None:
     page = _ui_page
-    if page is None or not hasattr(page, "refresh_queue_panel"):
-        return
-    try:
-        page.after(0, page.refresh_queue_panel)
-    except Exception as e:
-        Logger.warn(f"Failed pushing Twitch queue update: {e}")
+    if page is not None and hasattr(page, "refresh_queue_panel"):
+        try:
+            page.after(0, page.refresh_queue_panel)
+        except Exception:
+            pass
 
 def _make_queue_item(
     author: str,
@@ -117,17 +96,19 @@ def _make_queue_item(
     user_id: str,
     role: str,
     event_type: str = "",
-) -> dict:
-    return {
-        "id": next(_queue_ids),
-        "author": author,
-        "content": content,
-        "priority": bool(priority),
-        "user_id": user_id or "",
-        "role": role or "",
-        "event_type": event_type or "",
-        "received_at": time.time(),
-    }
+    native_id: str = "",
+) -> StreamChatMessage:
+    return StreamChatMessage(
+        provider="twitch",
+        native_id=native_id or str(next(_queue_ids)),
+        author_name=author,
+        author_id=user_id,
+        text=content,
+        priority=priority,
+        role=role,
+        kind="event" if event_type else "message",
+        event_type=event_type,
+    )
 
 def _priority_event_prompt(event_type: str, username: str, detail: str = "") -> str | None:
     event_type = (event_type or "").strip().lower()
@@ -159,8 +140,8 @@ def _priority_event_prompt(event_type: str, username: str, detail: str = "") -> 
 
 def _enqueue_priority_event(event_type: str, username: str, detail: str = "") -> None:
     prompt = _priority_event_prompt(event_type, username, detail)
-    bot = get_twitch_bot()
-    if prompt is None or bot is None or getattr(bot, "start_chat_pause", False):
+    hub = get_stream_chat_hub()
+    if prompt is None or hub.paused:
         return
     item = _make_queue_item(
         "Stream Event",
@@ -170,11 +151,11 @@ def _enqueue_priority_event(event_type: str, username: str, detail: str = "") ->
         role="event",
         event_type=event_type,
     )
-    with _queue_lock:
-        bot.prioritized_buffer.append(item)
-    _push_queue_update()
+    hub.enqueue(item)
 
 def _item_author(item) -> str:
+    if isinstance(item, StreamChatMessage):
+        return item.author_name
     if isinstance(item, dict):
         return str(item.get("author", ""))
     try:
@@ -183,6 +164,8 @@ def _item_author(item) -> str:
         return ""
 
 def _item_content(item) -> str:
+    if isinstance(item, StreamChatMessage):
+        return item.text
     if isinstance(item, dict):
         return str(item.get("content", ""))
     try:
@@ -214,16 +197,6 @@ def _snapshot_item(item, lane: str) -> dict:
         "age_seconds": 0,
     }
 
-def _load_blacklist_loop() -> None:
-    while True:
-        try:
-            global blacklisted_users
-            with open(FILE_PATH, "r") as f:
-                blacklisted_users = f.read().splitlines()
-        except Exception:
-            Logger.notify(f"Could not read {FILE_PATH}")
-        time.sleep(5)
-
 class Bot(_commands.Bot):
     def __init__(
         self,
@@ -254,7 +227,6 @@ class Bot(_commands.Bot):
         self.step_timer = time.perf_counter()
         self.start_chat_pause = False
         self.reader_task = None
-        Thread(target=_load_blacklist_loop, daemon=True).start()
 
     async def setup_hook(self) -> None:
         Logger.notify("Registering Twitch tokens/subscriptions...")
@@ -295,8 +267,6 @@ class Bot(_commands.Bot):
                 await _await_step("add channel token", self.add_token(channel_access, channel_refresh), timeout=30.0)
             else:
                 Logger.warn("Missing channel access token.")
-        if self.reader_task is None:
-            self.reader_task = asyncio.create_task(self._read_buffer_loop())
         chat_sub = _eventsub.ChatMessageSubscription(broadcaster_user_id=self._owner_id, user_id=self._bot_id)
         await _await_step("subscribe ChatMessageSubscription", self.subscribe_websocket(payload=chat_sub), timeout=30.0)
         notif_sub = _eventsub.ChatNotificationSubscription(broadcaster_user_id=self._owner_id, user_id=self._bot_id)
@@ -309,6 +279,9 @@ class Bot(_commands.Bot):
 
     async def event_ready(self) -> None:
         Logger.notify(f"Ready as {self.bot_id}")
+        get_stream_chat_hub().update_provider_status(
+            "twitch", "connected", "EventSub connected", get_auth("twitch", "channel_name") or ""
+        )
 
     async def event_message(self, payload: "twitchio.ChatMessage") -> None:  # type: ignore[name-defined]
         if self.start_chat_pause:
@@ -316,9 +289,11 @@ class Bot(_commands.Bot):
         chatter = payload.chatter
         author  = chatter.name or ""
         content = payload.text or ""
-        if "@" in content:
-            return
-        if author.lower() in blacklisted_users:
+        if get_stream_chat_hub().is_author_blocked(
+            "twitch",
+            author,
+            str(getattr(chatter, "id", "") or ""),
+        ):
             return
         color = str(chatter.color) if chatter.color else ""
         if getattr(chatter, "broadcaster", False):
@@ -332,17 +307,14 @@ class Bot(_commands.Bot):
         else:
             role = ""
         user_id = str(getattr(chatter, "id", "") or "")
-        _push_chat(author, color, role, content, user_id=user_id)
+        native_id = str(getattr(payload, "id", "") or "")
+        _push_chat(author, color, role, content, user_id=user_id, native_id=native_id)
         if getattr(chatter, "is_first", False):
             _push_event("first_msg", author)
         reward = getattr(payload, "channel_points_custom_reward_id", None)
         if reward:
             reward_title = getattr(getattr(payload, "channel_points_custom_reward", None), "title", "Channel Point Reward")
             _push_event("redemption", author, reward_title)
-
-        if has_ignored_prefix(content):
-            Logger.quiet_print(f"Twitch message ignored by prefix: {author}: {content}")
-            return
 
         priority = getattr(payload, "highlighted", False)
         item = _make_queue_item(
@@ -351,13 +323,9 @@ class Bot(_commands.Bot):
             priority=priority,
             user_id=user_id,
             role=role,
+            native_id=native_id,
         )
-        with _queue_lock:
-            if priority:
-                self.prioritized_buffer.append(item)
-            else:
-                self.chat_buffer.append(item)
-        _push_queue_update()
+        get_stream_chat_hub().enqueue(item)
 
     async def event_chat_notification(self, payload) -> None:
         try:
@@ -521,6 +489,9 @@ def _view_all(buffer, priority, max_backlog=5):
 def read_chat() -> None:
     global twitchbot, read_chat_running, read_chat_thread, twitch_channel, twitch_access_token
     Logger.notify("Starting Chat Fetching")
+    hub = get_stream_chat_hub()
+    hub.start()
+    hub.update_provider_status("twitch", "connecting", "Connecting EventSub")
 
     policy = _normalize_policy(get_settings("TWITCH_POLICY"))
     client_id     = get_auth("twitch", "client_id") or ""
@@ -534,7 +505,10 @@ def read_chat() -> None:
             "client_id, client_secret, bot_id, owner_id. "
             "Please set these in Settings → Twitch Authentication."
         )
+        hub.update_provider_status("twitch", "error", "Missing Twitch application or account credentials")
         return
+
+    configure_dns()
 
     twitchbot = Bot(
         client_id=client_id,
@@ -549,11 +523,19 @@ def read_chat() -> None:
 
 
 def runBot() -> None:
+    global read_chat_running
     Logger.notify("Chat thread started.")
     async def _runner():
         async with twitchbot:
             await twitchbot.start()
-    asyncio.run(_runner())
+    try:
+        asyncio.run(_runner())
+    except Exception as e:
+        get_stream_chat_hub().update_provider_status("twitch", "error", str(e))
+        Logger.warn(f"Twitch chat stopped: {e}")
+    finally:
+        read_chat_running = False
+        get_stream_chat_hub().update_provider_status("twitch", "disconnected")
 
 def get_twitch_bot():
     return twitchbot
@@ -581,9 +563,10 @@ def stop_read_chat(timeout: float = 2.0) -> None:
         except Exception as e:
             Logger.warn(f"Twitch chat shutdown failed: {e}")
     twitchbot = None
+    get_stream_chat_hub().update_provider_status("twitch", "disconnected")
 
 def set_twitch_policy(policy: str) -> str:
-    normalized = _normalize_policy(policy)
+    normalized = get_stream_chat_hub().set_policy(policy)
     bot = get_twitch_bot()
     if bot is not None:
         bot.policy = normalized
@@ -591,39 +574,13 @@ def set_twitch_policy(policy: str) -> str:
     return normalized
 
 def list_pending_messages() -> list[dict]:
-    bot = get_twitch_bot()
-    if bot is None:
-        return []
-    with _queue_lock:
-        priority_items = [
-            _snapshot_item(item, "priority")
-            for item in list(getattr(bot, "prioritized_buffer", []))
-        ]
-        standard_items = [
-            _snapshot_item(item, "standard")
-            for item in list(getattr(bot, "chat_buffer", []))
-        ]
-    return priority_items + standard_items
+    return get_stream_chat_hub().list_pending()
 
 def remove_pending_message(message_id) -> bool:
-    bot = get_twitch_bot()
-    if bot is None:
-        return False
-    try:
-        wanted_id = int(message_id)
-    except Exception:
-        return False
-
-    with _queue_lock:
-        for buffer in (bot.prioritized_buffer, bot.chat_buffer):
-            for idx, item in enumerate(list(buffer)):
-                if isinstance(item, dict) and item.get("id") == wanted_id:
-                    del buffer[idx] # This will remove the chat message by the ID associated with it. Be sure to keep an eye on chat to ensure you don't miss it.
-                    _push_queue_update()
-                    return True
-    return False
+    return get_stream_chat_hub().remove(str(message_id))
 
 def set_twitch_pause(value: bool) -> None:
+    get_stream_chat_hub().set_paused(value)
     bot = get_twitch_bot()
     if bot is not None:
         bot.start_chat_pause = bool(value)
@@ -633,6 +590,7 @@ def pause_chat_twitch(paused: bool) -> None:
     if twitchbot:
         twitchbot.start_chat_pause = paused
         Logger.notify(f"Chat reading {'paused' if paused else 'resumed'}.")
+    get_stream_chat_hub().set_paused(paused)
 
 def fetch_user_profile(user_id: str) -> dict | None:
     bot = get_twitch_bot()

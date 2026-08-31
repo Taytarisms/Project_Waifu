@@ -1,4 +1,6 @@
 import customtkinter as ctk
+
+from files.ui.components.scrolling import AppScrollableFrame
 import queue
 import random
 import threading
@@ -7,7 +9,7 @@ import uuid
 import importlib
 from files.ui import theme
 from files.ui.components.cards import ProviderCard
-from files.ui.components.header import SteamHeader
+from files.ui.components.header import SteamHeader, SubpageNavigation
 from files.ui.components.auth_dialog import AuthTokenDialog
 from pathlib import Path
 
@@ -71,11 +73,41 @@ PAID_PROVIDERS = [
 ]
 
 LOCAL_PROVIDERS = [
-    ("Local",    "Local model runtime for GGUF / llama-cpp style models.\nENTIRELY LOCAL",             LOCAL_MODEL_ICONS),
-    ("Personal", "Custom/personal backend route.\nNo true routing attached. DO NOT USE!!",             None),
+    (
+        "Local",
+        "Select an installed GGUF model and configure its runtime and generation settings.\nENTIRELY LOCAL",
+        LOCAL_MODEL_ICONS,
+    ),
+    (
+        "Download Models",
+        "Search Hugging Face and download compatible GGUF models into your local library.\nMODEL MANAGEMENT",
+        ASSETS_DIR / "hf-logo-with-title.png",
+    ),
 ]
 
-ALL_PROVIDERS = {name: (desc, img) for name, desc, img in PAID_PROVIDERS + LOCAL_PROVIDERS}
+
+def _local_model_is_ready(filename: str) -> bool:
+    filename = str(filename or "").strip()
+    if not filename:
+        return False
+
+    configured_path = Path(filename)
+    if configured_path.is_absolute() and configured_path.is_file():
+        return True
+
+    try:
+        from files.system_setup.model_checker import scan_local_models
+
+        wanted = configured_path.name.lower()
+        return any(
+            str(model.get("filename") or "").lower() == wanted
+            and Path(model.get("path", "")).is_file()
+            for model in scan_local_models()
+        )
+    except Exception:
+        return False
+
+MODEL_DOWNLOADS_DESTINATION = "Download Models"
 
 
 
@@ -476,7 +508,7 @@ class LLMCategoryPage(ctk.CTkFrame):
         subtitle = (
             "Cloud-hosted providers. An API key or account is required."
             if is_paid else
-            "Self-hosted models that run entirely on your hardware."
+            "Configure an installed local model or download a new GGUF model from Hugging Face."
         )
         providers = PAID_PROVIDERS if is_paid else LOCAL_PROVIDERS
 
@@ -493,15 +525,13 @@ class LLMCategoryPage(ctk.CTkFrame):
             text_color=theme.MUTED_TEXT,
         ).pack(anchor="w", padx=24, pady=(0, 20))
 
-        ctk.CTkButton(
+        SubpageNavigation(
             self,
-            text="← Back to LLM Library",
-            width=180,
-            fg_color="gray30",
-            command=lambda: self.app.show_page("LLM"),
+            back_text="← LLM Library",
+            back_command=lambda: self.app.show_page("LLM"),
         ).pack(anchor="w", padx=24, pady=(0, 16))
 
-        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        scroll = AppScrollableFrame(self, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=24, pady=10)
 
         grid = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -516,6 +546,11 @@ class LLMCategoryPage(ctk.CTkFrame):
                 grid,
                 name=name,
                 description=desc,
+                status=(
+                    "Available"
+                    if name == MODEL_DOWNLOADS_DESTINATION
+                    else "Inactive"
+                ),
                 image_path=image_path,
                 command=lambda n=name: self._open_provider(n),
             )
@@ -526,6 +561,14 @@ class LLMCategoryPage(ctk.CTkFrame):
                 card.set_active(True)
 
     def _open_provider(self, provider_name: str):
+        if provider_name == MODEL_DOWNLOADS_DESTINATION:
+            from files.ui.pages.hf_browser import HFModelBrowserPage
+
+            self.app.show_dynamic_page(
+                HFModelBrowserPage,
+                return_category="local",
+            )
+            return
         self.app.show_dynamic_page(LLMProviderPage, provider_name=provider_name)
 
 class LLMProviderPage(ctk.CTkFrame):
@@ -533,6 +576,7 @@ class LLMProviderPage(ctk.CTkFrame):
         super().__init__(master, fg_color=theme.APP_BG)
         self.app = app
         self.provider_name = provider_name
+        category = "paid" if provider_name in {n for n, _, _ in PAID_PROVIDERS} else "local"
 
         self.AUTH_REQUIREMENTS = {
             "OpenAI": {
@@ -575,11 +619,21 @@ class LLMProviderPage(ctk.CTkFrame):
             action_command=self.activate_provider,
         ).pack(fill="x")
 
+        SubpageNavigation(
+            self,
+            back_command=lambda: self.app.show_dynamic_page(
+                LLMCategoryPage,
+                category=category,
+            ),
+            library_text="⌂ LLM Library",
+            library_command=lambda: self.app.show_page("LLM"),
+        ).pack(fill="x", padx=24, pady=(12, 0))
+
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=24, pady=20)
 
         # Left: settings panel
-        left = ctk.CTkScrollableFrame(body, fg_color=theme.CARD_BG, corner_radius=10)
+        left = AppScrollableFrame(body, fg_color=theme.CARD_BG, corner_radius=10)
         left.pack(side="left", fill="both", expand=True, padx=(0, 10))
 
         content = ctk.CTkFrame(left, fg_color="transparent")
@@ -592,7 +646,7 @@ class LLMProviderPage(ctk.CTkFrame):
         right_outer.pack(side="right", fill="y", padx=(10, 0))
         right_outer.pack_propagate(False)
 
-        right = ctk.CTkScrollableFrame(right_outer, fg_color="transparent", corner_radius=10)
+        right = AppScrollableFrame(right_outer, fg_color="transparent", corner_radius=10)
         right.pack(fill="both", expand=True)
 
         ctk.CTkLabel(
@@ -640,24 +694,20 @@ class LLMProviderPage(ctk.CTkFrame):
         if provider_name == "NovelAI":
             self._build_novelai_character_tools(right)
             
-        _category = "paid" if provider_name in {n for n, _, _ in PAID_PROVIDERS} else "local"
-        ctk.CTkButton(
-            right,
-            text=f"← Back",
-            fg_color="gray30",
-            command=lambda: self.app.show_dynamic_page(LLMCategoryPage, category=_category),
-        ).pack(fill="x", padx=16, pady=(8, 4))
-
-        ctk.CTkButton(
-            right,
-            text="⌂ LLM Library",
-            fg_color="gray25",
-            command=lambda: self.app.show_page("LLM"),
-        ).pack(fill="x", padx=16, pady=(0, 16))
-
     def activate_provider(self):
         if not self._ensure_auth_token():
             return
+        if self.provider_name == "Local":
+            filename = get_settings("local_model_filename") if get_settings else ""
+            if not _local_model_is_ready(filename):
+                self.status_label.configure(
+                    text=(
+                        "Local model is not ready. Finish the download, then select "
+                        "and save an installed model in Model Settings."
+                    ),
+                    text_color="#d29922",
+                )
+                return
         self._finish_activation()
 
     def _finish_activation(self):

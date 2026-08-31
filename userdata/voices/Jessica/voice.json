@@ -1,0 +1,19 @@
+{
+    "name": "Jessica",
+    "mode": "voice_clone",
+    "model_id": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "engine": "qwen3",
+    "language": "English",
+    "speaker": "ryan",
+    "ref_audio": "You can upload your audio from anywhere on your PC!",
+    "ref_text": "If you spend your whole life waiting for the storm, you'll never enjoy the sunshine.",
+    "xvec_only": true,
+    "instruct": "Playful, Bright, Warm",
+    "device": "auto",
+    "backend": "faster",
+    "streaming_chunk_size": 8,
+    "sample_rate": 24000,
+    "num_step": 32,
+    "speed": 1.0,
+    "duration": null
+}

@@ -1,6 +1,6 @@
 {
-    "stt_mode": "Hot Mic",
-    "stt_engine": "Google",
+    "stt_mode": "Push To Talk",
+    "stt_engine": "Local Whisper",
     "stt_openai_model": "gpt-4o-transcribe",
     "stt_openai_chunk_seconds": 5.0,
     "stt_device_index": "1",
@@ -20,5 +20,13 @@
     "stt_google_energy_threshold": "",
     "stt_wake_word_enabled": false,
     "stt_wake_word": "",
-    "stt_ptt_key": "v"
+    "stt_ptt_key": "v",
+    "stt_device_selection_mode": "automatic",
+    "stt_device_id": "audio:ec8a1a2e4f397ae7",
+    "stt_device_name": "Chat Mic (2- TC-HELICON GoXLR)",
+    "stt_device_host_api": "MME",
+    "stt_device_preferred_patterns": "CABLE Output\nVB-Audio",
+    "stt_pause_during_playback": true,
+    "stt_partial_interval_ms": 500,
+    "stt_beam_size": 1
 }

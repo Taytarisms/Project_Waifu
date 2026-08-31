@@ -441,4 +441,4 @@ class LogsPage(ctk.CTkFrame):
         elif sys.platform == "darwin": # Mac OS in case I decide to move on to it
             subprocess.Popen(["open", str(path)])
         else:
-            subprocess.Popen(["xdg-open", str(path)]) # Same thing with Linux
+            raise OSError(f"Opening log paths is unsupported on {sys.platform} in this release.")

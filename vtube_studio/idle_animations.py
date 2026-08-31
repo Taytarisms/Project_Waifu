@@ -354,12 +354,21 @@ class IdleConfig:
 
 class IdleAnimationEngine:
     # Don't change any values in this engine unless you know what you're doing!
-    FPS: int = 15
-    FRAME_DURATION: float = 1.0 / FPS
+    DEFAULT_FPS: int = 15
 
-    def __init__(self, vts_client, logger=print):
+    def __init__(
+        self,
+        vts_client,
+        logger=print,
+        *,
+        fps: int = DEFAULT_FPS,
+        await_response: bool = True,
+    ):
         self._client = vts_client
         self._logger = logger
+        self.fps = max(1, min(60, int(fps)))
+        self.frame_duration = 1.0 / self.fps
+        self.await_response = bool(await_response)
         self.config = IdleConfig()
         self._t_origin = random.uniform(0.0, 10000.0)
         self._channels = self._build_channels()
@@ -437,9 +446,10 @@ class IdleAnimationEngine:
         }
 
     async def start(self) -> bool:
-        if self._running:
+        if self.is_running:
             self._logger("Idle animation already running.")
             return True
+        self._task = None
         if not await self.ensure_custom_params_registered():
             self._logger("Failed to register custom params — is VTS connected?")
             return False
@@ -461,7 +471,11 @@ class IdleAnimationEngine:
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        return bool(
+            self._running
+            and self._task is not None
+            and not self._task.done()
+        )
 
     def update_head_config(self, **kw):
         for k, v in kw.items():
@@ -652,35 +666,42 @@ class IdleAnimationEngine:
 
     async def _loop(self) -> None:
         self._logger("Idle animation loop entering main cycle.")
-        while self._running:
-            frame_start = time.monotonic()
-            now = time.monotonic()
-            t = now - self._t_origin
+        try:
+            while self._running:
+                frame_start = time.monotonic()
+                now = time.monotonic()
+                t = now - self._t_origin
 
-            self._maybe_rotate_idle_profile(now)
-            self._tick_transition(now)
+                self._maybe_rotate_idle_profile(now)
+                self._tick_transition(now)
 
-            out = {}
-            self._tick_head(t, out)
-            self._tick_body(t, out)
-            self._tick_bounce(t, out)
-            self._tick_eyes(now, out)
-            self._tick_head_follow(out)
-            self._tick_blink(now, out)
-            self._tick_breath(t, out)
-            self._tick_brows(t, out)
-            self._tick_mouth(t, out)
-            self._tick_gesture(now, out)
+                out = {}
+                self._tick_head(t, out)
+                self._tick_body(t, out)
+                self._tick_bounce(t, out)
+                self._tick_eyes(now, out)
+                self._tick_head_follow(out)
+                self._tick_blink(now, out)
+                self._tick_breath(t, out)
+                self._tick_brows(t, out)
+                self._tick_mouth(t, out)
+                self._tick_gesture(now, out)
 
-            vts_params = [
-                {"id": k, "value": float(v)}
-                for k, v in _with_param_aliases(out).items()
-            ]
-            if vts_params:
-                await self._send_params(vts_params)
+                vts_params = [
+                    {"id": k, "value": float(v)}
+                    for k, v in _with_param_aliases(out).items()
+                ]
+                if vts_params:
+                    await self._send_params(vts_params)
 
-            elapsed = time.monotonic() - frame_start
-            await asyncio.sleep(max(0.0, self.FRAME_DURATION - elapsed))
+                elapsed = time.monotonic() - frame_start
+                await asyncio.sleep(max(0.0, self.frame_duration - elapsed))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._logger(f"Idle animation loop stopped unexpectedly: {exc}")
+        finally:
+            self._running = False
 
     def _tick_head(self, t, out):
         if not self.config.head.enabled:
@@ -711,7 +732,7 @@ class IdleAnimationEngine:
         cfg = self.config.bounce
         raw = math.sin(self._bounce_phase)
         bounce = raw * cfg.amplitude
-        self._bounce_phase += cfg.frequency * self.FRAME_DURATION * math.tau
+        self._bounce_phase += cfg.frequency * self.frame_duration * math.tau
         mod = 0.8 + 0.2 * _smooth_noise(t * 0.12, 77777)
         bounce *= mod
         out["AIBodyAngleY"] = out.get("AIBodyAngleY", 0.0) + bounce
@@ -771,7 +792,7 @@ class IdleAnimationEngine:
             return
         cfg = self.config.breath
         drift = _smooth_noise(t * 0.05, 99999) * cfg.frequency_drift
-        self._breath_phase += (cfg.frequency + drift) * self.FRAME_DURATION * math.tau
+        self._breath_phase += (cfg.frequency + drift) * self.frame_duration * math.tau
         out["AIBreath"] = math.sin(self._breath_phase) * cfg.amplitude * self._breath_scale
 
     def _tick_brows(self, t, out):
@@ -844,10 +865,16 @@ class IdleAnimationEngine:
 
     async def _send_params(self, param_values):
         try:
-            await self._client.inject_parameter_values(
+            response = await self._client.inject_parameter_values(
                 param_values, mode=self.config.injection_mode,
-                await_response=False, timeout=2.0,
+                await_response=self.await_response, timeout=2.0,
             )
+            if (
+                self.await_response
+                and isinstance(response, dict)
+                and response.get("messageType") == "APIError"
+            ):
+                raise RuntimeError(self._format_vts_error(response))
             self._consecutive_send_failures = 0
         except asyncio.TimeoutError:
             self._consecutive_send_failures += 1

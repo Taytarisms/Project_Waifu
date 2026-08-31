@@ -9,10 +9,11 @@ except Exception:
 
 
 NOVELAI_MODELS = [
+    "xialong-v1",
+    "glm-4-6",
+    "erato",
     "kayra",
     "clio",
-    "erato",   # newer / higher tier
-    "custom",
 ]
 
 class NovelAISettingsPage(ctk.CTkFrame):
@@ -28,13 +29,13 @@ class NovelAISettingsPage(ctk.CTkFrame):
             text_color=theme.TEXT,
         ).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 10))
 
-        self.model_var = ctk.StringVar(value=self._setting("novel_model", "kayra"))
+        self.model_var = ctk.StringVar(value=self._setting("novel_model", "xialong-v1"))
         self.temperature_var = ctk.DoubleVar(value=float(self._setting("novel_temperature", 0.7)))
         self.max_tokens_var = ctk.DoubleVar(value=float(self._setting("novel_max_tokens", 512)))
         self.top_p_var = ctk.DoubleVar(value=float(self._setting("novel_top_p", 0.9)))
         self.top_k_var = ctk.DoubleVar(value=float(self._setting("novel_top_k", 50)))
 
-        # Model itself (Kayra, Clio, etc.)
+        # Current NovelAI models plus still-supported legacy story models.
         self._combo_row("Model", self.model_var, NOVELAI_MODELS, 1)
 
         # Creativity and Token output

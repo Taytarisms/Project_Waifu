@@ -4,7 +4,8 @@
 
 This updater downloads the latest GitHub release source archive for
 `Taytarisms/Project_Waifu`, extracts it to a temporary folder, and overlays
-app-owned files into the local `files` folder.
+app-owned files into the local `files` folder. The public repository root is
+that `files` folder, so all protected paths below are repository-relative.
 
 Protected paths are skipped during the overlay:
 
@@ -19,8 +20,6 @@ Protected paths are skipped during the overlay:
 - `fine_tune/fine-tune-file.jsonl`
 - `memory/chroma_data/`
 - `memory/chroma_memories/`
-- `setup_log.txt`
-- `closed_captions.txt`
 - any `__pycache__` or `.pyc/.pyo` files
 
 or basically anything that pertains to your userdata.

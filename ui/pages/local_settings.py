@@ -121,26 +121,6 @@ class LocalSettingsPage(ctk.CTkFrame):
             text_color="#58a6ff",
         )
         self._vision_badge.pack(side="left")
-        hf_row = ctk.CTkFrame(self, fg_color="transparent")
-        hf_row.grid(row=row, column=0, sticky="w", padx=18, pady=(0, 14))
-        row += 1
-
-        ctk.CTkButton(
-            hf_row,
-            text="🤗  Browse HuggingFace",
-            fg_color="#21262d",
-            hover_color="#30363d",
-            border_color=theme.BORDER if hasattr(theme, "BORDER") else "#30363d",
-            border_width=1,
-            command=self._open_hf_browser,
-        ).pack(side="left", padx=(0, 8))
-
-        ctk.CTkLabel(
-            hf_row,
-            text="Find and download GGUF models",
-            text_color=theme.MUTED_TEXT,
-            font=ctk.CTkFont(size=12),
-        ).pack(side="left")
 
         self.family_var = ctk.StringVar(
             value=self._setting("local_model_family", "auto")
@@ -309,7 +289,7 @@ class LocalSettingsPage(ctk.CTkFrame):
         if models:
             names = [m["filename"] for m in models]
         else:
-            names = ["No models found — browse HuggingFace"]
+            names = ["No installed models found"]
 
         def _update():
             if not self.winfo_exists():
@@ -350,25 +330,6 @@ class LocalSettingsPage(ctk.CTkFrame):
             self._vision_badge.configure(text="👁  Supports Vision", text_color="#58a6ff")
         else:
             self._vision_badge.configure(text="")
-
-    def _open_hf_browser(self):
-        try:
-            from files.ui.pages.hf_browser import HFModelBrowserPage
-            widget = self
-            app    = None
-            for _ in range(10):
-                widget = widget.master
-                if hasattr(widget, "show_dynamic_page"):
-                    app = widget
-                    break
-            if app:
-                app.show_dynamic_page(HFModelBrowserPage)
-            else:
-                import webbrowser
-                webbrowser.open("https://huggingface.co/models?library=gguf&sort=downloads")
-        except Exception:
-            import webbrowser
-            webbrowser.open("https://huggingface.co/models?library=gguf&sort=downloads")
 
     def _setting(self, key, default):
         if not get_settings:

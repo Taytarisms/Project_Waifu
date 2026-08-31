@@ -10,11 +10,6 @@ except Exception:
 
 
 class NovelAILoginDialog(ctk.CTkToplevel):
-    """Compatibility dialog for older NovelAI callers.
-
-    NovelAI auth in this app uses API tokens only.
-    """
-
     def __init__(self, parent):
         super().__init__(parent)
         self.title("NovelAI API Token")

@@ -1,6 +1,7 @@
 import json
 import customtkinter as ctk
 from files.ui import theme
+from files.provider_capabilities import GEMINI_CHAT_MODELS, normalize_gemini_model
 
 try:
     from files.system_setup.settings import get_settings, save_settings
@@ -9,18 +10,9 @@ except Exception:
     save_settings = None
 
 ## Active Models can be found here: https://ai.google.dev/gemini-api/docs/models
-## These models are current according to the docs, the Gemini 3 series was discontinued back in March of this year.
+## Current model IDs and thinking controls: https://ai.google.dev/gemini-api/docs/generate-content/thinking
 
-GEMINI_MODELS = [
-    "gemini-3.1-pro",
-    "gemini-3-flash",
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-]
+GEMINI_MODELS = GEMINI_CHAT_MODELS
 
 
 class GeminiSettingsPage(ctk.CTkFrame):
@@ -36,31 +28,49 @@ class GeminiSettingsPage(ctk.CTkFrame):
             text_color=theme.TEXT,
         ).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 10))
 
-        self.model_var       = ctk.StringVar(value=self._setting("gemini_model", "gemini-2.5-flash"))
+        self.model_var = ctk.StringVar(
+            value=normalize_gemini_model(
+                self._setting("gemini_model", "gemini-2.5-flash")
+            )
+        )
         self.temperature_var = ctk.DoubleVar(value=float(self._setting("gemini_temperature", 1.0)))
         self.max_tokens_var  = ctk.DoubleVar(value=float(self._setting("gemini_max_tokens",  1024)))
         self.top_p_var       = ctk.DoubleVar(value=float(self._setting("gemini_top_p",       1.0)))
         self.top_k_var       = ctk.DoubleVar(value=float(self._setting("gemini_top_k",       0)))
+        self.thinking_level_var = ctk.StringVar(
+            value=self._setting("gemini_thinking_level", "medium")
+        )
 
         self._combo_row("Model",        self.model_var,       GEMINI_MODELS, row=1)
         self._slider_row("Temperature", self.temperature_var, 0.0,  2.0,  row=2)
         self._slider_row("Max Tokens",  self.max_tokens_var,  64,   8192, row=3, is_int=True)
         self._slider_row("Top P",       self.top_p_var,       0.0,  1.0,  row=4)
         self._slider_row("Top K",       self.top_k_var,       0,    100,  row=5, is_int=True)
+        self._combo_row(
+            "Thinking Level",
+            self.thinking_level_var,
+            ["minimal", "low", "medium", "high"],
+            row=6,
+        )
 
         ctk.CTkLabel(
             self,
-            text="Top K (0 = disabled)",
+            text=(
+                "Sampling controls are saved for compatible models. They are "
+                "automatically omitted for Gemini 3.x models. Minimal is "
+                "promoted to low on models that do not support it."
+            ),
             text_color=theme.MUTED_TEXT,
             anchor="w",
             font=ctk.CTkFont(size=11),
-        ).grid(row=6, column=0, sticky="w", padx=18, pady=(0, 12))
+            wraplength=560,
+        ).grid(row=7, column=0, sticky="w", padx=18, pady=(0, 12))
 
         ctk.CTkButton(
             self,
             text="Save Gemini Settings",
             command=self.save,
-        ).grid(row=7, column=0, sticky="w", padx=18, pady=(10, 8))
+        ).grid(row=8, column=0, sticky="w", padx=18, pady=(10, 8))
 
         self.status_label = ctk.CTkLabel(
             self,
@@ -68,7 +78,7 @@ class GeminiSettingsPage(ctk.CTkFrame):
             text_color=theme.MUTED_TEXT,
             anchor="w",
         )
-        self.status_label.grid(row=8, column=0, sticky="w", padx=18, pady=(0, 18))
+        self.status_label.grid(row=9, column=0, sticky="w", padx=18, pady=(0, 18))
 
     def _setting(self, key, default):
         if not get_settings:
@@ -114,6 +124,7 @@ class GeminiSettingsPage(ctk.CTkFrame):
             "gemini_max_tokens":  int(self.max_tokens_var.get()),
             "gemini_top_p":       float(self.top_p_var.get()),
             "gemini_top_k":       int(self.top_k_var.get()),
+            "gemini_thinking_level": self.thinking_level_var.get().strip(),
         }
         if save_settings:
             for key, value in payload.items():

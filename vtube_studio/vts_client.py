@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -28,6 +30,7 @@ class VTSRawClient:
         api_name: str = "VTubeStudioPublicAPI",
         api_version: str = "1.0",
         request_timeout_seconds: float = 8.0,
+        open_timeout_seconds: float = 2.5,
         logger=print,
     ):
         if websockets is None:
@@ -44,6 +47,7 @@ class VTSRawClient:
         self.api_name = api_name
         self.api_version = api_version
         self.request_timeout_seconds = float(request_timeout_seconds)
+        self.open_timeout_seconds = float(open_timeout_seconds)
         self.logger = logger
 
         self._ws = None
@@ -55,6 +59,7 @@ class VTSRawClient:
         self._closing = False
         self._auth_token = ""
         self._request_counter = 0
+        self.last_error = ""
 
     @property
     def uri(self) -> str:
@@ -71,9 +76,12 @@ class VTSRawClient:
     async def connect(self) -> bool:
         if self.authenticated:
             return True
+        if self._ws is not None and not self.connected:
+            await self.close()
 
         self.token_path.parent.mkdir(parents=True, exist_ok=True)
         self._closing = False
+        self.last_error = ""
 
         try:
             if self._ws is None:
@@ -83,6 +91,7 @@ class VTSRawClient:
                     ping_interval=20,
                     ping_timeout=20,
                     close_timeout=2,
+                    open_timeout=self.open_timeout_seconds,
                     max_queue=64,
                 )
                 self._connected = True
@@ -114,6 +123,7 @@ class VTSRawClient:
             return True
 
         except Exception as e:
+            self.last_error = str(e)
             self.logger(f"Connect/auth failed: {e}")
             await self.close()
             return False
@@ -151,7 +161,7 @@ class VTSRawClient:
         data: dict | None = None,
         *,
         request_id: str | None = None,
-        timeout: float = 8.0,
+        timeout: float | None = None,
         await_response: bool = True,
     ) -> dict | None:
         if self._ws is None or not self._connected:
@@ -174,15 +184,16 @@ class VTSRawClient:
             self._pending[request_id] = future
 
         try:
-            import json
-
             async with self._send_lock:
                 await self._ws.send(json.dumps(payload, ensure_ascii=False))
 
             if not await_response:
                 return None
 
-            return await asyncio.wait_for(future, timeout=timeout)
+            return await asyncio.wait_for(
+                future,
+                timeout=self.request_timeout_seconds if timeout is None else timeout,
+            )
 
         except Exception:
             if await_response:
@@ -287,8 +298,6 @@ class VTSRawClient:
         return bool(data.get("authenticated"))
 
     async def _recv_loop(self) -> None:
-        import json
-
         try:
             async for raw in self._ws:
                 try:
@@ -311,10 +320,15 @@ class VTSRawClient:
                     pass
 
         except Exception as e:
+            self.last_error = str(e)
             self.logger(f"Receive loop stopped: {e}")
 
         finally:
             self._connected = False
+            self._authenticated = False
+            self._ws = None
+            if not self._closing and not self.last_error:
+                self.last_error = "VTube Studio connection closed."
             for request_id, future in list(self._pending.items()):
                 if not future.done():
                     future.set_exception(RuntimeError("VTS receive loop stopped."))
@@ -335,7 +349,17 @@ class VTSRawClient:
     def _save_token(self, token: str) -> None:
         try:
             self.token_path.parent.mkdir(parents=True, exist_ok=True)
-            self.token_path.write_text(token.strip(), encoding="utf-8")
+            temporary = self.token_path.with_name(
+                f".{self.token_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            try:
+                with temporary.open("w", encoding="utf-8") as handle:
+                    handle.write(token.strip())
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self.token_path)
+            finally:
+                temporary.unlink(missing_ok=True)
         except Exception as e:
             self.logger(f"Failed to save auth token: {e}")
 

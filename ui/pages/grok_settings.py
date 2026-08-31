@@ -1,6 +1,7 @@
 import json
 import customtkinter as ctk
 from files.ui import theme
+from files.provider_capabilities import GROK_CHAT_MODELS
 
 try:
     from files.system_setup.settings import get_settings, save_settings
@@ -11,17 +12,7 @@ except Exception:
 ## All available models can be found here: https://docs.x.ai/developers/models
 ## xAI is a bit more "broad" with how they name these in the API docs, so I went with what was commonly listed on repo's.
 
-GROK_MODELS = [
-    "grok-4.3",
-    "grok-4.20-multi-agent-0309",
-    "grok-4.20-0309-reasoning",
-    "grok-4.20-0309-non-reasoning",
-    "grok-4-1-fast-reasoning",
-    "grok-4-1-fast-non-reasoning",
-    "grok-3",
-    "grok-3-mini",
-    "grok-2-1212",
-]
+GROK_MODELS = GROK_CHAT_MODELS
 
 class GrokSettingsPage(ctk.CTkFrame):
     def __init__(self, master):
@@ -36,28 +27,40 @@ class GrokSettingsPage(ctk.CTkFrame):
             text_color=theme.TEXT,
         ).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 10))
 
-        self.model_var       = ctk.StringVar(value=self._setting("grok_model",       "grok-4.3"))
+        self.model_var       = ctk.StringVar(value=self._setting("grok_model",       "grok-4.5"))
         self.temperature_var = ctk.DoubleVar(value=float(self._setting("grok_temperature", 1.0)))
         self.max_tokens_var  = ctk.DoubleVar(value=float(self._setting("grok_max_tokens",  1024)))
+        self.reasoning_effort_var = ctk.StringVar(
+            value=self._setting("grok_reasoning_effort", "medium")
+        )
 
         self._combo_row("Model",        self.model_var,       GROK_MODELS, row=1)
         self._slider_row("Temperature", self.temperature_var, 0.0,  2.0,  row=2)
         self._slider_row("Max Tokens",  self.max_tokens_var,  64,   8192, row=3, is_int=True)
+        self._combo_row(
+            "Reasoning Effort",
+            self.reasoning_effort_var,
+            ["low", "medium", "high", "xhigh"],
+            row=4,
+        )
 
         ctk.CTkLabel(
             self,
-            text="Note: xai_sdk chat.sample() does not expose top_p / top_k directly.",
+            text=(
+                "Grok reasoning cannot be disabled. xhigh is native on Grok 4.6 "
+                "and is treated as high by Grok 4.5."
+            ),
             text_color=theme.MUTED_TEXT,
             anchor="w",
             font=ctk.CTkFont(size=11),
             wraplength=460,
-        ).grid(row=4, column=0, sticky="w", padx=18, pady=(0, 12))
+        ).grid(row=5, column=0, sticky="w", padx=18, pady=(0, 12))
 
         ctk.CTkButton(
             self,
             text="Save Grok Settings",
             command=self.save,
-        ).grid(row=5, column=0, sticky="w", padx=18, pady=(10, 8))
+        ).grid(row=6, column=0, sticky="w", padx=18, pady=(10, 8))
 
         self.status_label = ctk.CTkLabel(
             self,
@@ -65,7 +68,7 @@ class GrokSettingsPage(ctk.CTkFrame):
             text_color=theme.MUTED_TEXT,
             anchor="w",
         )
-        self.status_label.grid(row=6, column=0, sticky="w", padx=18, pady=(0, 18))
+        self.status_label.grid(row=7, column=0, sticky="w", padx=18, pady=(0, 18))
 
     def _setting(self, key, default):
         if not get_settings:
@@ -109,6 +112,7 @@ class GrokSettingsPage(ctk.CTkFrame):
             "grok_model":       self.model_var.get().strip(),
             "grok_temperature": float(self.temperature_var.get()),
             "grok_max_tokens":  int(self.max_tokens_var.get()),
+            "grok_reasoning_effort": self.reasoning_effort_var.get().strip(),
         }
         if save_settings:
             for key, value in payload.items():

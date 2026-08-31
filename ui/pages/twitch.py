@@ -1,4 +1,6 @@
 import customtkinter as ctk
+
+from files.ui.components.scrolling import AppScrollableFrame
 import threading
 import urllib.request
 from io import BytesIO
@@ -69,6 +71,8 @@ EVENT_STYLES = {
     "poll":        ("📊", "#8E44AD", "Poll: {detail}"),
     "prediction":  ("🎯", "#D35400", "Prediction: {detail}"),
     "redemption":  ("🏆", "#F1C40F", "Redeemed: {detail}"),
+    "super_chat":  ("$", "#29B6F6", "Super Chat: {detail}"),
+    "super_sticker": ("★", "#FF7043", "Super Sticker: {detail}"),
 }
 
 def _pill(parent, text, fg, bg, font_size=10):
@@ -214,7 +218,7 @@ class ConfirmDialog(ctk.CTkToplevel):
                       fg_color=theme.DANGER, hover_color="#922b21",
                       command=lambda: [on_confirm(), self.destroy()]).pack(side="left")
 
-class ChatterDetailPanel(ctk.CTkScrollableFrame):
+class ChatterDetailPanel(AppScrollableFrame):
     def __init__(self, master, on_close=None, **kwargs):
         super().__init__(master, fg_color=theme.APP_BG, corner_radius=8, **kwargs)
         self._content = None
@@ -427,14 +431,26 @@ class BlacklistPanel(ctk.CTkFrame):
         try:
             p = self._path()
             if p.exists():
-                return [ln.strip() for ln in p.read_text().splitlines() if ln.strip()]
+                return [
+                    ln.strip().casefold()
+                    for ln in p.read_text(encoding="utf-8").splitlines()
+                    if ln.strip()
+                ]
         except Exception as e:
             print(f"Blacklist had a read error: {e}")
         return []
 
     def _save(self, names: list[str]):
         try:
-            self._path().write_text("\n".join(names) + ("\n" if names else ""))
+            self._path().write_text(
+                "\n".join(names) + ("\n" if names else ""),
+                encoding="utf-8",
+            )
+            try:
+                from files.stream_chat import get_stream_chat_hub
+                get_stream_chat_hub().refresh_local_ignores()
+            except Exception:
+                pass
         except Exception as e:
             print(f"Blacklist had a write error: {e}")
 
@@ -442,7 +458,7 @@ class BlacklistPanel(ctk.CTkFrame):
         add_bar = ctk.CTkFrame(self, fg_color="transparent")
         add_bar.pack(fill="x", padx=12, pady=(12, 6))
 
-        self._entry = ctk.CTkEntry(add_bar, placeholder_text="Username to blacklist…",
+        self._entry = ctk.CTkEntry(add_bar, placeholder_text="Account or platform:account to ignore…",
                                    font=ctk.CTkFont(size=12))
         self._entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self._entry.bind("<Return>", lambda e: self._add_from_entry())
@@ -456,7 +472,7 @@ class BlacklistPanel(ctk.CTkFrame):
         self._status.pack(anchor="w", padx=14, pady=(0, 4))
 
         _divider(self)
-        self._list_frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self._list_frame = AppScrollableFrame(self, fg_color="transparent")
         self._list_frame.pack(fill="both", expand=True, padx=6, pady=(0, 10))
 
         self.refresh()
@@ -467,7 +483,7 @@ class BlacklistPanel(ctk.CTkFrame):
 
         names = self._load()
         if not names:
-            ctk.CTkLabel(self._list_frame, text="No users blacklisted.",
+            ctk.CTkLabel(self._list_frame, text="No accounts ignored locally.",
                          text_color=theme.MUTED_TEXT,
                          font=ctk.CTkFont(size=12)).pack(pady=20)
             return
@@ -475,7 +491,7 @@ class BlacklistPanel(ctk.CTkFrame):
         for name in names:
             self._add_row(name)
 
-        self._status.configure(text=f"{len(names)} user{'s' if len(names) != 1 else ''} blacklisted.")
+        self._status.configure(text=f"{len(names)} account{'s' if len(names) != 1 else ''} ignored locally.")
 
     def _add_row(self, name: str):
         row = ctk.CTkFrame(self._list_frame, fg_color=theme.APP_BG, corner_radius=6)
@@ -496,12 +512,12 @@ class BlacklistPanel(ctk.CTkFrame):
         ).pack(side="right", padx=(4, 8), pady=4)
 
     def _add_from_entry(self):
-        name = self._entry.get().strip().lower()
+        name = self._entry.get().strip().casefold()
         if not name:
             return
         names = self._load()
         if name in names:
-            self._status.configure(text=f"{name} is already blacklisted.",
+            self._status.configure(text=f"{name} is already ignored.",
                                    text_color=theme.MUTED_TEXT)
             return
         names.append(name)
@@ -511,7 +527,7 @@ class BlacklistPanel(ctk.CTkFrame):
         self.refresh()
 
     def add_user(self, username: str):
-        name = username.strip().lower()
+        name = username.strip().casefold()
         names = self._load()
         if name not in names:
             names.append(name)
@@ -521,8 +537,8 @@ class BlacklistPanel(ctk.CTkFrame):
     def _confirm_remove(self, name: str):
         ConfirmDialog(
             self,
-            title="Remove from Blacklist",
-            message=f"Remove '{name}' from the blacklist?",
+            title="Remove Ignored Account",
+            message=f"Allow messages and events from '{name}' again?",
             on_confirm=lambda n=name: self._do_remove(n),
         )
 
@@ -621,7 +637,7 @@ class LegendPanel(ctk.CTkFrame):
         self._build()
 
     def _build(self):
-        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        scroll = AppScrollableFrame(self, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=6, pady=(8, 10))
 
         ctk.CTkLabel(scroll, text="Role Badges",
@@ -697,7 +713,7 @@ class MiddleColumn(ctk.CTkFrame):
         self._tab_history_btn.pack(side="left", padx=(0, 6))
 
         self._tab_bl_btn = ctk.CTkButton(
-            tab_bar, text="Blacklist",
+            tab_bar, text="Ignored Accounts",
             font=ctk.CTkFont(size=13, weight="bold"),
             height=30, corner_radius=6,
             command=lambda: self._show("blacklist"),
@@ -772,7 +788,7 @@ class MiddleColumn(ctk.CTkFrame):
         split.pack(fill="both", expand=True, padx=0, pady=(0, 10))
         self._split = split
 
-        self._roster_frame = ctk.CTkScrollableFrame(
+        self._roster_frame = AppScrollableFrame(
             split, fg_color="transparent", width=230)
         self._roster_frame.pack(side="left", fill="both", expand=True,
                                 padx=(10, 4))
@@ -864,7 +880,7 @@ class MiddleColumn(ctk.CTkFrame):
 
         ctk.CTkButton(
             menu,
-            text=f"🚫  Blacklist {chatter['username']}",
+            text=f"🚫  Ignore {chatter['username']}",
             font=ctk.CTkFont(size=12),
             fg_color="transparent",
             hover_color=theme.DANGER,
@@ -882,10 +898,15 @@ class MiddleColumn(ctk.CTkFrame):
         return self._blacklist_panel
 
 class TwitchPage(ctk.CTkFrame):
+    MAX_RENDERED_CHAT_ROWS = 200
+    MAX_RENDERED_EVENT_ROWS = 100
+
     def __init__(self, master, app):
         super().__init__(master, fg_color=theme.APP_BG)
         self.app = app
         self._event_labels = []
+        self._event_cards = []
+        self._chat_rows = []
         self._events_resize_after_id = None
         self._pending_events_width = None
         self._queue_rows = {}
@@ -923,7 +944,7 @@ class TwitchPage(ctk.CTkFrame):
     def _build_chat(self, parent):
         hdr = ctk.CTkFrame(parent, fg_color="transparent")
         hdr.pack(fill="x", padx=12, pady=(12, 6))
-        ctk.CTkLabel(hdr, text="Twitch Chat",
+        ctk.CTkLabel(hdr, text=getattr(self, "_chat_title", "Twitch Chat"),
                      font=ctk.CTkFont(size=16, weight="bold"),
                      text_color=theme.TEXT).pack(side="left")
 
@@ -936,14 +957,17 @@ class TwitchPage(ctk.CTkFrame):
         self._pause_btn.pack(side="right")
 
         bar = ctk.CTkFrame(parent, fg_color="transparent")
+        self._chat_bar = bar
         bar.pack(side="bottom", fill="x", padx=8, pady=(0, 10))
         self._chat_input = ctk.CTkEntry(
             bar, placeholder_text="Send a message…", font=ctk.CTkFont(size=12))
         self._chat_input.pack(side="left", fill="x", expand=True, padx=(0, 4))
         self._chat_input.bind("<Return>", self._send_msg)
-        ctk.CTkButton(bar, text="Send", width=52, height=28,
-                      font=ctk.CTkFont(size=11),
-                      command=self._send_msg).pack(side="right")
+        self._send_button = ctk.CTkButton(
+            bar, text="Send", width=52, height=28,
+            font=ctk.CTkFont(size=11), command=self._send_msg
+        )
+        self._send_button.pack(side="right")
 
         self._pause_banner = ctk.CTkLabel(
             parent,
@@ -954,7 +978,7 @@ class TwitchPage(ctk.CTkFrame):
             corner_radius=4,
             height=22,
         )
-        self._chat_area = ctk.CTkScrollableFrame(
+        self._chat_area = AppScrollableFrame(
             parent, fg_color=theme.APP_BG, corner_radius=6)
         self._chat_area.pack(fill="both", expand=True, padx=8, pady=(0, 6))
 
@@ -992,6 +1016,10 @@ class TwitchPage(ctk.CTkFrame):
             justify="left",
             anchor="w",
         ).pack(fill="x", padx=(22 if tier else 4, 0), pady=(1, 0))
+        self._chat_rows.append(row)
+        while len(self._chat_rows) > self.MAX_RENDERED_CHAT_ROWS:
+            oldest = self._chat_rows.pop(0)
+            oldest.destroy()
         
     def _toggle_pause(self):
         self._apply_pause(not self._chat_paused)
@@ -1056,10 +1084,13 @@ class TwitchPage(ctk.CTkFrame):
         )
         self._queue_status.pack(fill="x", padx=14, pady=(0, 4))
 
-        self._queue_list = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        self._queue_list = AppScrollableFrame(parent, fg_color="transparent")
         self._queue_list.pack(fill="both", expand=True, padx=8, pady=(0, 10))
 
     def _schedule_queue_refresh(self):
+        if hasattr(self, "_page_active") and not self._page_active:
+            self._queue_refresh_after_id = None
+            return
         try:
             self._queue_refresh_after_id = self.after(1000, self._queue_refresh_tick)
         except Exception:
@@ -1067,6 +1098,8 @@ class TwitchPage(ctk.CTkFrame):
 
     def _queue_refresh_tick(self):
         self._queue_refresh_after_id = None
+        if hasattr(self, "_page_active") and not self._page_active:
+            return
         self.refresh_queue_panel()
         if self.winfo_exists():
             self._schedule_queue_refresh()
@@ -1198,7 +1231,7 @@ class TwitchPage(ctk.CTkFrame):
         self.refresh_queue_panel()
 
     def _build_settings(self, parent):
-        inner = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        inner = AppScrollableFrame(parent, fg_color="transparent")
         inner.pack(fill="both", expand=True)
 
         ctk.CTkLabel(inner, text="Twitch Settings",
@@ -1282,7 +1315,7 @@ class TwitchPage(ctk.CTkFrame):
     def _build_events(self, parent):
         hdr = ctk.CTkFrame(parent, fg_color="transparent")
         hdr.pack(fill="x", padx=14, pady=(12, 6))
-        ctk.CTkLabel(hdr, text="Twitch Events",
+        ctk.CTkLabel(hdr, text=getattr(self, "_events_title", "Twitch Events"),
                      font=ctk.CTkFont(size=15, weight="bold"),
                      text_color=theme.TEXT).pack(side="left")
         ctk.CTkButton(hdr, text="Clear", width=52, height=24,
@@ -1290,7 +1323,7 @@ class TwitchPage(ctk.CTkFrame):
                       fg_color=theme.DANGER, hover_color="#922b21",
                       command=self._clear_events).pack(side="right")
 
-        self._events_area = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        self._events_area = AppScrollableFrame(parent, fg_color="transparent")
         self._events_area.pack(fill="both", expand=True, padx=6, pady=(0, 10))
         self._events_area.bind("<Configure>", self._schedule_event_rewrap)
 
@@ -1316,7 +1349,14 @@ class TwitchPage(ctk.CTkFrame):
         )
         main.pack(anchor="w", fill="x")
         self._event_labels.append(main)
+        self._event_cards.append(card)
         self._apply_event_wrap(main)
+
+        while len(self._event_cards) > self.MAX_RENDERED_EVENT_ROWS:
+            oldest_card = self._event_cards.pop(0)
+            oldest_card.destroy()
+            if self._event_labels:
+                self._event_labels.pop(0)
 
         ctk.CTkLabel(col, text=time_ago, font=ctk.CTkFont(size=10),
                      text_color=theme.MUTED_TEXT, anchor="w").pack(anchor="w")
@@ -1325,6 +1365,7 @@ class TwitchPage(ctk.CTkFrame):
         for w in self._events_area.winfo_children():
             w.destroy()
         self._event_labels.clear()
+        self._event_cards.clear()
 
     def _schedule_event_rewrap(self, event):
         self._pending_events_width = event.width

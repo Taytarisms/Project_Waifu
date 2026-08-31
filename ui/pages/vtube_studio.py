@@ -1,20 +1,27 @@
 import asyncio
-import json
-from pathlib import Path
 import customtkinter as ctk
 import sys
 
+from files.ui.components.scrolling import AppScrollableFrame
+
 from files.ui import theme
-from files.vtube_studio.hotkeys import UNMAPPED_OPTION, VTSHotkeyManager, USERDATA_DIR
+from files.vtube_studio.hotkeys import (
+    UNMAPPED_OPTION,
+    USERDATA_DIR,
+    VTSHotkeyManager,
+    VTSSettings,
+)
 from files.vtube_studio.idle_animations import IDLE_PROFILES
 from files.main_loop import main_loop as app_loop
 from files.system_setup.settings import get_settings, save_settings, get_bool_setting
+from files.system_setup.json_utils import load_json_safe, write_json_atomic
 
 DEFAULT_ACTION_SLOTS = [
     "neutral", "happy", "sad", "angry", "confused",
     "surprised", "embarrassed", "love", "thinking", "sleepy",
-    "idle", "reset",
 ]
+FULL_RESET_SLOT = "__full_reset__"
+UNAVAILABLE_MAPPING_OPTION = "Unavailable in current model (kept)"
 
 AVAILABLE_PORTS = ["8001", "8002", "8003", "8004"]
 AUTOCONNECT_PATH = USERDATA_DIR / "vts_autoconnect.json"
@@ -23,19 +30,19 @@ def card_bg():
     return getattr(theme, "CARD_BG", "#161b22")
 
 def _load_autoconnect() -> dict:
-    try:
-        if AUTOCONNECT_PATH.exists():
-            return json.loads(AUTOCONNECT_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {"enabled": False, "port": 8001}
+    return load_json_safe(
+        AUTOCONNECT_PATH,
+        {"enabled": False, "port": 8001},
+        dict,
+        logger=print,
+    )
 
 def _save_autoconnect(enabled: bool, port: int) -> None:
     try:
         USERDATA_DIR.mkdir(parents=True, exist_ok=True)
-        AUTOCONNECT_PATH.write_text(
-            json.dumps({"enabled": enabled, "port": port}, indent=2),
-            encoding="utf-8",
+        write_json_atomic(
+            AUTOCONNECT_PATH,
+            {"enabled": enabled, "port": port},
         )
     except Exception:
         pass
@@ -44,28 +51,50 @@ class VTubeStudioPage(ctk.CTkFrame):
     def __init__(self, master, app):
         super().__init__(master, fg_color=theme.APP_BG)
         self.app = app
+        try:
+            idle_fps = int(get_settings("vts_idle_fps") or 10)
+        except (TypeError, ValueError):
+            idle_fps = 10
         self.manager = app_loop.get_vts_manager()
         if self.manager is None:
-            self.manager = VTSHotkeyManager(logger=self._log_async_safe)
+            self.manager = VTSHotkeyManager(
+                settings=VTSSettings(
+                    idle_fps=idle_fps,
+                    idle_await_response=get_bool_setting(
+                        "vts_idle_await_response", default=True
+                    ),
+                ),
+                logger=self._log_async_safe,
+            )
             app_loop.set_vts_manager(self.manager)
         else:
             self.manager.set_logger(self._log_async_safe)
+            self.manager.settings.idle_fps = idle_fps
+            self.manager.settings.idle_await_response = get_bool_setting(
+                "vts_idle_await_response", default=True
+            )
         self.status_var = ctk.StringVar(value="VTube Studio page ready.")
         self.hotkey_count_var = ctk.StringVar(value="Cached hotkeys: 0")
         self.param_status_var = ctk.StringVar(value="Params: Unknown")
         self.connection_var = ctk.StringVar(value="Disconnected")
         self.idle_status_var = ctk.StringVar(value="Idle: Off")
         self.slot_dropdowns = {}
+        self._preserved_unavailable_entries = {}
+        self._active_hotkey_test_future = None
+        self._page_active = False
+        self._runtime_status_after_id = None
         ac = _load_autoconnect()
         self._ac_port = ac.get("port", 8001)
         self._ac_enabled = ac.get("enabled", False)
+        self._vts_enabled = get_bool_setting("enable_vts", default=False)
         self._autoconnect_attempt = 0
-        self._autoconnect_max_attempts = 12
+        self._autoconnect_max_attempts = 4
         self._autoconnect_retry_ms = 2500
         self._autoconnect_scan_ports = True
         self._build()
         self.refresh_from_cache()
-        if self._ac_enabled:
+        self._last_runtime_state = None
+        if self._vts_enabled and self._ac_enabled:
             self.after(500, self._attempt_autoconnect)
 
     @staticmethod
@@ -77,6 +106,8 @@ class VTubeStudioPage(ctk.CTkFrame):
             pass
 
     def _attempt_autoconnect(self):
+        if not self._vts_enabled:
+            return
         self._autoconnect_attempt += 1
         try:
             saved_port = int(self._ac_port or 8001)
@@ -105,6 +136,8 @@ class VTubeStudioPage(ctk.CTkFrame):
         connected_port = None
         last_error = ""
         for port in ports_to_try:
+            if not self._vts_enabled:
+                break
             try:
                 # Force a clean client/socket before trying this port.
                 self.manager.set_logger(self._log_async_safe)
@@ -114,6 +147,7 @@ class VTubeStudioPage(ctk.CTkFrame):
                 if ok:
                     connected_port = port
                     break
+                last_error = self.manager.last_error
             except Exception as e:
                 last_error = str(e)
                 self._raw_print(f"VTS auto-connect attempt failed on port {port}: {e}")
@@ -125,7 +159,7 @@ class VTubeStudioPage(ctk.CTkFrame):
                 self.port_var.set(str(connected_port))
                 self.connection_var.set(f"Connected (:{connected_port})")
                 self.param_status_var.set(
-                    "Params: Ready" if self.manager.custom_params_registered else "Params: Failed"
+                    "Params: Ready" if self.manager.custom_params_registered else "Params: Not registered"
                 )
                 self._log(f"Auto-connected to VTS on port {connected_port}.")
 
@@ -137,6 +171,7 @@ class VTubeStudioPage(ctk.CTkFrame):
             self.param_status_var.set("Params: Unknown")
             if (
                 self.autoconnect_var.get()
+                and self._vts_enabled
                 and self._autoconnect_attempt < self._autoconnect_max_attempts
             ):
                 self._log("Auto-connect failed. VTS may not be ready yet; retrying...")
@@ -177,6 +212,13 @@ class VTubeStudioPage(ctk.CTkFrame):
         )
         self.port_dropdown.pack(side="left", padx=(0, 18), pady=10)
 
+        self.enabled_var = ctk.BooleanVar(value=self._vts_enabled)
+        ctk.CTkCheckBox(
+            port_row, text="Enable VTube Studio",
+            variable=self.enabled_var, text_color=theme.TEXT,
+            command=self._on_enabled_toggle,
+        ).pack(side="left", padx=(0, 18), pady=10)
+
         self.autoconnect_var = ctk.BooleanVar(value=self._ac_enabled)
         ctk.CTkCheckBox(
             port_row, text="Auto-connect on startup",
@@ -193,19 +235,27 @@ class VTubeStudioPage(ctk.CTkFrame):
         self.status_label = ctk.CTkLabel(outer, textvariable=self.status_var, text_color=theme.MUTED_TEXT)
         self.status_label.pack(side="bottom", anchor="w", pady=(12, 0))
 
-        scroll_container = ctk.CTkScrollableFrame(outer, fg_color="transparent")
+        scroll_container = AppScrollableFrame(outer, fg_color="transparent")
         scroll_container.pack(fill="both", expand=True)
 
         self._build_emotion_panel(scroll_container)
         self._build_idle_panel(scroll_container)
 
-        self.mapping_frame = ctk.CTkScrollableFrame(
+        mapping_panel = ctk.CTkFrame(
             scroll_container,
             fg_color=card_bg(),
-            label_text="Action Mapping",
-            height=320,
+            corner_radius=10,
         )
-        self.mapping_frame.pack(fill="x", pady=(0, 4))
+        mapping_panel.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(
+            mapping_panel,
+            text="Action Mapping",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=theme.TEXT,
+        ).pack(anchor="w", padx=12, pady=(12, 4))
+        self.mapping_frame = ctk.CTkFrame(mapping_panel, fg_color="transparent")
+        self.mapping_frame.pack(fill="x", pady=(0, 8))
+        self.mapping_frame.grid_columnconfigure(0, weight=1)
 
     def _on_port_change(self, new_port_str: str):
         try:
@@ -226,7 +276,7 @@ class VTubeStudioPage(ctk.CTkFrame):
         if self.autoconnect_var.get():
             _save_autoconnect(True, new_port)
 
-        if self.manager._connected:
+        if self.manager.connected:
             self._log(f"Reconnecting from port {old_port} to {new_port}...")
             self._run_async_thread(
                 lambda port=new_port: self._reconnect_on_port_change(port)
@@ -248,7 +298,7 @@ class VTubeStudioPage(ctk.CTkFrame):
             if ok:
                 self.connection_var.set(f"Connected (:{selected_port})")
                 self.param_status_var.set(
-                    "Params: Ready" if self.manager.custom_params_registered else "Params: Failed"
+                    "Params: Ready" if self.manager.custom_params_registered else "Params: Not registered"
                 )
                 self._log(f"Reconnected to VTS on port {selected_port}.")
 
@@ -271,8 +321,69 @@ class VTubeStudioPage(ctk.CTkFrame):
     def _on_autoconnect_toggle(self):
         enabled = self.autoconnect_var.get()
         port = int(self.port_var.get())
+        if enabled and not self.enabled_var.get():
+            self.enabled_var.set(True)
+            self._set_enabled(True)
         _save_autoconnect(enabled, port)
         self._log(f"Auto-connect on startup: {'enabled' if enabled else 'disabled'} (port {port})")
+
+    def _set_enabled(self, enabled: bool) -> None:
+        self._vts_enabled = bool(enabled)
+        save_settings("enable_vts", self._vts_enabled)
+
+    def _on_enabled_toggle(self) -> None:
+        enabled = self.enabled_var.get()
+        self._set_enabled(enabled)
+        if enabled:
+            self._log("VTube Studio integration enabled.")
+            if self.autoconnect_var.get() and not self.manager.connected:
+                self._autoconnect_attempt = 0
+                self._attempt_autoconnect()
+        else:
+            self._log("VTube Studio integration disabled; closing its connection.")
+            self._run_async_thread(self._close_async)
+
+    def _poll_runtime_status(self) -> None:
+        self._runtime_status_after_id = None
+        if not self._page_active:
+            return
+        try:
+            state = self.manager.connection_state
+            if not self.enabled_var.get():
+                state = "disabled"
+            if state != self._last_runtime_state:
+                self._last_runtime_state = state
+                if state == "connected":
+                    self.connection_var.set(f"Connected (:{self.manager.settings.port})")
+                elif state == "connecting":
+                    self.connection_var.set("Connecting...")
+                elif state == "faulted":
+                    self.connection_var.set("Connection faulted")
+                elif state == "disabled":
+                    self.connection_var.set("Disabled")
+                else:
+                    self.connection_var.set("Disconnected")
+            self.idle_status_var.set(
+                "Idle: On" if self.manager.idle_running else "Idle: Off"
+            )
+            self._runtime_status_after_id = self.after(1000, self._poll_runtime_status)
+        except Exception:
+            return
+
+    def on_show(self):
+        if self._page_active:
+            return
+        self._page_active = True
+        self._poll_runtime_status()
+
+    def on_hide(self):
+        self._page_active = False
+        if self._runtime_status_after_id is not None:
+            try:
+                self.after_cancel(self._runtime_status_after_id)
+            except Exception:
+                pass
+            self._runtime_status_after_id = None
 
     def _build_emotion_panel(self, parent):
         emotion_frame = ctk.CTkFrame(parent, fg_color=card_bg(), corner_radius=10)
@@ -328,15 +439,15 @@ class VTubeStudioPage(ctk.CTkFrame):
         raw = get_settings("vts_emotion_mode")
         if raw in ("", None):
             legacy_enabled = get_bool_setting(
-                "enable_vts_emotion_inference", default=True
+                "enable_vts_emotion_inference", default=False
             )
-            return "llm" if legacy_enabled else "off"
+            return "llm" if legacy_enabled else "heuristic"
         mode = str(raw).strip().lower()
-        return mode if mode in ("llm", "heuristic", "off") else "llm"
+        return mode if mode in ("llm", "heuristic", "off") else "heuristic"
 
     def _current_emotion_mode_label(self) -> str:
         return {"llm": "LLM", "heuristic": "Heuristic", "off": "Off"}.get(
-            self._resolve_emotion_mode(), "LLM"
+            self._resolve_emotion_mode(), "Heuristic"
         )
 
     def _emotion_mode_status_text(self) -> str:
@@ -529,11 +640,15 @@ class VTubeStudioPage(ctk.CTkFrame):
         self.blink_interval_label.configure(text=f"{blink_lo:.0f}-{blink_hi:.0f}s")
 
     def start_idle_clicked(self):
+        if not self.enabled_var.get():
+            self.enabled_var.set(True)
+            self._set_enabled(True)
         self._log("Starting idle animation...")
         async def task():
             ok = await self.manager.start_idle_animation()
             def update_ui():
                 if ok:
+                    save_settings("enable_vts_idle_animation", True)
                     engine = self.manager.idle_engine
                     if engine is not None:
                         profile = self.profile_var.get() or "calm"
@@ -553,12 +668,16 @@ class VTubeStudioPage(ctk.CTkFrame):
 
     async def _stop_idle_async(self):
         await self.manager.stop_idle_animation()
+        save_settings("enable_vts_idle_animation", False)
         def update_ui():
             self.idle_status_var.set("Idle: Off")
             self._log("Idle animation stopped.")
         self.after(0, update_ui)
 
     def connect_clicked(self):
+        if not self.enabled_var.get():
+            self.enabled_var.set(True)
+            self._set_enabled(True)
         try:
             selected_port = int(self.port_var.get())
         except ValueError:
@@ -572,25 +691,17 @@ class VTubeStudioPage(ctk.CTkFrame):
     async def _connect_async(self, selected_port: int):
         connected_port = None
         last_error = ""
-        ports_to_try = [int(selected_port)]
-        for port in AVAILABLE_PORTS:
-            try:
-                p = int(port)
-            except Exception:
-                continue
-            if p not in ports_to_try:
-                ports_to_try.append(p)
-        for port in ports_to_try:
-            try:
-                await self.manager.close()
-                self.manager.settings.port = port
-                ok = await self.manager.connect()
-                if ok:
-                    connected_port = port
-                    break
-            except Exception as e:
-                last_error = str(e)
-                print(f"Connection attempt failed on port {port}: {e}")
+        try:
+            await self.manager.close()
+            self.manager.settings.port = int(selected_port)
+            ok = await self.manager.connect()
+            if ok:
+                connected_port = int(selected_port)
+            else:
+                last_error = self.manager.last_error
+        except Exception as e:
+            last_error = str(e)
+            print(f"Connection attempt failed on port {selected_port}: {e}")
 
         def update_ui():
             if connected_port is not None:
@@ -598,7 +709,7 @@ class VTubeStudioPage(ctk.CTkFrame):
                 self.port_var.set(str(connected_port))
                 self.connection_var.set(f"Connected (:{connected_port})")
                 self.param_status_var.set(
-                    "Params: Ready" if self.manager.custom_params_registered else "Params: Failed"
+                    "Params: Ready" if self.manager.custom_params_registered else "Params: Not registered"
                 )
                 self._log(f"Connected to VTS on port {connected_port}.")
 
@@ -666,25 +777,39 @@ class VTubeStudioPage(ctk.CTkFrame):
         for child in self.mapping_frame.winfo_children():
             child.destroy()
         self.slot_dropdowns.clear()
+        self._preserved_unavailable_entries.clear()
         if not hotkey_names:
             hotkey_names = ["No cached hotkeys found"]
         else:
             hotkey_names = [UNMAPPED_OPTION] + hotkey_names
         saved_map = self.manager.load_vts_mapping()
         saved_emotions = saved_map.get("emotions", {})
-        for row_index, slot in enumerate(DEFAULT_ACTION_SLOTS):
+        slots = [*DEFAULT_ACTION_SLOTS, FULL_RESET_SLOT]
+        for row_index, slot in enumerate(slots):
+            row_options = list(hotkey_names)
             row = ctk.CTkFrame(self.mapping_frame, fg_color="transparent")
             row.grid(row=row_index, column=0, sticky="ew", padx=12, pady=6)
             row.grid_columnconfigure(1, weight=1)
-            ctk.CTkLabel(row, text=slot.title(), text_color=theme.TEXT, width=140, anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 12))
-            emotion_config = saved_emotions.get(slot, {})
-            talking_sequence = emotion_config.get("talking_hotkey_sequence", [])
+            label = "Full Reset" if slot == FULL_RESET_SLOT else slot.title()
+            ctk.CTkLabel(row, text=label, text_color=theme.TEXT, width=140, anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 12))
+            if slot == FULL_RESET_SLOT:
+                talking_sequence = saved_map.get("full_reset_hotkey_sequence", [])
+            else:
+                emotion_config = saved_emotions.get(slot, {})
+                talking_sequence = emotion_config.get("talking_hotkey_sequence", [])
             selected_name = None
             if talking_sequence:
-                selected_name = talking_sequence[0].get("name")
-            if selected_name not in hotkey_names:
-                selected_name = hotkey_names[0]
-            dropdown = ctk.CTkOptionMenu(row, values=hotkey_names)
+                selected_name = self.manager.display_name_for_mapping_entry(
+                    talking_sequence[0]
+                )
+            if selected_name not in row_options:
+                if talking_sequence:
+                    self._preserved_unavailable_entries[slot] = talking_sequence[0]
+                    row_options.append(UNAVAILABLE_MAPPING_OPTION)
+                    selected_name = UNAVAILABLE_MAPPING_OPTION
+                else:
+                    selected_name = row_options[0]
+            dropdown = ctk.CTkOptionMenu(row, values=row_options)
             dropdown.set(selected_name)
             dropdown.grid(row=0, column=1, sticky="ew")
             ctk.CTkButton(row, text="Test", width=70, command=lambda s=slot: self.test_slot_clicked(s)).grid(row=0, column=2, sticky="e", padx=(8, 0))
@@ -696,19 +821,33 @@ class VTubeStudioPage(ctk.CTkFrame):
         self._build_mapping_rows(hotkey_names)
 
     def save_mapping_clicked(self):
-        mapping = {"current_emotion": "", "full_reset_hotkey_sequence": [], "emotions": {}}
+        if not self.manager.load_cached_hotkeys():
+            self._log("Cannot save mappings until hotkeys have been refreshed for the current model.")
+            return
+        emotion_entries = {}
+        full_reset_entry = None
         for slot, dropdown in self.slot_dropdowns.items():
             selected_name = dropdown.get()
-            if not selected_name or selected_name == "No cached hotkeys found" or selected_name == UNMAPPED_OPTION:
-                continue
-            entry = self.manager.build_mapping_entry_from_name(selected_name)
-            if not entry:
-                continue
-            mapping["emotions"][slot] = {"talking_hotkey_sequence": [entry], "idle_hotkey_sequence": [], "reset_hotkey_sequence": []}
-            if slot == "reset":
-                mapping["full_reset_hotkey_sequence"] = [entry]
-        self.manager.save_vts_mapping(mapping)
-        self._log(f"Saved {len(mapping['emotions'])} VTS emotion mappings.")
+            if selected_name == UNAVAILABLE_MAPPING_OPTION:
+                entry = self._preserved_unavailable_entries.get(slot)
+            elif not selected_name or selected_name == "No cached hotkeys found" or selected_name == UNMAPPED_OPTION:
+                entry = None
+            else:
+                entry = self.manager.build_mapping_entry_from_name(selected_name)
+            if slot == FULL_RESET_SLOT:
+                full_reset_entry = entry
+            else:
+                emotion_entries[slot] = entry
+        mapping = self.manager.save_primary_mappings(
+            emotion_entries,
+            full_reset_entry,
+        )
+        mapped_count = sum(
+            bool(config.get("talking_hotkey_sequence"))
+            for config in mapping.get("emotions", {}).values()
+            if isinstance(config, dict)
+        )
+        self._log(f"Saved {mapped_count} VTS emotion mappings without changing advanced sequences.")
 
     def test_selected_clicked(self):
         for slot, dropdown in self.slot_dropdowns.items():
@@ -719,6 +858,9 @@ class VTubeStudioPage(ctk.CTkFrame):
         self._log("No valid mapped emotion to test.")
 
     def test_slot_clicked(self, slot_name):
+        if self._hotkey_test_in_progress():
+            self._log("A VTS hotkey test is already running; wait for it to finish.")
+            return
         dropdown = self.slot_dropdowns.get(slot_name)
         if not dropdown:
             self._log(f"No dropdown found for slot: {slot_name}")
@@ -728,20 +870,40 @@ class VTubeStudioPage(ctk.CTkFrame):
             self._log(f"{slot_name} is unmapped.")
             return
         self.save_mapping_clicked()
-        self._log(f"Testing VTS emotion slot: {slot_name}")
-        self._run_async_thread(lambda slot=slot_name: self._test_emotion_async(slot))
+        if slot_name == FULL_RESET_SLOT:
+            self.full_reset_clicked()
+        else:
+            self._log(f"Testing VTS emotion slot: {slot_name}")
+            self._start_hotkey_test(
+                lambda slot=slot_name: self._test_emotion_async(slot)
+            )
 
     async def _test_emotion_async(self, emotion_name):
         result = await self.manager.set_emotion_and_animate_talking(emotion_name)
         if result:
-            self.after(0, lambda n=emotion_name: self._log(f"Triggered talking sequence for: {n}"))
+            if self.manager.last_emotion_action == "cooldown_skipped":
+                self.after(
+                    0,
+                    lambda n=emotion_name: self._log(
+                        f"Skipped duplicate VTS test during cooldown: {n}"
+                    ),
+                )
+            else:
+                self.after(0, lambda n=emotion_name: self._log(f"Triggered talking sequence for: {n}"))
             self.after(0, lambda: self.connection_var.set(f"Connected (:{self.manager.settings.port})"))
         else:
-            self.after(0, lambda n=emotion_name: self._log(f"Failed to trigger talking sequence for: {n}"))
+            detail = self.manager.last_error
+            message = f"Failed to trigger talking sequence for: {emotion_name}"
+            if detail:
+                message = f"{message}. {detail}"
+            self.after(0, lambda text=message: self._log(text))
 
     def full_reset_clicked(self):
+        if self._hotkey_test_in_progress():
+            self._log("A VTS hotkey test is already running; wait for it to finish.")
+            return
         self._log("Triggering VTS full reset...")
-        self._run_async_thread(self._full_reset_async)
+        self._start_hotkey_test(self._full_reset_async)
 
     async def _full_reset_async(self):
         result = await self.manager.full_reset()
@@ -749,6 +911,27 @@ class VTubeStudioPage(ctk.CTkFrame):
             self.after(0, lambda: self._log("Triggered VTS full reset."))
         else:
             self.after(0, lambda: self._log("No full reset sequence mapped, or reset failed."))
+
+    def _hotkey_test_in_progress(self) -> bool:
+        future = self._active_hotkey_test_future
+        return future is not None and not future.done()
+
+    def _start_hotkey_test(self, async_func) -> bool:
+        if self._hotkey_test_in_progress():
+            self._log("A VTS hotkey test is already running; wait for it to finish.")
+            return False
+        future = self._run_async_thread(async_func)
+        if future is None:
+            return False
+        self._active_hotkey_test_future = future
+        future.add_done_callback(
+            lambda finished: self._ui(self._finish_hotkey_test, finished)
+        )
+        return True
+
+    def _finish_hotkey_test(self, future) -> None:
+        if self._active_hotkey_test_future is future:
+            self._active_hotkey_test_future = None
 
     def _ui(self, func, *args, **kwargs):
         try:
@@ -763,7 +946,7 @@ class VTubeStudioPage(ctk.CTkFrame):
             loop = app_loop.async_loop
             if loop is None or not loop.is_running():
                 print("Main async loop is not running yet.")
-                return
+                return None
             future = asyncio.run_coroutine_threadsafe(async_func(), loop)
             def done_callback(fut):
                 try:
@@ -771,8 +954,10 @@ class VTubeStudioPage(ctk.CTkFrame):
                 except Exception as e:
                     print(f"Async error: {e}")
             future.add_done_callback(done_callback)
+            return future
         except Exception as e:
             print(f"Async submit error: {e}")
+            return None
 
     @staticmethod
     def _log_async_safe(message):

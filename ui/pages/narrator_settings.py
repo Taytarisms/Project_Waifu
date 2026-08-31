@@ -1,6 +1,8 @@
 import customtkinter as ctk
+
+from files.ui.components.scrolling import AppScrollableFrame
 from files.ui import theme
-from files.ui.components.header import SteamHeader
+from files.ui.components.header import SteamHeader, SubpageNavigation
 from files.system_setup.settings import get_settings
 from files.system_setup.system_logger import Logger
 from files.tts.narrator import narrator_controls
@@ -58,20 +60,16 @@ class NarratorSettingsPage(ctk.CTkFrame):
             action_command=self._toggle_enabled_from_header,
         ).pack(fill="x")
 
-        nav_frame = ctk.CTkFrame(self, fg_color="transparent")
-        nav_frame.pack(fill="x", padx=24, pady=(12, 0))
-        ctk.CTkButton(
-            nav_frame,
-            text="← Back",
-            width=100,
-            fg_color="gray30",
-            command=lambda: self.app.show_page("TTS"),
-        ).pack(side="left")
+        SubpageNavigation(
+            self,
+            back_text="← TTS Library",
+            back_command=lambda: self.app.show_page("TTS"),
+        ).pack(fill="x", padx=24, pady=(12, 0))
 
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=24, pady=20)
 
-        left = ctk.CTkScrollableFrame(body, fg_color=theme.CARD_BG, corner_radius=10)
+        left = AppScrollableFrame(body, fg_color=theme.CARD_BG, corner_radius=10)
         left.pack(side="left", fill="both", expand=True, padx=(0, 10))
         content = ctk.CTkFrame(left, fg_color="transparent")
         content.pack(fill="both", expand=True)
@@ -86,7 +84,7 @@ class NarratorSettingsPage(ctk.CTkFrame):
         right_outer.pack(side="right", fill="y", padx=(10, 0))
         right_outer.pack_propagate(False)
 
-        right = ctk.CTkScrollableFrame(
+        right = AppScrollableFrame(
             right_outer,
             fg_color="transparent",
             corner_radius=10,
@@ -384,13 +382,6 @@ class NarratorSettingsPage(ctk.CTkFrame):
             hover_color="#922b21",
             command=narrator_controls.interrupt,
         ).pack(side="left", fill="x", expand=True, padx=(4, 0))
-
-        ctk.CTkButton(
-            parent,
-            text="Back to TTS Library",
-            command=lambda: self.app.show_page("TTS"),
-            fg_color="gray30",
-        ).pack(fill="x", padx=16, pady=(8, 16))
 
     def _voices_for_current_backend(self) -> list[str]:
         current_choice = self.backend_var.get() if hasattr(self, "backend_var") else ""

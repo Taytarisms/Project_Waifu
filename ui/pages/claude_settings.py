@@ -1,6 +1,7 @@
 import json
 import customtkinter as ctk
 from files.ui import theme
+from files.provider_capabilities import CLAUDE_CHAT_MODELS
 
 try:
     from files.system_setup.settings import get_settings, save_settings
@@ -11,14 +12,7 @@ except Exception:
 ## Models can be found here: https://platform.claude.com/docs/en/about-claude/models/overview
 ## Every model listed here is up to date. According to the docs, Claude 4 will be discontinued June 15th
 
-CLAUDE_MODELS = [
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5-20251101",
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-4-5-20251001",
-]
+CLAUDE_MODELS = CLAUDE_CHAT_MODELS
 
 class ClaudeSettingsPage(ctk.CTkFrame):
     def __init__(self, master):
@@ -38,26 +32,41 @@ class ClaudeSettingsPage(ctk.CTkFrame):
         self.max_tokens_var  = ctk.DoubleVar(value=float(self._setting("claude_max_tokens",  1024)))
         self.top_p_var       = ctk.DoubleVar(value=float(self._setting("claude_top_p",       1.0)))
         self.top_k_var       = ctk.DoubleVar(value=float(self._setting("claude_top_k",       0)))
+        self.thinking_effort_var = ctk.StringVar(
+            value=self._setting("claude_thinking_effort", "medium")
+        )
 
         self._combo_row("Model",       self.model_var,       CLAUDE_MODELS, row=1)
         self._slider_row("Temperature", self.temperature_var, 0.0,  1.0,  row=2)
         self._slider_row("Max Tokens",  self.max_tokens_var,  64,   8192, row=3, is_int=True)
         self._slider_row("Top P",       self.top_p_var,       0.0,  1.0,  row=4)
         self._slider_row("Top K",       self.top_k_var,       0,    500,  row=5, is_int=True)
+        self._combo_row(
+            "Thinking Effort",
+            self.thinking_effort_var,
+            ["none", "low", "medium", "high", "max"],
+            row=6,
+        )
 
         ctk.CTkLabel(
             self,
-            text="Top K (0 = disabled)",
+            text=(
+                "Sampling controls are saved for compatible older models. "
+                "They are automatically omitted for Opus 4.7+ and Claude 5. "
+                "Reasoning summaries use adaptive thinking on Claude 4.6+ and "
+                "can increase latency and token usage."
+            ),
             text_color=theme.MUTED_TEXT,
             anchor="w",
             font=ctk.CTkFont(size=11),
-        ).grid(row=6, column=0, sticky="w", padx=18, pady=(0, 12))
+            wraplength=560,
+        ).grid(row=7, column=0, sticky="w", padx=18, pady=(0, 12))
 
         ctk.CTkButton(
             self,
             text="Save Claude Settings",
             command=self.save,
-        ).grid(row=7, column=0, sticky="w", padx=18, pady=(10, 8))
+        ).grid(row=8, column=0, sticky="w", padx=18, pady=(10, 8))
 
         self.status_label = ctk.CTkLabel(
             self,
@@ -65,7 +74,7 @@ class ClaudeSettingsPage(ctk.CTkFrame):
             text_color=theme.MUTED_TEXT,
             anchor="w",
         )
-        self.status_label.grid(row=8, column=0, sticky="w", padx=18, pady=(0, 18))
+        self.status_label.grid(row=9, column=0, sticky="w", padx=18, pady=(0, 18))
 
     def _setting(self, key, default):
         if not get_settings:
@@ -111,6 +120,7 @@ class ClaudeSettingsPage(ctk.CTkFrame):
             "claude_max_tokens":  int(self.max_tokens_var.get()),
             "claude_top_p":       float(self.top_p_var.get()),
             "claude_top_k":       int(self.top_k_var.get()),
+            "claude_thinking_effort": self.thinking_effort_var.get().strip(),
         }
         if save_settings:
             for key, value in payload.items():

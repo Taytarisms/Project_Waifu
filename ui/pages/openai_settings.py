@@ -1,6 +1,7 @@
 import json
 import customtkinter as ctk
 from files.ui import theme
+from files.provider_capabilities import OPENAI_CHAT_MODELS
 
 try:
     from files.system_setup.settings import get_settings, save_settings
@@ -9,22 +10,10 @@ except Exception:
     save_settings = None
 
 ## Models can be found here: https://developers.openai.com/api/docs/models/all
-## OpenAI has a ton of models that are deprecated so I included the cheap options too.
+## OpenAI has a ton of models that are deprecated but newer models are expensive so I included the cheap options too.
 ## I did not include Davinci since I'm using the chat api and not completions.
 
-OPENAI_MODELS = [
-    "gpt-5.5",
-    "gpt-5.5-pro",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.4-nano",
-    "gpt-5.2",
-    "gpt-5.1",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-    "gpt-4.1-nano",
-    "gpt-3.5-turbo",
-]
+OPENAI_MODELS = OPENAI_CHAT_MODELS
 
 class OpenAISettingsPage(ctk.CTkFrame):
     def __init__(self, master):
@@ -39,40 +28,42 @@ class OpenAISettingsPage(ctk.CTkFrame):
             text_color=theme.TEXT,
         ).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 10))
 
-        self.model_var = ctk.StringVar(value=self._setting("openai_model", "gpt-4.1"))
+        self.model_var = ctk.StringVar(value=self._setting("openai_model", "gpt-5.6-luna"))
         self.temperature_var = ctk.DoubleVar(value=float(self._setting("openai_temperature", 0.7)))
         self.max_tokens_var = ctk.DoubleVar(value=float(self._setting("openai_max_tokens", 512)))
         self.top_p_var = ctk.DoubleVar(value=float(self._setting("openai_top_p", 1.0)))
-        self.presence_penalty_var = ctk.DoubleVar(value=float(self._setting("openai_presence_penalty", 0.0)))
-        self.frequency_penalty_var = ctk.DoubleVar(value=float(self._setting("openai_frequency_penalty", 0.0)))
-        self.stop_var = ctk.StringVar(value=str(self._setting("openai_stop", "")))
+        self.reasoning_effort_var = ctk.StringVar(
+            value=self._setting("openai_reasoning_effort", "medium")
+        )
 
         self._combo_row("Model", self.model_var, OPENAI_MODELS, row=1)
         self._slider_row("Temperature", self.temperature_var, 0.0, 2.0, row=2)
         self._slider_row("Max Tokens", self.max_tokens_var, 64, 8192, row=3, is_int=True)
         self._slider_row("Top P", self.top_p_var, 0.0, 1.0, row=4)
-        self._slider_row("Presence Penalty", self.presence_penalty_var, -2.0, 2.0, row=5)
-        self._slider_row("Frequency Penalty", self.frequency_penalty_var, -2.0, 2.0, row=6)
+        self._combo_row(
+            "Reasoning Effort",
+            self.reasoning_effort_var,
+            ["none", "low", "medium", "high", "xhigh"],
+            row=5,
+        )
 
         ctk.CTkLabel(
             self,
-            text="Stop Sequence",
-            text_color=theme.TEXT,
+            text=(
+                "GPT-5 models use the Responses API. Sampling controls are "
+                "only sent to compatible non-reasoning models."
+            ),
+            text_color=theme.MUTED_TEXT,
             anchor="w",
-        ).grid(row=7, column=0, sticky="w", padx=18, pady=(14, 4))
-
-        ctk.CTkEntry(
-            self,
-            textvariable=self.stop_var,
-            placeholder_text="Optional, comma-separated",
-            width=360,
-        ).grid(row=8, column=0, sticky="w", padx=18, pady=(0, 14))
+            font=ctk.CTkFont(size=11),
+            wraplength=560,
+        ).grid(row=6, column=0, sticky="w", padx=18, pady=(0, 12))
 
         ctk.CTkButton(
             self,
             text="Save OpenAI Settings",
             command=self.save,
-        ).grid(row=9, column=0, sticky="w", padx=18, pady=(10, 8))
+        ).grid(row=7, column=0, sticky="w", padx=18, pady=(10, 8))
 
         self.status_label = ctk.CTkLabel(
             self,
@@ -80,7 +71,7 @@ class OpenAISettingsPage(ctk.CTkFrame):
             text_color=theme.MUTED_TEXT,
             anchor="w",
         )
-        self.status_label.grid(row=10, column=0, sticky="w", padx=18, pady=(0, 18))
+        self.status_label.grid(row=8, column=0, sticky="w", padx=18, pady=(0, 18))
 
     def _setting(self, key, default):
         if not get_settings:
@@ -129,9 +120,7 @@ class OpenAISettingsPage(ctk.CTkFrame):
             "openai_temperature": float(self.temperature_var.get()),
             "openai_max_tokens": int(self.max_tokens_var.get()),
             "openai_top_p": float(self.top_p_var.get()),
-            "openai_presence_penalty": float(self.presence_penalty_var.get()),
-            "openai_frequency_penalty": float(self.frequency_penalty_var.get()),
-            "openai_stop": self.stop_var.get().strip(),
+            "openai_reasoning_effort": self.reasoning_effort_var.get().strip(),
         }
 
         if save_settings:

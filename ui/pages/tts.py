@@ -1,15 +1,24 @@
 from pathlib import Path
 import customtkinter as ctk
+
+from files.ui.components.scrolling import AppScrollableFrame
 from tkinter import filedialog
 import threading
 import asyncio
 
 from files.ui import theme
 from files.ui.components.cards import ProviderCard
-from files.ui.components.header import SteamHeader
+from files.ui.components.header import SteamHeader, SubpageNavigation
 from files.ui.components.auth_dialog import AuthTokenDialog
 from files.ui.pages.narrator_settings import NarratorSettingsPage
 from files.ui.pages.caption_settings import CaptionsSettingsPage
+from files.provider_capabilities import (
+    ELEVENLABS_TTS_MODELS,
+    FISH_TTS_MODELS,
+    INWORLD_TTS_MODELS,
+    OPENAI_TTS_MODELS,
+    OPENAI_TTS_VOICES,
+)
 from files.system_setup.audio_tools import list_output_devices, parse_output_device
 
 try:
@@ -205,15 +214,13 @@ class TTSCategoryPage(ctk.CTkFrame):
             anchor="w", padx=24, pady=(0, 20)
         )
 
-        ctk.CTkButton(
+        SubpageNavigation(
             self,
-            text="← Back to TTS Library",
-            width=180,
-            fg_color="gray30",
-            command=lambda: self.app.show_page("TTS"),
+            back_text="← TTS Library",
+            back_command=lambda: self.app.show_page("TTS"),
         ).pack(anchor="w", padx=24, pady=(0, 16))
 
-        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        scroll = AppScrollableFrame(self, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=24, pady=10)
 
         grid = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -291,21 +298,21 @@ class TTSProviderPage(ctk.CTkFrame):
             action_command=self.activate_provider,
         ).pack(fill="x")
 
-        nav_frame = ctk.CTkFrame(self, fg_color="transparent")
-        nav_frame.pack(fill="x", padx=24, pady=(12, 0))
         back_category = "local" if provider_name in [n for n, _, _ in LOCAL_TTS_PROVIDERS] else "cloud"
-        ctk.CTkButton(
-            nav_frame,
-            text="← Back",
-            width=100,
-            fg_color="gray30",
-            command=lambda: self.app.show_dynamic_page(TTSCategoryPage, category=back_category),
-        ).pack(side="left")
+        SubpageNavigation(
+            self,
+            back_command=lambda: self.app.show_dynamic_page(
+                TTSCategoryPage,
+                category=back_category,
+            ),
+            library_text="⌂ TTS Library",
+            library_command=lambda: self.app.show_page("TTS"),
+        ).pack(fill="x", padx=24, pady=(12, 0))
 
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=24, pady=20)
 
-        left = ctk.CTkScrollableFrame(body, fg_color=theme.CARD_BG, corner_radius=10)
+        left = AppScrollableFrame(body, fg_color=theme.CARD_BG, corner_radius=10)
         left.pack(side="left", fill="both", expand=True, padx=(0, 10))
         content = ctk.CTkFrame(left, fg_color="transparent")
         content.pack(fill="both", expand=True)
@@ -315,7 +322,7 @@ class TTSProviderPage(ctk.CTkFrame):
         right_outer.pack(side="right", fill="y", padx=(10, 0))
         right_outer.pack_propagate(False)
 
-        right = ctk.CTkScrollableFrame(right_outer, fg_color="transparent", corner_radius=10)
+        right = AppScrollableFrame(right_outer, fg_color="transparent", corner_radius=10)
         right.pack(fill="both", expand=True)
 
         ctk.CTkLabel(
@@ -348,13 +355,6 @@ class TTSProviderPage(ctk.CTkFrame):
             quota_card_cls(right).pack(fill="x", padx=16, pady=(0, 8))
 
         self._build_test_speak_tools(right)
-
-        ctk.CTkButton(
-            right,
-            text="Back to TTS Library",
-            command=lambda: self.app.show_page("TTS"),
-            fg_color="gray30",
-        ).pack(fill="x", padx=16, pady=16)
 
     def activate_provider(self):
         if not self._ensure_auth_token():
@@ -490,7 +490,12 @@ class TTSProviderPage(ctk.CTkFrame):
         self.test_textbox.pack(fill="x", padx=16, pady=(0, 8))
         self.test_textbox.insert("0.0", "This is a quick test of the current TTS provider.")
 
-        ctk.CTkButton(parent, text="Speak Test", command=self.speak_test).pack(fill="x", padx=16, pady=4)
+        self.test_speak_button = ctk.CTkButton(
+            parent,
+            text="Speak Test",
+            command=self.speak_test,
+        )
+        self.test_speak_button.pack(fill="x", padx=16, pady=4)
 
     def speak_test(self):
         text = self.test_textbox.get("0.0", "end-1c").strip()
@@ -503,15 +508,30 @@ class TTSProviderPage(ctk.CTkFrame):
 
         self.activate_provider()
         self.status_label.configure(text=f"Sending test speak to {self.provider_name}...")
+        self.test_speak_button.configure(state="disabled")
+        provider_name = self.provider_name
 
         def runner():
             try:
-                result = asyncio.run(gen_response.speak(text))
-                self.after(0, lambda: self.status_label.configure(text=f"Test speak sent to {self.provider_name}."))
+                async def run_test():
+                    playback = await gen_response.speak(text)
+                    await gen_response.wait_for_playback(playback)
+
+                asyncio.run(run_test())
+                message = f"Test speak completed for {provider_name}."
             except Exception as e:
-                self.after(0, lambda: self.status_label.configure(text=f"Test speak failed: {e}"))
+                message = f"Test speak failed: {e}"
+            self.after(0, self._set_test_status, message)
 
         threading.Thread(target=runner, daemon=True).start()
+
+    def _set_test_status(self, message):
+        try:
+            if self.winfo_exists() and self.status_label.winfo_exists():
+                self.status_label.configure(text=message)
+                self.test_speak_button.configure(state="normal")
+        except Exception:
+            pass
 
 class BaseTTSSettings(ctk.CTkFrame):
     def __init__(self, master, title):
@@ -703,29 +723,31 @@ class ElevenLabsTTSSettings(BaseTTSSettings):
         self.style_var = ctk.DoubleVar(value=float(self._setting("eleven_style", 0.34)))
         self.speed_var = ctk.DoubleVar(value=float(self._setting("eleven_speed", 1.0)))
         self.speaker_boost_var = ctk.BooleanVar(value=bool(self._setting("eleven_speaker_boost", False)))
-        self.streaming_var = ctk.BooleanVar(value=bool(self._setting("eleven_streaming", True)))
 
         row = 2
         self._entry_row("Voice ID", self.voice_id_var, row); row += 1
         self._combo_row(
             "Model",
             self.model_id_var,
-            [
-                "eleven_v3",
-                "eleven_multilingual_v2",
-                "eleven_flash_v2_5",
-                "eleven_turbo_v2_5",
-                "eleven_turbo_v2",
-                "eleven_tts_v1",
-            ],
+            ELEVENLABS_TTS_MODELS,
             row,
         ); row += 1
         self._slider_row("Stability", self.stability_var, 0.0, 1.0, row); row += 1
         self._slider_row("Similarity", self.similarity_var, 0.0, 1.0, row); row += 1
         self._slider_row("Style", self.style_var, 0.0, 1.0, row); row += 1
-        self._slider_row("Speed", self.speed_var, 0.5, 2.0, row); row += 1
+        self._slider_row("Speed", self.speed_var, 0.7, 1.2, row); row += 1
         self._checkbox_row("Use Speaker Boost", self.speaker_boost_var, row); row += 1
-        self._checkbox_row("Use Streaming Playback", self.streaming_var, row); row += 1
+        ctk.CTkLabel(
+            self,
+            text=(
+                "Eleven v3 omits Similarity and Speaker Boost automatically. "
+                "Turbo models were removed in favor of their faster Flash replacements."
+            ),
+            text_color=theme.MUTED_TEXT,
+            wraplength=560,
+            justify="left",
+        ).grid(row=row, column=0, sticky="w", padx=18, pady=(8, 8))
+        row += 1
 
         ctk.CTkButton(self, text="Save ElevenLabs Settings", command=self.save).grid(
             row=row, column=0, sticky="w", padx=18, pady=(16, 8)
@@ -749,7 +771,6 @@ class ElevenLabsTTSSettings(BaseTTSSettings):
                 "eleven_style": float(self.style_var.get()),
                 "eleven_speed": float(self.speed_var.get()),
                 "eleven_speaker_boost": bool(self.speaker_boost_var.get()),
-                "eleven_streaming": bool(self.streaming_var.get()),
             },
             "ElevenLabs",
         )
@@ -761,14 +782,10 @@ class NovelAITTSSettings(BaseTTSSettings):
 
         self.voice_seed_var = ctk.StringVar(value=self._setting("novel_tts_voice_seed", "galette"))
         self.version_var = ctk.StringVar(value=self._setting("novel_tts_version", "v2"))
-        self.mode_var = ctk.StringVar(value=self._setting("novel_tts_mode", "Streamed"))
-        self.output_format_var = ctk.StringVar(value=self._setting("novel_tts_output_format", "mp3"))
 
         row = 2
         self._entry_row("Voice Seed", self.voice_seed_var, row); row += 1
         self._combo_row("Version", self.version_var, ["v1", "v2"], row); row += 1
-        self._combo_row("Mode", self.mode_var, ["Streamed", "Full"], row); row += 1
-        self._combo_row("Output Format", self.output_format_var, ["mp3", "wav", "opus"], row); row += 1
 
         ctk.CTkButton(self, text="Save NovelAI TTS Settings", command=self.save).grid(
             row=row, column=0, sticky="w", padx=18, pady=(16, 8)
@@ -787,8 +804,6 @@ class NovelAITTSSettings(BaseTTSSettings):
             {
                 "novel_tts_voice_seed": self.voice_seed_var.get().strip(),
                 "novel_tts_version": self.version_var.get().strip(),
-                "novel_tts_mode": self.mode_var.get().strip(),
-                "novel_tts_output_format": self.output_format_var.get().strip(),
             },
             "NovelAI TTS",
         )
@@ -839,8 +854,9 @@ class FishSpeechSettings(BaseTTSSettings):
         self.api_url_var = ctk.StringVar(
             value=self._setting("fish_api_url", "https://api.fish.audio/v1/tts")
         )
+        saved_model = str(self._setting("fish_model", "s2-pro") or "s2-pro")
         self.model_var = ctk.StringVar(
-            value=self._setting("fish_model", "s2-pro")
+            value=saved_model if saved_model in FISH_TTS_MODELS else "s2-pro"
         )
         self.voice_id_var = ctk.StringVar(
             value=self._setting("fish_voice_id", "")
@@ -874,17 +890,22 @@ class FishSpeechSettings(BaseTTSSettings):
 
         row = 2
         self._entry_row("API URL", self.api_url_var, row); row += 1
-        self._combo_row("Model", self.model_var, ["s2-pro"], row); row += 1
+        self._combo_row("Model", self.model_var, FISH_TTS_MODELS, row); row += 1
         self._entry_row("Voice / Reference ID", self.voice_id_var, row); row += 1
-        self._slider_row("Sample Rate", self.rate_var, 16000, 48000, row, is_int=True); row += 1
-        self._slider_row("Channels", self.channels_var, 1, 2, row, is_int=True); row += 1
-        self._slider_row("Chunk Length", self.chunk_length_var, 50, 500, row, is_int=True); row += 1
-        self._slider_row("Min Chunk Length", self.min_chunk_length_var, 20, 200, row, is_int=True); row += 1
+        self._combo_row(
+            "Sample Rate",
+            self.rate_var,
+            ["8000", "16000", "24000", "32000", "44100"],
+            row,
+        ); row += 1
+        self._slider_row("Playback Channels", self.channels_var, 1, 2, row, is_int=True); row += 1
+        self._slider_row("Chunk Length", self.chunk_length_var, 100, 300, row, is_int=True); row += 1
+        self._slider_row("Min Chunk Length", self.min_chunk_length_var, 0, 100, row, is_int=True); row += 1
 
-        self._combo_row("Latency", self.latency_var, ["low", "normal"], row); row += 1
+        self._combo_row("Latency", self.latency_var, ["low", "balanced", "normal"], row); row += 1
         self._combo_row("Format", self.format_var, ["pcm"], row); row += 1
 
-        self._checkbox_row("Normalize Audio", self.normalize_var, row); row += 1
+        self._checkbox_row("Normalize Text", self.normalize_var, row); row += 1
         self._checkbox_row("Condition on Previous Chunks", self.condition_previous_var, row); row += 1
 
         ctk.CTkButton(
@@ -932,17 +953,28 @@ class OpenAITTSSettings(BaseTTSSettings):
         self._combo_row(
             "Model",
             self.model_var,
-            ["gpt-4o-mini-tts", "tts-1", "tts-1-hd"],
+            OPENAI_TTS_MODELS,
             row,
         ); row += 1
         self._combo_row(
             "Voice",
             self.voice_var,
-            ["alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer"],
+            OPENAI_TTS_VOICES,
             row,
         ); row += 1
         self._slider_row("Speed", self.speed_var, 0.25, 4.0, row); row += 1
         self._entry_row("Instructions", self.instructions_var, row); row += 1
+        ctk.CTkLabel(
+            self,
+            text=(
+                "Instructions are sent only to gpt-4o-mini-tts. The legacy tts-1 "
+                "models also support a smaller voice set."
+            ),
+            text_color=theme.MUTED_TEXT,
+            wraplength=560,
+            justify="left",
+        ).grid(row=row, column=0, sticky="w", padx=18, pady=(8, 8))
+        row += 1
 
         ctk.CTkButton(self, text="Save OpenAI TTS Settings", command=self.save).grid(
             row=row, column=0, sticky="w", padx=18, pady=(16, 8)
@@ -977,7 +1009,7 @@ class InWorldTTSSettings(BaseTTSSettings):
         )
         saved_model = (
             self._setting("inworld_tts_model_id", "")
-            or self._setting("inworld_tts_model", "inworld-tts-1.5-mini")
+            or self._setting("inworld_tts_model", "inworld-tts-2")
         )
 
         self.model_var = ctk.StringVar(value=saved_model)
@@ -988,9 +1020,6 @@ class InWorldTTSSettings(BaseTTSSettings):
         )
         self.sample_rate_var = ctk.DoubleVar(
             value=float(self._setting("inworld_tts_sample_rate", 24000))
-        )
-        self.bit_rate_var = ctk.DoubleVar(
-            value=float(self._setting("inworld_tts_bit_rate", 32000))
         )
         self.language_var = ctk.StringVar(
             value=self._setting("inworld_tts_language", "")
@@ -1008,7 +1037,7 @@ class InWorldTTSSettings(BaseTTSSettings):
             value=self._setting("inworld_tts_timestamp_type", "NONE")
         )
         self.warmup_var = ctk.BooleanVar(
-            value=bool(self._setting("inworld_tts_warmup", True))
+            value=bool(self._setting("inworld_tts_warmup", False))
         )
 
         row = 2
@@ -1018,12 +1047,7 @@ class InWorldTTSSettings(BaseTTSSettings):
         self._combo_row(
             "Model",
             self.model_var,
-            [
-                "inworld-tts-2",
-                "inworld-tts-1.5-max",
-                "inworld-tts-1.5-mini",
-                "inworld-tts-1",
-            ],
+            INWORLD_TTS_MODELS,
             row,
         ); row += 1
 
@@ -1044,14 +1068,12 @@ class InWorldTTSSettings(BaseTTSSettings):
         ); row += 1
 
         self._slider_row("Sample Rate", self.sample_rate_var, 8000, 48000, row, is_int=True); row += 1
-        self._slider_row("Bit Rate", self.bit_rate_var, 16000, 128000, row, is_int=True); row += 1
-
         self._entry_row("Language / Locale", self.language_var, row); row += 1
 
         self._combo_row(
             "Timestamp Type",
             self.timestamp_type_var,
-            ["NONE", "CHARACTER", "WORD", "PHONEME", "VISEME"],
+            ["NONE", "CHARACTER", "WORD"],
             row,
         ); row += 1
 
@@ -1062,8 +1084,9 @@ class InWorldTTSSettings(BaseTTSSettings):
             self,
             text=(
                 "Voice ID can be a built-in voice like Sarah/Dennis or a custom/cloned "
-                "voiceId returned by InWorld's Voices API. For TTS-2, delivery mode is "
-                "the primary expressiveness control; older models may use temperature."
+                "voiceId returned by InWorld's Voices API. TTS-2 sends Delivery Mode "
+                "and omits Temperature; older models do the reverse. Warmup generates "
+                "a real extra clip, so it is off by default."
             ),
             text_color=theme.MUTED_TEXT,
             wraplength=560,
@@ -1095,7 +1118,6 @@ class InWorldTTSSettings(BaseTTSSettings):
                 "inworld_tts_model_id": model_id,
                 "inworld_tts_audio_encoding": self.audio_encoding_var.get().strip(),
                 "inworld_tts_sample_rate": int(self.sample_rate_var.get()),
-                "inworld_tts_bit_rate": int(self.bit_rate_var.get()),
                 "inworld_tts_language": self.language_var.get().strip(),
                 "inworld_tts_delivery_mode": self.delivery_mode_var.get().strip().upper(),
                 "inworld_tts_temperature": float(self.temperature_var.get()),
@@ -1150,7 +1172,7 @@ class Qwen3TTSSettings(BaseTTSSettings):
 
         self.preset_var = ctk.StringVar(value=self._setting("qwen3_tts_preset", ""))
         self.model_id_var = ctk.StringVar(value=self._setting("qwen3_tts_model_id", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"))
-        self.backend_var = ctk.StringVar(value=self._setting("qwen3_tts_backend", "faster"))
+        self.backend_var = ctk.StringVar(value=self._setting("qwen3_tts_backend", "auto"))
         self.device_var = ctk.StringVar(value=self._setting("qwen3_tts_device", "auto"))
         self.speaker_var = ctk.StringVar(value=self._setting("qwen3_tts_speaker", "ryan"))
         self.language_var = ctk.StringVar(value=self._setting("qwen3_tts_language", "English"))
