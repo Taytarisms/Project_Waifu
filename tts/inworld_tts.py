@@ -10,12 +10,13 @@ import requests
 from pydub import AudioSegment
 
 from files.system_setup.audio_tools import configure_audio_tools, tts_output_dir
+from files.provider_capabilities import inworld_uses_delivery_mode
 from files.system_setup.settings import get_auth, get_settings
 from files.system_setup.system_logger import Logger
 from files.main_loop import turn_control
 configure_audio_tools()
 OUTPUT_DIR = tts_output_dir("inworld")
-DEFAULT_MODEL_ID = "inworld-tts-1.5-mini"
+DEFAULT_MODEL_ID = "inworld-tts-2"
 DEFAULT_VOICE_ID = "Ashley"
 DEFAULT_AUDIO_ENCODING = "MP3"
 DEFAULT_SAMPLE_RATE = 24000
@@ -103,12 +104,17 @@ def _build_payload(text: str, voice_id: Optional[str] = None, model_id: Optional
 
     audio_encoding = str(_setting("inworld_tts_audio_encoding", DEFAULT_AUDIO_ENCODING)).strip() or DEFAULT_AUDIO_ENCODING
     sample_rate = _as_int(_setting("inworld_tts_sample_rate", DEFAULT_SAMPLE_RATE), DEFAULT_SAMPLE_RATE)
-    bit_rate = _as_int(_setting("inworld_tts_bit_rate", DEFAULT_BIT_RATE), DEFAULT_BIT_RATE)
     language = str(_setting("inworld_tts_language", "") or "").strip()
     delivery_mode = str(_setting("inworld_tts_delivery_mode", DEFAULT_DELIVERY_MODE) or "").strip().upper()
     temperature = _as_float(_setting("inworld_tts_temperature", 1.0), 1.0)
-    apply_normalization = _as_bool(_setting("inworld_tts_apply_text_normalization", True), True)
-    timestamp_type = str(_setting("inworld_tts_timestamp_type", "") or "").strip()
+    normalization_setting = _setting("inworld_tts_apply_text_normalization", True)
+    if isinstance(normalization_setting, str) and normalization_setting.upper() in {
+        "ON", "OFF", "APPLY_TEXT_NORMALIZATION_UNSPECIFIED"
+    }:
+        apply_normalization = normalization_setting.upper()
+    else:
+        apply_normalization = "ON" if _as_bool(normalization_setting, True) else "OFF"
+    timestamp_type = str(_setting("inworld_tts_timestamp_type", "") or "").strip().upper()
 
     payload: dict[str, Any] = {
         "text": text,
@@ -122,17 +128,15 @@ def _build_payload(text: str, voice_id: Optional[str] = None, model_id: Optional
 
     if sample_rate > 0:
         payload["audioConfig"]["sampleRateHertz"] = sample_rate
-    if bit_rate > 0:
-        payload["audioConfig"]["bitRate"] = bit_rate
     if language:
         payload["audioConfig"]["language"] = language
-    if delivery_mode and delivery_mode != "DEFAULT":
-        payload["deliveryMode"] = delivery_mode
-
-    if temperature > 0:
+    if inworld_uses_delivery_mode(model):
+        if delivery_mode in {"STABLE", "BALANCED", "CREATIVE"}:
+            payload["deliveryMode"] = delivery_mode
+    elif temperature > 0:
         payload["temperature"] = temperature
 
-    if timestamp_type and timestamp_type != "NONE":
+    if timestamp_type in {"WORD", "CHARACTER"}:
         payload["timestampType"] = timestamp_type
 
     return payload
@@ -235,7 +239,7 @@ def _stream_tts_sync(api_key: str, text: str, voice_id: Optional[str], model_id:
 
     payload = _build_payload(text=text, voice_id=voice_id, model_id=model_id)
 
-    use_warmup = _as_bool(_setting("inworld_tts_warmup", True), True)
+    use_warmup = _as_bool(_setting("inworld_tts_warmup", False), False)
 
     session = requests.Session()
     session.headers.update(headers)

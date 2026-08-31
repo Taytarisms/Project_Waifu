@@ -2,6 +2,7 @@ import asyncio
 from typing import Optional
 from files.system_setup.settings import get_settings, get_auth
 from files.system_setup.system_logger import Logger
+from files.llm.generation_result import result_text
 
 DEFAULT_EMOTIONS = [
     "neutral",
@@ -148,6 +149,7 @@ async def infer_emotion(
         Logger.warn(f"LLM call failed: {e}")
         return heuristic or ""
 
+    raw = result_text(raw)
     emotion = _parse_emotion_output(raw, emotion_list)
 
     if emotion:
@@ -169,7 +171,6 @@ async def infer_emotion(
 _novel_inference_client = None
 async def _call_llm_for_inference(prompt: str) -> str:
     from files.llm.openai_llm import open_response
-    from files.llm.LocalLLM import response_local
     from files.llm.grok import grok_response
     from files.llm.claude import claude_response
     from files.llm.gemini import gemini_response
@@ -186,7 +187,9 @@ async def _call_llm_for_inference(prompt: str) -> str:
     if current_chat_model == "NovelAI":
         return await _call_novelai_for_inference(prompt)
     if current_chat_model == "Local":
-        return await response_local(
+        from files.llm.local_worker_client import response_local_via_worker
+
+        return await response_local_via_worker(
             text=prompt,
             max_tokens=24,
             save_to_history=False,

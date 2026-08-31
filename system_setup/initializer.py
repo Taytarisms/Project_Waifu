@@ -8,7 +8,7 @@ import traceback
 novelai_voice_seed: str = "galette"
 
 system_msg:    str = ""
-Novel_Model:   str = "kayra"
+Novel_Model:   str = "xialong-v1"
 novel_client:  NovelAIClient | None = None
 provider:      str = ""
 chat_model:    str = ""
@@ -33,10 +33,12 @@ def set_novel_model(model_name: str) -> None:
         "clio":       "clio",
         "xialong":    "xialong-v1",
         "xialong-v1": "xialong-v1",
+        "glm-4-6":    "glm-4-6",
+        "glm-4.6":    "glm-4-6",
     }
 
     key = (model_name or "").strip().lower()
-    Novel_Model = aliases.get(key, "kayra")
+    Novel_Model = aliases.get(key, "xialong-v1")
 
     save_settings("NOVELAI_MODEL", Novel_Model)
     print(f"NovelAI model set to: {Novel_Model}")
@@ -49,7 +51,7 @@ def get_or_create_novelai_model() -> str:
         return Novel_Model
 
     print("Choose NovelAI model:")
-    print("Options: Kayra, Erato, Clio, Xialong")
+    print("Options: Xialong, GLM-4.6, Erato, Kayra, Clio")
     selected = input("NovelAI model: ").strip()
     set_novel_model(selected)
     return Novel_Model

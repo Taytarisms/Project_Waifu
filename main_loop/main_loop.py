@@ -1,5 +1,6 @@
 import time
 import asyncio
+import concurrent.futures
 import json
 import queue
 from typing import Optional
@@ -14,7 +15,7 @@ from files.moderation.check_for_bad_words import check_for_bad_words, decode_bad
 from files.moderation.check_for_spam import is_spam_message
 from files.moderation.text_cleaner import split_message, cleaned_chat_pairings
 from files.fine_tune.fine_tune_creator import create_chat_pair
-from files.system_setup.settings import USERDATA_DIR, get_settings
+from files.system_setup.settings import USERDATA_DIR, get_bool_setting, get_settings
 from files.system_setup.json_utils import load_json_safe
 from files.tts.narrator.backends.narrator import get_narrator
 from files.closed_captions import clear_caption, caption_coordinator, SOURCE_NARRATOR, SOURCE_USER, SOURCE_LLM
@@ -27,11 +28,16 @@ BAD_WORDS = decode_bad_words()
 UNKNOWN_USER_ID = "unknown_user"
 message_queue: "queue.Queue[tuple[str, bool, Optional[queue.Queue]]]" = queue.Queue()
 async_loop = None
+_loop_thread: Optional[threading.Thread] = None
+_main_future = None
+_loop_ready = threading.Event()
+_loop_lock = threading.Lock()
 _vts_manager: Optional[VTSHotkeyManager] = None
 _turn_active = threading.Event()
 SAVED_CHAT = USERDATA_DIR / "conversation_context.json"
 LAST_TURNS = 3
 _persistent_context_injected = False
+STREAM_CHAT_SOURCES = {"twitch", "youtube", "kick"}
 
 def is_turn_active() -> bool:
     return _turn_active.is_set()
@@ -116,6 +122,18 @@ def set_vts_manager(manager: VTSHotkeyManager) -> None:
     global _vts_manager
     _vts_manager = manager
 
+
+def is_vts_enabled() -> bool:
+    return get_bool_setting("enable_vts", default=False)
+
+
+def is_vts_ready() -> bool:
+    return bool(
+        is_vts_enabled()
+        and _vts_manager is not None
+        and _vts_manager.connected
+    )
+
 def _log_info(text: str) -> None:
     try:
         LogManager.info(text)
@@ -154,7 +172,7 @@ def finish_turn(resp_q: Optional[queue.Queue], response: Optional[str]) -> None:
         Logger.clear_turn_id()
 
 def turn_start(source: str, turn_id: str | None, speaker: str, text: str) -> None:
-    if source != "twitch" or not turn_id:
+    if source not in STREAM_CHAT_SOURCES or not turn_id:
         return
     ui = getattr(Logger, "ui_ref", None)
     if ui is None or not hasattr(ui, "outside_chat"):
@@ -162,10 +180,10 @@ def turn_start(source: str, turn_id: str | None, speaker: str, text: str) -> Non
     try:
         ui.after(0, ui.outside_chat, turn_id, speaker, text, source)
     except Exception as e:
-        Logger.warn(f"Failed to render Twitch turn start: {e}")
+        Logger.warn(f"Failed to render {source} turn start: {e}")
 
 def turn_finish(source: str, turn_id: str | None, response: Optional[str]) -> None:
-    if source != "twitch" or not turn_id:
+    if source not in STREAM_CHAT_SOURCES or not turn_id:
         return
     ui = getattr(Logger, "ui_ref", None)
     if ui is None or not hasattr(ui, "outside_chat_finish"):
@@ -173,7 +191,28 @@ def turn_finish(source: str, turn_id: str | None, response: Optional[str]) -> No
     try:
         ui.after(0, ui.outside_chat_finish, turn_id, response or "", source)
     except Exception as e:
-        Logger.warn(f"Failed to render Twitch turn finish: {e}")
+        Logger.warn(f"Failed to render {source} turn finish: {e}")
+
+
+def publish_reasoning(turn_id: str | None, result) -> None:
+    reasoning = str(getattr(result, "reasoning", "") or "").strip()
+    if not reasoning:
+        return
+    ui = getattr(Logger, "ui_ref", None)
+    if ui is None or not hasattr(ui, "show_reasoning"):
+        return
+    payload = {
+        "turn_id": turn_id or "",
+        "reasoning": reasoning,
+        "reasoning_kind": str(getattr(result, "reasoning_kind", "none") or "none"),
+        "provider": str(getattr(result, "provider", "") or ""),
+        "model": str(getattr(result, "model", "") or ""),
+        "usage": dict(getattr(result, "usage", {}) or {}),
+    }
+    try:
+        ui.after(0, ui.show_reasoning, payload)
+    except Exception as e:
+        Logger.warn(f"Failed to render model reasoning: {e}")
 
 def _live_memory_max_distance() -> float:
     try:
@@ -224,34 +263,47 @@ async def recall_memories_total(query: str, user_id: str, n_results: int = 3) ->
     return combined
 
 async def _wait_for_playback(playback) -> None:
-    if not isinstance(playback, threading.Thread):
+    await gen_response.wait_for_playback(playback)
+
+
+def _suspend_stt_for_playback() -> bool:
+    try:
+        from files.speech_to_text import stt_controls
+
+        return bool(stt_controls.suspend_for_playback())
+    except Exception as exc:
+        Logger.warn(f"Could not coordinate STT with playback: {exc}")
+        return False
+
+
+def _resume_stt_after_playback(was_suspended: bool) -> None:
+    if not was_suspended:
         return
-    while playback.is_alive():
-        if turn_control.is_interrupted():
-            gen_response.stop_tts()
-            await asyncio.to_thread(playback.join, 0.25)
-            raise turn_control.TurnInterrupted()
-        await asyncio.to_thread(playback.join, 0.1)
+    try:
+        from files.speech_to_text import stt_controls
+
+        stt_controls.resume_after_playback(was_suspended)
+    except Exception as exc:
+        Logger.warn(f"Could not resume STT after playback: {exc}")
 
 def _read_emotion_mode() -> str:
     try:
-        from files.system_setup.settings import get_bool_setting
         raw = get_settings("vts_emotion_mode")
         if raw in ("", None):
             legacy = get_bool_setting(
-                "enable_vts_emotion_inference", default=True
+                "enable_vts_emotion_inference", default=False
             )
-            return "llm" if legacy else "off"
+            return "llm" if legacy else "heuristic"
         mode = str(raw).strip().lower()
         if mode in ("llm", "heuristic", "off"):
             return mode
     except Exception:
         pass
-    return "llm"
+    return "heuristic"
 
 async def start_emotion_inf(response_text: str) -> None:
     manager = _vts_manager
-    if manager is None:
+    if manager is None or not is_vts_ready():
         return
 
     mode = _read_emotion_mode()
@@ -354,7 +406,9 @@ async def main_loop():
         _turn_active.set()
         execution_start_time = time.perf_counter()
         response: Optional[str] = None
+        generation = None
         turn_detail = f"speaker={UNKNOWN_USER_ID}, needs_llm={needs_llm}"
+        emotion_task: Optional[asyncio.Task] = None
 
         try:
             if not isinstance(message, str):
@@ -368,12 +422,15 @@ async def main_loop():
             turn_control.raise_if_interrupted()
             speaker = username or UNKNOWN_USER_ID
             msg_source = (meta or {}).get("source", "")
+            memory_user_id = str((meta or {}).get("memory_user_id") or speaker)
             is_monologue = msg_source == "monologue"
-            store_input_memory = bool((meta or {}).get("store_input_memory", not is_monologue))
-            store_output_memory = bool((meta or {}).get("store_output_memory", True))
-            use_live_recall = bool((meta or {}).get("use_live_recall", not is_monologue))
-            allow_finetune = bool((meta or {}).get("allow_finetune", not is_monologue))
-            speak_input = bool((meta or {}).get("speak_input", not is_monologue))
+            is_stream_event = str((meta or {}).get("kind") or "").strip().lower() == "event"
+            regular_input = not is_monologue and not is_stream_event
+            store_input_memory = bool((meta or {}).get("store_input_memory", regular_input))
+            store_output_memory = bool((meta or {}).get("store_output_memory", not is_stream_event))
+            use_live_recall = bool((meta or {}).get("use_live_recall", regular_input))
+            allow_finetune = bool((meta or {}).get("allow_finetune", regular_input))
+            speak_input = bool((meta or {}).get("speak_input", regular_input))
             turn_start(msg_source, turn_id, speaker, text)
             turn_detail = f"speaker={speaker}, needs_llm={needs_llm}, input_chars={len(text)}"
             spam_check = False if is_monologue else is_spam_message(text)
@@ -394,13 +451,13 @@ async def main_loop():
                 random_mems = await random_memories_main(n_results=max(1, memory_count))
                 memory_block = format_memories(random_mems)
             elif use_live_recall:
-                recalled = await recall_memories_total(text, user_id=speaker, n_results=3)
+                recalled = await recall_memories_total(text, user_id=memory_user_id, n_results=3)
                 memory_block = format_memories(recalled)
             else:
                 memory_block = None
             turn_control.raise_if_interrupted()
             if store_input_memory:
-                await store_user_memory_main(text, user_id=speaker, source=msg_source or "chat")
+                await store_user_memory_main(text, user_id=memory_user_id, source=msg_source or "chat")
                 Logger.print(f"Added: '{text}' to user memories!")
                 _log_info(f"Stored user memory: speaker={speaker}, chars={len(text)}")
 
@@ -419,7 +476,12 @@ async def main_loop():
             llm_input = prepend_contetx(llm_input)
             llm_start = time.perf_counter()
             try:
-                response = await gen_response.send_user_text(llm_input)
+                generation = await gen_response.send_user_text(llm_input)
+                response = str(getattr(generation, "text", generation) or "").strip()
+                if not response:
+                    raise RuntimeError(
+                        f"{current_chat_model or 'LLM'} returned an empty response."
+                    )
                 turn_control.raise_if_interrupted()
                 Logger.quiet_print(response)
                 llm_ms = (time.perf_counter() - llm_start) * 1000
@@ -436,6 +498,13 @@ async def main_loop():
                     Logger.warn(f"LLM Response Filtered. Detected moderation words: {filtered_words}")
                     _log_suggestion(f"LLM response filtered. speaker={speaker}, matched={filtered_words}")
                     response = CENSOR_PLACEHOLDER
+
+            if (
+                generation is not None
+                and response != CENSOR_PLACEHOLDER
+                and not str(response or "").startswith("Error:")
+            ):
+                publish_reasoning(turn_id, generation)
 
             if allow_finetune and get_settings("enable_finetune_sampling"):
                 if cleaned_chat_pairings(text, response):
@@ -456,7 +525,7 @@ async def main_loop():
                     else:
                         await store_ai_memory_for_chatter_main(
                             response,
-                            user_id=speaker,
+                            user_id=memory_user_id,
                             source=msg_source or "chat",
                         )
                         Logger.print(f"Added: '{response}' to AI memory for {speaker}!")
@@ -470,8 +539,13 @@ async def main_loop():
                 user_text=text,
                 assistant_text=response or "",
             )
-            emotion_task: Optional[asyncio.Task] = None
-            if (response and response != CENSOR_PLACEHOLDER and not response.startswith("Error:")):
+            if (
+                is_vts_ready()
+                and _read_emotion_mode() != "off"
+                and response
+                and response != CENSOR_PLACEHOLDER
+                and not response.startswith("Error:")
+            ):
                 emotion_task = asyncio.create_task(start_emotion_inf(response))
             is_user_source = msg_source in ("manual", "stt")
             caption_source = SOURCE_USER if is_user_source else SOURCE_NARRATOR
@@ -482,39 +556,65 @@ async def main_loop():
             narrator = get_narrator()
             if narrator.is_enabled() and text and speak_input:
                 narrator_start = time.perf_counter()
+                stt_suspended = _suspend_stt_for_playback()
                 try:
                     await narrator.narrate_message(text, source=msg_source)
                     turn_control.raise_if_interrupted()
                 except Exception as e:
                     Logger.warn(f"Narration Failed: {e}")
                     _log_error(f"Narration Failed: {e}", exc_info=True)
+                finally:
+                    _resume_stt_after_playback(stt_suspended)
                 _log_perf("Narrator playback", (time.perf_counter() - narrator_start) * 1000, detail=f"speaker={speaker}, chars={len(text)}")
             if text and speak_input:
                 caption_coordinator.finish_pending()
-            should_caption_reply = (
+            should_speak_reply = bool(
                 response
                 and response != CENSOR_PLACEHOLDER
                 and not response.startswith("Error:")
             )
+            should_caption_reply = should_speak_reply
             if should_caption_reply:
                 caption_coordinator.set_pending(response, source=SOURCE_LLM)
 
-            tts_start = time.perf_counter()
-            turn_control.raise_if_interrupted()
-            playback = await gen_response.speak(response or "")
-            await _wait_for_playback(playback)
-            tts_ms = (time.perf_counter() - tts_start) * 1000
-            _log_perf("TTS route/playback", tts_ms, detail=f"{turn_detail}, response_chars={len(response or '')}")
+            if should_speak_reply:
+                tts_start = time.perf_counter()
+                turn_control.raise_if_interrupted()
+                stt_suspended = _suspend_stt_for_playback()
+                try:
+                    playback = await gen_response.speak(response)
+                    await _wait_for_playback(playback)
+                except turn_control.TurnInterrupted:
+                    raise
+                except Exception as e:
+                    Logger.warn(f"TTS Failed: {e}")
+                    _log_error(f"TTS Failed: {e}", exc_info=True)
+                finally:
+                    _resume_stt_after_playback(stt_suspended)
+                tts_ms = (time.perf_counter() - tts_start) * 1000
+                _log_perf("TTS route/playback", tts_ms, detail=f"{turn_detail}, response_chars={len(response)}")
+            else:
+                _log_info(
+                    "TTS skipped because the LLM response was empty, blocked, or an error."
+                )
             if should_caption_reply:
                 caption_coordinator.finish_pending()
             if emotion_task is not None:
                 try:
-                    await asyncio.wait_for(asyncio.shield(emotion_task), timeout=1.0)
-                except (asyncio.TimeoutError, Exception):
-                    pass
+                    await asyncio.wait_for(emotion_task, timeout=1.0)
+                except asyncio.TimeoutError:
+                    emotion_task.cancel()
+                    await asyncio.gather(emotion_task, return_exceptions=True)
+                    Logger.warn("VTS emotion inference did not finish before reset and was cancelled.")
+                except Exception as e:
+                    Logger.warn(f"VTS emotion task failed: {e}")
 
             try:
-                if _vts_manager is not None:
+                if (
+                    emotion_task is not None
+                    and is_vts_ready()
+                    and get_bool_setting("vts_emotion_reset_after_tts", default=True)
+                ):
                     reset_delay = float(get_settings("vts_emotion_reset_delay") or 0.35)
                     if reset_delay > 0:
                         await asyncio.sleep(reset_delay)
@@ -554,6 +654,9 @@ async def main_loop():
             turn_finish(msg_source, turn_id, response)
             finish_turn(resp_q, response)
         finally:
+            if emotion_task is not None and not emotion_task.done():
+                emotion_task.cancel()
+                await asyncio.gather(emotion_task, return_exceptions=True)
             _turn_active.clear()
             message_queue.task_done()
 
@@ -562,13 +665,71 @@ def thread_target():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     async_loop = loop
-    loop.run_forever()
-    async_loop = None
+    _loop_ready.set()
+    try:
+        loop.run_forever()
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        async_loop = None
 
 def start_loop():
-    global async_loop
-    t = threading.Thread(target=thread_target, daemon=True)
-    t.start()
-    while async_loop is None:
-        time.sleep(0.01)
-    asyncio.run_coroutine_threadsafe(main_loop(), async_loop)
+    global _loop_thread, _main_future
+    with _loop_lock:
+        if _loop_thread is not None and _loop_thread.is_alive() and async_loop is not None:
+            return
+        _loop_ready.clear()
+        _loop_thread = threading.Thread(target=thread_target, daemon=True)
+        _loop_thread.start()
+    if not _loop_ready.wait(timeout=5.0) or async_loop is None:
+        raise RuntimeError("Main async loop did not start within five seconds.")
+    _main_future = asyncio.run_coroutine_threadsafe(main_loop(), async_loop)
+
+
+def shutdown_vts_manager(timeout: float = 3.0) -> None:
+    manager = _vts_manager
+    loop = async_loop
+    if manager is None or loop is None or not loop.is_running():
+        return
+    if threading.current_thread() is _loop_thread:
+        asyncio.create_task(manager.close())
+        return
+    future = asyncio.run_coroutine_threadsafe(manager.close(), loop)
+    try:
+        future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        Logger.warn("Timed out while closing the VTube Studio connection.")
+    except Exception as exc:
+        Logger.warn(f"Could not close the VTube Studio connection: {exc}")
+
+
+def stop_loop(timeout: float = 3.0) -> None:
+    global _loop_thread, _main_future
+    with _loop_lock:
+        loop = async_loop
+        thread = _loop_thread
+        future = _main_future
+        _main_future = None
+    if loop is None:
+        return
+    shutdown_vts_manager(timeout=min(timeout, 3.0))
+    message_queue.put_nowait(None)
+    if future is not None and not future.done():
+        try:
+            future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+        except Exception:
+            pass
+    loop.call_soon_threadsafe(loop.stop)
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=timeout)
+    with _loop_lock:
+        if thread is None or not thread.is_alive():
+            _loop_thread = None

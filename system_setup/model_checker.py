@@ -1,5 +1,6 @@
 import subprocess
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -314,11 +315,20 @@ def download_gguf(
 ) -> Path | None:
     import urllib.request
 
-    folder   = get_model_folder(model_id.split("/")[-1])
-    dest     = folder / filename
-    if dest.exists():
+    folder = get_model_folder(model_id.split("/")[-1])
+    relative = Path(filename.replace("\\", "/"))
+    if relative.is_absolute() or ".." in relative.parts:
+        print(f"Download failed: unsafe model filename {filename!r}")
+        return None
+
+    dest = folder.joinpath(*relative.parts)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(f"{dest.name}.part")
+    if dest.is_file() and dest.stat().st_size > 0:
         print(f"Already exists: {dest}")
         return dest
+    dest.unlink(missing_ok=True)
+    partial.unlink(missing_ok=True)
     print(f"Downloading {filename} → {folder}")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "AICompanionApp/1.0"})
@@ -327,7 +337,7 @@ def download_gguf(
             downloaded = 0
             chunk_size = 1024 * 1024  # 1 MB chunks
 
-            with open(dest, "wb") as f:
+            with partial.open("wb") as f:
                 while True:
                     chunk = resp.read(chunk_size)
                     if not chunk:
@@ -337,11 +347,18 @@ def download_gguf(
                     if on_progress:
                         on_progress(downloaded, total)
 
+        if downloaded <= 0:
+            raise IOError("the server returned an empty model file")
+        if total and downloaded != total:
+            raise IOError(
+                f"incomplete model download ({downloaded} of {total} bytes)"
+            )
+
+        os.replace(partial, dest)
         print(f"Download complete: {dest}")
         return dest
 
     except Exception as e:
         print(f"Download failed: {e}")
-        if dest.exists():
-            dest.unlink()   # clean up partial file
+        partial.unlink(missing_ok=True)
         return None

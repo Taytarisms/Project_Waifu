@@ -25,3 +25,4 @@ class STTConfig:
 
     language: Optional[str] = "en"
     beam_size: int = 1
+    push_to_talk: bool = False

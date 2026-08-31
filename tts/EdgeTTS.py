@@ -1,4 +1,6 @@
 import wave
+import uuid
+import aiohttp
 import pyaudio
 import edge_tts
 from pydub import AudioSegment
@@ -11,7 +13,6 @@ configure_audio_tools()
 
 OUTPUT_DIR = tts_output_dir("edge")
 VOICE = "en-US-AvaNeural"
-OUTPUT_FILE_MP3 = OUTPUT_DIR / "edge_output.mp3"
 OUTPUT_FILE_WAV = OUTPUT_DIR / "edge_output.wav"
 
 
@@ -47,20 +48,41 @@ def PlayAudio(wav_file: str):
     stream.close()
     p.terminate()
 
-async def read_chat(message: str):
+async def read_chat(message: str) -> bool:
+    message = str(message or "").strip()
+    if not message:
+        Logger.warn("EdgeTTS skipped because the response text was empty.")
+        return False
+
+    unique = uuid.uuid4().hex
+    mp3_path = OUTPUT_DIR / f"edge_{unique}.mp3"
+    wav_path = OUTPUT_DIR / f"edge_{unique}.wav"
     try:
         if turn_control.is_interrupted():
-            return
-        communicate = edge_tts.Communicate(message, VOICE) # Communicates with Edge Servers - creating a faux "browser request" -> tts output | DOES require an internet connection!
-        await communicate.save(str(OUTPUT_FILE_MP3))
+            return False
+        # aiohttp otherwise prefers aiodns when it is installed. On some
+        # Windows configurations pycares cannot reach the configured DNS
+        # servers even though the system resolver works normally.
+        connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
+        communicate = edge_tts.Communicate(
+            message,
+            VOICE,
+            connector=connector,
+        )
+        await communicate.save(str(mp3_path))
+        if not mp3_path.exists() or mp3_path.stat().st_size < 256:
+            raise RuntimeError("EdgeTTS returned no playable audio data.")
         if turn_control.is_interrupted():
-            return
-        audio_content = AudioSegment.from_file(str(OUTPUT_FILE_MP3), format="mp3")
+            return False
+        audio_content = AudioSegment.from_file(str(mp3_path), format="mp3")
         audio_content.export(
-            str(OUTPUT_FILE_WAV),
+            str(wav_path),
             format="wav",
             parameters=["-ar", "44100", "-ac", "2"],
         )
+        if not wav_path.exists() or wav_path.stat().st_size <= 44:
+            raise RuntimeError("EdgeTTS WAV conversion produced no audio data.")
+        wav_path.replace(OUTPUT_FILE_WAV)
         Logger.print(f"Created New File: {OUTPUT_FILE_WAV}")
         try:
             from files.closed_captions import caption_coordinator
@@ -69,6 +91,14 @@ async def read_chat(message: str):
             Logger.warn(f"Caption sync error: {_e}")
 
         PlayAudio(str(OUTPUT_FILE_WAV))
+        return True
 
     except Exception as e:
-        print(f"Error in generation: {e}")
+        Logger.error(f"EdgeTTS generation failed: {e}")
+        return False
+    finally:
+        for temporary_path in (mp3_path, wav_path):
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except Exception:
+                pass

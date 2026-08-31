@@ -17,6 +17,12 @@ USER_SPEAKER = "user"
 SCOPE_GLOBAL = "global"
 SCOPE_CHATTER = "chatter"
 
+
+class MemoryOperationError(RuntimeError):
+    """Raised when a memory mutation could not be completed.
+        Better to raise an error than do nothing and break the
+        proccesses in place."""
+
 def dedupe_memory(
     text: str,
     user_id: str,
@@ -127,6 +133,7 @@ def recall_memories(
         docs = results.get("documents", [[]])
         metas = results.get("metadatas", [[]])
         dists = results.get("distances", [[]])
+        ids = results.get("ids", [[]])
         if not docs or not docs[0]:
             return []
         output: List[Dict[str, Any]] = []
@@ -151,6 +158,7 @@ def recall_memories(
                 continue
             seen.add(normalized)
             output.append({
+                "id": ids[0][i] if ids and ids[0] and i < len(ids[0]) else None,
                 "text": doc,
                 "metadata": meta,
                 "distance": dist
@@ -240,6 +248,7 @@ def random_memories(
         results = collection.get(**get_kwargs)
         docs = results.get("documents", []) or []
         metas = results.get("metadatas", []) or []
+        ids = results.get("ids", []) or []
         if not docs:
             return []
 
@@ -256,7 +265,12 @@ def random_memories(
                 continue
             seen.add(normalized)
             meta = metas[idx] if idx < len(metas) and metas[idx] else {}
-            output.append({"text": doc, "metadata": meta, "distance": None})
+            output.append({
+                "id": ids[idx] if idx < len(ids) else None,
+                "text": doc,
+                "metadata": meta,
+                "distance": None,
+            })
             if len(output) >= int(n_results or 3):
                 break
         return output
@@ -311,6 +325,116 @@ def store_ai_global_memory(
         source=source,
         tags=tags
     )
+
+def delete_memories(ids: List[str]) -> int:
+    clean = list(dict.fromkeys(
+        str(i).strip()
+        for i in (ids or [])
+        if i is not None and str(i).strip()
+    ))
+    if not clean:
+        return 0
+    try:
+        existing = collection.get(ids=clean, include=[])
+        present = existing.get("ids", []) or []
+        if not present:
+            Logger.warn("No matching memories to delete.")
+            return 0
+        collection.delete(ids=present)
+        Logger.quiet_print(f"Deleted {len(present)} memory(ies).")
+        return len(present)
+    except Exception as e:
+        Logger.error(f"Memory deletion failed: {e}")
+        raise MemoryOperationError("The memory database could not delete the selected memories.") from e
+
+
+def _deletion_filter(
+    user_id: Optional[str] = None,
+    speaker: Optional[str] = None,
+    scope: Optional[str] = None,
+    memory_type: Optional[str] = None,
+    source: Optional[str] = None,
+) -> Optional[Dict]:
+    conditions: List[Dict[str, str]] = []
+    if user_id:
+        conditions.append({"user_id": user_id})
+    if speaker:
+        conditions.append({"speaker": speaker})
+    if scope:
+        conditions.append({"scope": scope})
+    if memory_type:
+        conditions.append({"memory_type": memory_type})
+    if source:
+        conditions.append({"source": source})
+    return _build_where_filter(conditions)
+
+
+def count_memories_where(
+    user_id: Optional[str] = None,
+    speaker: Optional[str] = None,
+    scope: Optional[str] = None,
+    memory_type: Optional[str] = None,
+    source: Optional[str] = None,
+) -> int:
+    where_filter = _deletion_filter(user_id, speaker, scope, memory_type, source)
+    if not where_filter:
+        return 0
+    try:
+        found = collection.get(where=where_filter, include=[])
+        return len(found.get("ids", []) or [])
+    except Exception as e:
+        Logger.error(f"Memory count failed: {e}")
+        raise MemoryOperationError("The memory database could not count matching memories.") from e
+
+
+def delete_memories_where(
+    user_id: Optional[str] = None,
+    speaker: Optional[str] = None,
+    scope: Optional[str] = None,
+    memory_type: Optional[str] = None,
+    source: Optional[str] = None,
+) -> int:
+    where_filter = _deletion_filter(user_id, speaker, scope, memory_type, source)
+    if not where_filter:
+        Logger.warn("Refusing bulk delete with no filter; use clear_all_memories().")
+        return 0
+    try:
+        found = collection.get(where=where_filter, include=[])
+        present = found.get("ids", []) or []
+        if not present:
+            return 0
+        collection.delete(ids=present)
+        Logger.quiet_print(f"Deleted {len(present)} memory(ies) by filter.")
+        return len(present)
+    except Exception as e:
+        Logger.error(f"Bulk memory deletion failed: {e}")
+        raise MemoryOperationError("The memory database could not complete the bulk deletion.") from e
+
+
+def count_all_memories() -> int:
+    try:
+        return int(collection.count())
+    except Exception as e:
+        Logger.error(f"Memory count failed: {e}")
+        raise MemoryOperationError("The memory database could not count stored memories.") from e
+
+
+def clear_all_memories(confirm: bool = False) -> int:
+    if not confirm:
+        Logger.warn("clear_all_memories() requires confirm=True.")
+        return 0
+    try:
+        found = collection.get(include=[])
+        present = found.get("ids", []) or []
+        if not present:
+            return 0
+        collection.delete(ids=present)
+        Logger.quiet_print(f"Cleared {len(present)} memory(ies).")
+        return len(present)
+    except Exception as e:
+        Logger.error(f"Memory clear failed: {e}")
+        raise MemoryOperationError("The memory database could not clear all memories.") from e
+
 
 _MEMORY_LOCK = asyncio.Lock()
 async def run_mem_loop(func, *args, **kwargs):
@@ -555,3 +679,49 @@ async def random_memories_main(
         scope=scope,
         source=source,
     )
+
+
+async def delete_memories_main(ids: List[str]) -> int:
+    return await run_mem_loop(delete_memories, ids=ids)
+
+
+async def count_memories_where_main(
+    user_id: Optional[str] = None,
+    speaker: Optional[str] = None,
+    scope: Optional[str] = None,
+    memory_type: Optional[str] = None,
+    source: Optional[str] = None,
+) -> int:
+    return await run_mem_loop(
+        count_memories_where,
+        user_id=user_id,
+        speaker=speaker,
+        scope=scope,
+        memory_type=memory_type,
+        source=source,
+    )
+
+
+async def count_all_memories_main() -> int:
+    return await run_mem_loop(count_all_memories)
+
+
+async def delete_memories_where_main(
+    user_id: Optional[str] = None,
+    speaker: Optional[str] = None,
+    scope: Optional[str] = None,
+    memory_type: Optional[str] = None,
+    source: Optional[str] = None,
+) -> int:
+    return await run_mem_loop(
+        delete_memories_where,
+        user_id=user_id,
+        speaker=speaker,
+        scope=scope,
+        memory_type=memory_type,
+        source=source,
+    )
+
+
+async def clear_all_memories_main(confirm: bool = False) -> int:
+    return await run_mem_loop(clear_all_memories, confirm=confirm)

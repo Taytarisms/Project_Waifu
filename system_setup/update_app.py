@@ -18,10 +18,11 @@ except Exception:
     APP_VERSION = "unknown"
     PUBLIC_REPOSITORY = "Taytarisms/Project_Waifu"
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_ROOT = PROJECT_ROOT.parent
-STATE_PATH = PROJECT_ROOT / "userdata" / "update_state.json"
-BACKUP_DIR = PROJECT_ROOT / "update" / "backups"
+FILES_ROOT = Path(__file__).resolve().parents[1]
+APP_ROOT = FILES_ROOT.parent
+PROJECT_ROOT = FILES_ROOT
+STATE_PATH = FILES_ROOT / "userdata" / "update_state.json"
+BACKUP_DIR = FILES_ROOT / "update" / "backups"
 DEFAULT_BRANCH = "main"
 REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_PROTECTED_PATHS = (
@@ -29,6 +30,7 @@ DEFAULT_PROTECTED_PATHS = (
     "models/",
     "userdata/",
     "logs/",
+    ".venv/",
     "python_embeded/",
     "ffmpeg/",
     "tcl/",
@@ -36,8 +38,6 @@ DEFAULT_PROTECTED_PATHS = (
     "fine_tune/fine-tune-file.jsonl",
     "memory/chroma_data/",
     "memory/chroma_memories/",
-    "setup_log.txt",
-    "closed_captions.txt",
 )
 GENERATED_DIR_NAMES = {"__pycache__"}
 GENERATED_SUFFIXES = (".pyc", ".pyo")
@@ -49,7 +49,6 @@ IGNORED_SOURCE_PATHS = (
     "LICENSE",
     "LICENSE.md",
     "README.md",
-    "files/",
 )
 
 
@@ -83,13 +82,13 @@ def _is_protected(rel_path: str | Path, protected_paths: tuple[str, ...]) -> boo
     parts = set(rel.split("/"))
     if parts.intersection(GENERATED_DIR_NAMES) or rel.endswith(GENERATED_SUFFIXES):
         return True
-    for protected in protected_paths:
-        protected = _normalize_rel(protected)
+    for protected_entry in protected_paths:
+        is_directory = str(protected_entry).replace("\\", "/").endswith("/")
+        protected = _normalize_rel(protected_entry)
         if not protected:
             continue
-        if protected.endswith("/"):
-            base = protected.rstrip("/")
-            if rel == base or rel.startswith(base + "/"):
+        if is_directory:
+            if rel == protected or rel.startswith(protected + "/"):
                 return True
         elif rel == protected:
             return True
@@ -347,16 +346,13 @@ def _apply_actions(actions: list[dict]) -> None:
             _remove_empty_parents(target)
 
 def _venv_python() -> str:
-    win = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
-    posix = PROJECT_ROOT / ".venv" / "bin" / "python"
+    win = FILES_ROOT / ".venv" / "Scripts" / "python.exe"
     if win.is_file():
         return str(win)
-    if posix.is_file():
-        return str(posix)
     return sys.executable
 
 def _install_requirements_if_changed(before_hash: str | None) -> None:
-    requirements = PROJECT_ROOT / "requirements.txt"
+    requirements = FILES_ROOT / "requirements.txt"
     if not requirements.is_file():
         print("No requirements.txt found after update; skipping dependency install.")
         return
@@ -369,7 +365,7 @@ def _install_requirements_if_changed(before_hash: str | None) -> None:
     if python == sys.executable:
         print(
             "WARNING: app venv (.venv) not found; installing requirements into the "
-            "current interpreter (inside python_embedded). Run setup.bat to rebuild the venv if the app "
+            "current interpreter (inside python_embeded). Run setup.bat to rebuild the venv if the app "
             "fails to import its dependencies."
         )
     print(f"requirements.txt changed; installing Python dependencies with {python}")
@@ -399,7 +395,7 @@ def _installed_version(state: dict) -> str:
 
 
 def _noupdate_exists() -> bool:
-    return (APP_ROOT / ".noupdate").exists() or (PROJECT_ROOT / ".noupdate").exists()
+    return (APP_ROOT / ".noupdate").exists() or (FILES_ROOT / ".noupdate").exists()
 
 
 def _protected_paths(extra_paths: list[str] | None) -> tuple[str, ...]:
@@ -443,7 +439,7 @@ def command_update(args) -> int:
         print(f"Already on {source['version']}. Use --force to reinstall this version.")
         return 0
 
-    requirements = PROJECT_ROOT / "requirements.txt"
+    requirements = FILES_ROOT / "requirements.txt"
     before_requirements_hash = _sha256_file(requirements) if requirements.is_file() else None
 
     with tempfile.TemporaryDirectory(prefix="project_waifu_update_") as temp_dir:
@@ -486,8 +482,8 @@ def command_update(args) -> int:
 
     if args.install_deps:
         _install_requirements_if_changed(before_requirements_hash)
-    elif before_requirements_hash and (PROJECT_ROOT / "requirements.txt").is_file():
-        after_hash = _sha256_file(PROJECT_ROOT / "requirements.txt")
+    elif before_requirements_hash and (FILES_ROOT / "requirements.txt").is_file():
+        after_hash = _sha256_file(FILES_ROOT / "requirements.txt")
         if before_requirements_hash != after_hash:
             print("requirements.txt changed. Run setup.bat or rerun this updater with --install-deps.")
 

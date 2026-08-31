@@ -1,13 +1,15 @@
+from dataclasses import dataclass
 import io
-import time
-import wave
 import queue
 import threading
-from dataclasses import dataclass
 from typing import Callable, Optional
-import sounddevice as sd
+import wave
+
+import numpy as np
 from openai import OpenAI
 
+from files.speech_to_text.stt_config import STTConfig
+from files.speech_to_text.utterance_capture import SAMPLE_RATE, UtteranceCapture
 from files.system_setup.settings import get_auth
 from files.system_setup.system_logger import Logger
 
@@ -15,152 +17,180 @@ from files.system_setup.system_logger import Logger
 class OpenAIWhisperConfig:
     model: str = "gpt-4o-transcribe"
     language: str = "en"
-    sample_rate: int = 16000
-    channels: int = 1
     chunk_seconds: float = 5.0
 
 class OpenAIWhisperCore:
-    def __init__(self, input_device_index: Optional[int] = None, cfg: Optional[OpenAIWhisperConfig] = None):
+    def __init__(
+        self,
+        input_device_index: Optional[int] = None,
+        cfg: Optional[OpenAIWhisperConfig] = None,
+        capture_cfg: Optional[STTConfig] = None,
+    ) -> None:
         self.input_device_index = input_device_index
         self.cfg = cfg or OpenAIWhisperConfig()
-        self.client = OpenAI(api_key=get_auth("openai", "token"))
+        self.capture_cfg = capture_cfg or STTConfig(enable_partials=False)
+        self._api_key = str(get_auth("openai", "token") or "").strip()
+        self.client: Optional[OpenAI] = None
+        self._capture: Optional[UtteranceCapture] = None
+        self._jobs: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=4)
+        self._worker_thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._paused = threading.Event()
+        self._on_text: Optional[Callable[[str, bool], None]] = None
+        self._on_status: Optional[Callable[[str, str], None]] = None
+        self._session = 0
 
-        self.running = False
-        self.paused = False
-        self.audio_q = queue.Queue()
-        self.stream = None
-        self.worker_thread = None
-        self.on_text = None
-        self._buffer = bytearray()
-        self._buffer_lock = threading.Lock()
+    def _status(self, phase: str, detail: str = "") -> None:
+        if self._on_status:
+            try:
+                self._on_status(phase, detail)
+            except Exception:
+                pass
 
-    def start(self, on_text: Callable[[str, bool], None]):
-        if self.running:
+    def start(
+        self,
+        on_text: Callable[[str, bool], None],
+        on_status: Optional[Callable[[str, str], None]] = None,
+    ) -> None:
+        if self._worker_thread and self._worker_thread.is_alive():
             return
+        if not self._api_key:
+            raise RuntimeError("OpenAI STT requires an OpenAI API key.")
+        self.client = OpenAI(api_key=self._api_key)
+        self._on_text = on_text
+        self._on_status = on_status
+        self._stop.clear()
+        self._paused.clear()
+        self._session += 1
+        session = self._session
+        self._status("starting", f"Opening microphone for {self.cfg.model}.")
 
-        self.on_text = on_text
-        self.running = True
-        self.paused = False
-
+        self._capture = UtteranceCapture(
+            input_device_index=self.input_device_index,
+            cfg=self.capture_cfg,
+            on_final=lambda audio: self._queue_utterance(audio, session),
+        )
         try:
-            self.stream = sd.InputStream(
-                samplerate=self.cfg.sample_rate,
-                channels=self.cfg.channels,
-                dtype="int16",
-                device=self.input_device_index,
-                callback=self._audio_callback,
-            )
-            self.stream.start()
-        except Exception as e:
-            self.running = False
-            Logger.warn(
-                f"OpenAI STT failed to open input device {self.input_device_index!r}: {e}"
-            )
+            self._capture.start()
+        except Exception:
+            self._capture = None
+            self.client = None
+            self._status("failed", "Could not open the selected microphone.")
             raise
 
-        Logger.print(
-            f"OpenAI STT capturing on device {self.input_device_index!r} (model={self.cfg.model!r})"
+        self._worker_thread = threading.Thread(
+            target=self._worker,
+            args=(session,),
+            name="stt_openai_transcription",
+            daemon=True,
         )
+        self._worker_thread.start()
+        self._status("listening", f"OpenAI transcription is listening with {self.cfg.model}.")
 
-        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
-        self.worker_thread.start()
-
-    def stop(self):
-        self.running = False
-
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
-
-    def pause(self):
-        self.paused = True
-
-    def resume(self):
-        self.paused = False
-
-    def force_flush_and_pause(self):
-        self.paused = True
-        flush_bytes = b""
-        with self._buffer_lock:
-            if self._buffer:
-                flush_bytes = bytes(self._buffer)
-                self._buffer.clear()
-
-        while not self.audio_q.empty():
-            try:
-                flush_bytes += self.audio_q.get_nowait()
-            except queue.Empty:
-                break
-        if flush_bytes:
-            threading.Thread(
-                target=lambda: self._transcribe(flush_bytes),
-                daemon=True,
-            ).start()
-
-    def _audio_callback(self, indata, frames, time_info, status):
-        if not self.running or self.paused:
+    def _queue_utterance(self, audio: np.ndarray, session: int) -> None:
+        if session != self._session or self._stop.is_set():
             return
+        try:
+            self._jobs.put_nowait(audio)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._jobs.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._jobs.put_nowait(audio)
+        except queue.Full:
+            Logger.warn("OpenAI STT dropped an utterance because requests are behind.")
 
-        self.audio_q.put(bytes(indata))
-
-    def _worker(self):
-        bytes_per_second = self.cfg.sample_rate * self.cfg.channels * 2
-        target_size = int(bytes_per_second * self.cfg.chunk_seconds)
-
-        while self.running:
-            if self.paused:
-                time.sleep(0.05)
+    def _worker(self, session: int) -> None:
+        while not self._stop.is_set() and session == self._session:
+            try:
+                audio = self._jobs.get(timeout=0.1)
+            except queue.Empty:
                 continue
-            try:
-                chunk = self.audio_q.get(timeout=0.25)
-                with self._buffer_lock:
-                    self._buffer.extend(chunk)
+            if audio is None:
+                return
+            self._status("transcribing", "Uploading a completed utterance to OpenAI.")
+            text = self._transcribe(audio)
+            if text and self._on_text and session == self._session and not self._stop.is_set():
+                try:
+                    self._on_text(text, False)
+                except Exception as exc:
+                    Logger.warn(f"OpenAI STT callback failed: {exc}")
+            if text is not None and session == self._session:
+                if self._paused.is_set() and self.capture_cfg.push_to_talk:
+                    self._status("armed", "Push-to-talk is ready.")
+                elif not self._paused.is_set():
+                    self._status("listening", "OpenAI transcription is listening.")
 
-                    if len(self._buffer) >= target_size:
-                        audio_bytes = bytes(self._buffer)
-                        self._buffer.clear()
-                    else:
-                        audio_bytes = b""
-
-                if audio_bytes:
-                    try:
-                        self._transcribe(audio_bytes)
-                    except Exception as e:
-                        Logger.warn(f"OpenAI STT worker error: {e}")
-
-            except queue.Empty:
-                time.sleep(0.05)
-
-    def _transcribe(self, pcm_bytes: bytes):
-        if not pcm_bytes:
-            return
-        min_bytes = int(self.cfg.sample_rate * self.cfg.channels * 2 * 0.2)
-        if len(pcm_bytes) < min_bytes:
-            return
-
+    def _transcribe(self, pcm16: np.ndarray) -> Optional[str]:
+        client = self.client
+        if client is None or pcm16.size < SAMPLE_RATE // 5:
+            return ""
         wav_io = io.BytesIO()
-
-        with wave.open(wav_io, "wb") as wf:
-            wf.setnchannels(self.cfg.channels)
-            wf.setsampwidth(2)
-            wf.setframerate(self.cfg.sample_rate)
-            wf.writeframes(pcm_bytes)
-
+        with wave.open(wav_io, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(SAMPLE_RATE)
+            wav_file.writeframes(np.asarray(pcm16, dtype=np.int16).tobytes())
         wav_io.seek(0)
         wav_io.name = "speech.wav"
-
         try:
-            result = self.client.audio.transcriptions.create(
+            result = client.audio.transcriptions.create(
                 model=self.cfg.model,
                 file=wav_io,
                 language=self.cfg.language or None,
             )
-        except Exception as e:
-            Logger.warn(f"OpenAI STT transcription failed (model={self.cfg.model!r}): {e}")
-            return
+        except Exception as exc:
+            Logger.warn(f"OpenAI STT transcription failed (model={self.cfg.model!r}): {exc}")
+            self._status("degraded", f"OpenAI transcription failed: {exc}")
+            return None
+        return str(getattr(result, "text", "") or "").strip()
 
-        text = getattr(result, "text", "").strip()
+    def pause(self) -> None:
+        self._paused.set()
+        if self._capture:
+            self._capture.pause(discard=True)
+        self._status("paused", "Microphone capture is paused.")
 
-        if text and self.on_text:
-            self.on_text(text, False)
+    def force_flush_and_pause(self) -> None:
+        self._paused.set()
+        if self._capture:
+            self._capture.force_flush_and_pause()
+        self._status("paused", "Push-to-talk utterance queued for OpenAI.")
+
+    def resume(self) -> None:
+        self._paused.clear()
+        if self._capture:
+            self._capture.resume()
+        self._status("listening", "Microphone capture resumed.")
+
+    def stop(self) -> None:
+        self._session += 1
+        self._stop.set()
+        if self._capture:
+            self._capture.stop()
+        self._capture = None
+        try:
+            self._jobs.put_nowait(None)
+        except queue.Full:
+            try:
+                self._jobs.get_nowait()
+                self._jobs.put_nowait(None)
+            except queue.Empty:
+                pass
+        thread = self._worker_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=2.0)
+        if thread and thread.is_alive():
+            Logger.warn("An OpenAI transcription request is still winding down after stop.")
+        self._worker_thread = None
+        self.client = None
+        while True:
+            try:
+                self._jobs.get_nowait()
+            except queue.Empty:
+                break
+        self._status("stopped", "OpenAI transcription stopped.")

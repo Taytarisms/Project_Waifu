@@ -1,13 +1,29 @@
 import json
+import os
+import threading
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 
-def _write_json(path: Path, value: Any) -> None:
+_WRITE_LOCK = threading.RLock()
+
+
+def write_json_atomic(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    with _WRITE_LOCK:
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(value, handle, indent=2, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def load_json_safe(
@@ -21,7 +37,7 @@ def load_json_safe(
 
     try:
         if not path.exists() or not path.read_text(encoding="utf-8").strip():
-            _write_json(path, fallback)
+            write_json_atomic(path, fallback)
             return fallback
 
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -38,7 +54,7 @@ def load_json_safe(
         except Exception:
             pass
 
-        _write_json(path, fallback)
+        write_json_atomic(path, fallback)
         if logger:
             try:
                 logger(f"Recovered bad JSON file {path}: {exc}")

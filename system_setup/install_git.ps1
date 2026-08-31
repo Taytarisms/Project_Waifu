@@ -1,14 +1,20 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$LogPath
+    [string]$LogPath,
+    [switch]$Quiet
 )
 
 $ErrorActionPreference = "Continue"
+if ($Quiet) {
+    $ProgressPreference = "SilentlyContinue"
+}
 
 function Write-SetupLog {
     param([string]$Message)
 
-    Write-Host $Message
+    if (-not $Quiet) {
+        Write-Host $Message
+    }
     Add-Content -Path $LogPath -Value $Message -Encoding UTF8 -ErrorAction SilentlyContinue
 }
 
@@ -23,7 +29,9 @@ function Invoke-LoggedNative {
     Write-SetupLog ("Running: {0} {1}" -f $FilePath, ($Arguments -join " "))
     & $FilePath @Arguments 2>&1 | ForEach-Object {
         $line = $_.ToString()
-        Write-Host $line
+        if (-not $Quiet) {
+            Write-Host $line
+        }
         Add-Content -Path $LogPath -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
     }
     if ($null -ne $LASTEXITCODE) {

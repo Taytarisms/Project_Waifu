@@ -12,6 +12,7 @@ from files.llm.boilerplate_novel import NovelAIClient
 from files.llm.grok import grok_response
 from files.llm.claude import claude_response
 from files.llm.gemini import gemini_response
+from files.llm.generation_result import GenerationResult
 
 from files.vision.VisionContext import Backend
 from files.vision.VisionWatcher import WatchMode, InjectionResult, get_watcher
@@ -35,6 +36,64 @@ novel_tts_client: NovelTTSClient | None = None
 character: str | None = None
 device_index: int | None = None
 novelai_voice_seed: str = "Ligeia"
+
+
+class PlaybackTask(threading.Thread):
+    def __init__(self, label: str, target, *, require_success: bool = False):
+        self.label = label
+        self._playback_target = target
+        self._require_success = require_success
+        self.result = None
+        self.error: BaseException | None = None
+        safe_name = "".join(
+            character if character.isalnum() else "_" for character in label.lower()
+        ).strip("_")
+        super().__init__(
+            target=self._run_playback,
+            daemon=True,
+            name=f"tts_{safe_name or 'playback'}",
+        )
+
+    def _run_playback(self) -> None:
+        try:
+            self.result = self._playback_target()
+            if self._require_success and not self.result and not turn_control.is_interrupted():
+                raise RuntimeError(f"{self.label} did not produce playable audio.")
+        except BaseException as exc:
+            self.error = exc
+
+    def result_or_raise(self):
+        if self.is_alive():
+            raise RuntimeError(f"{self.label} playback is still running.")
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def _start_playback(label: str, target, *, require_success: bool = False) -> PlaybackTask:
+    playback = PlaybackTask(label, target, require_success=require_success)
+    playback.start()
+    return playback
+
+
+async def wait_for_playback(playback):
+    if playback is None:
+        return None
+    if not isinstance(playback, threading.Thread):
+        raise TypeError(f"Unsupported TTS playback handle: {type(playback).__name__}")
+
+    while playback.is_alive():
+        if turn_control.is_interrupted():
+            stop_tts()
+            await asyncio.to_thread(playback.join, 0.25)
+            raise turn_control.TurnInterrupted()
+        await asyncio.to_thread(playback.join, 0.1)
+
+    if turn_control.is_interrupted():
+        raise turn_control.TurnInterrupted()
+    if isinstance(playback, PlaybackTask):
+        return playback.result_or_raise()
+    return None
 
 
 def interrupt() -> None:
@@ -290,10 +349,11 @@ def local_tts_runtime(engine_key: str, identity: tuple, factory, text: str) -> N
         if isinstance(e, turn_control.TurnInterrupted):
             Logger.warn(f"Local TTS interrupted for {engine_key}.")
             stop_local_tts()
-            return
+            raise
         Logger.error(f"Local TTS route failed for {engine_key}: {e}")
         _lm_error(f"Local TTS route failed for {engine_key}: {e}", exc_info=True)
         stop_local_tts()
+        raise
 
 def _files_dir() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -339,7 +399,7 @@ def qwen3_core():
         cfg = Qwen3TTSConfig(
             model_id=get_settings("qwen3_tts_model_id") or "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
             device=get_settings("qwen3_tts_device") or "auto",
-            backend=get_settings("qwen3_tts_backend") or "faster",
+            backend=get_settings("qwen3_tts_backend") or "auto",
             speaker=get_settings("qwen3_tts_speaker") or "ryan",
             language=get_settings("qwen3_tts_language") or "English",
             instruct=get_settings("qwen3_tts_instruct") or "",
@@ -355,7 +415,11 @@ def qwen3_core():
 async def speak(text):
     global novel_tts_client, novelai_voice_seed, device_index, provider
 
-    text = text or ""
+    text = str(text or "").strip()
+    if not text:
+        Logger.warn("TTS skipped because the response text was empty.")
+        _lm_info("TTS route skipped: empty response text")
+        return None
     turn_control.raise_if_interrupted()
     engine_key, current_provider = _current_tts_engine()
     provider = current_provider
@@ -383,11 +447,10 @@ async def speak(text):
             or get_settings("eleven_voice")
             or elevenlabs_tts.voiceid
         )
-        playback_thread = threading.Thread(
-            target=lambda: elevenlabs_tts.synthesize(text, voice_id),
-            daemon=True,
+        playback_thread = _start_playback(
+            "ElevenLabs TTS",
+            lambda: elevenlabs_tts.synthesize(text, voice_id),
         )
-        playback_thread.start()
         return _return_thread(playback_thread)
 
     if engine_key == "fishspeech":
@@ -406,22 +469,18 @@ async def speak(text):
         FishTTS.CHANNELS = int(get_settings("fish_channels") or FishTTS.CHANNELS)
         FishTTS.OUTPUT_DEVICE = _as_int_or_none(get_settings("tts_output_device"))
 
-        playback_thread = threading.Thread(
-            target=lambda: asyncio.run(FishTTS.run_tts(text, fish_voice_id)),
-            daemon=True,
-        )
-        playback_thread.start()
-        return _return_thread(playback_thread)
+        await FishTTS.run_tts(text, fish_voice_id)
+        return None
 
     if engine_key == "edge":
         Logger.print("ROUTING EdgeTTS")
         _lm_info("TTS routed: EdgeTTS")
         EdgeTTS.VOICE = get_settings("edge_voice") or EdgeTTS.VOICE
-        playback_thread = threading.Thread(
-            target=lambda: asyncio.run(EdgeTTS.read_chat(text)),
-            daemon=True,
+        playback_thread = _start_playback(
+            "EdgeTTS",
+            lambda: asyncio.run(EdgeTTS.read_chat(text)),
+            require_success=True,
         )
-        playback_thread.start()
         return _return_thread(playback_thread)
 
     if engine_key == "novelai_tts":
@@ -436,6 +495,7 @@ async def speak(text):
             file_id = await novel_tts_client.generate_tts(
                 speak=text,
                 voice_seed=voice_seed,
+                version=get_settings("novel_tts_version") or "v2",
             )
             gen_ms = (time.perf_counter() - t0) * 1000
             _lm_perf(
@@ -452,30 +512,33 @@ async def speak(text):
             except Exception as _ce:
                 Logger.warn(f"Captions Error raised: {_ce}")
 
-            playback_thread = threading.Thread(
-                target=novel_tts_client.play_tts,
-                args=(file_id, _as_int_or_none(get_settings("tts_output_device")) or device_index, 10),
-                daemon=True,
+            playback_thread = _start_playback(
+                "NovelAI TTS",
+                lambda: novel_tts_client.play_tts(
+                    file_id,
+                    _as_int_or_none(get_settings("tts_output_device")) or device_index,
+                    10,
+                ),
+                require_success=True,
             )
-            playback_thread.start()
             return _return_thread(playback_thread)
         except Exception as e:
             Logger.error(f"Error during NovelAI TTS generation: {e}")
             _lm_error(f"Error during NovelAI TTS generation: {e}", exc_info=True)
-            return None
+            raise
 
     if engine_key == "openai_tts":
         Logger.print("ROUTING OpenAI TTS")
         _lm_info("TTS routed: OpenAI TTS")
-        playback_thread = threading.Thread(
-            target=lambda: openai_tts(
+        playback_thread = _start_playback(
+            "OpenAI TTS",
+            lambda: openai_tts(
                 text=text,
                 model=get_settings("openai_tts_model") or "gpt-4o-mini-tts",
                 voice=get_settings("openai_tts_voice") or "nova",
             ),
-            daemon=True,
+            require_success=True,
         )
-        playback_thread.start()
         return _return_thread(playback_thread)
 
     if engine_key == "inworld":
@@ -491,21 +554,21 @@ async def speak(text):
             inworld_model = (
                 get_settings("inworld_tts_model_id")
                 or get_settings("inworld_tts_model")
-                or "inworld-tts-1.5-mini"
+                or "inworld-tts-2"
             )
 
-            playback_thread = threading.Thread(
-                target=lambda: asyncio.run(
+            playback_thread = _start_playback(
+                "InWorld TTS",
+                lambda: asyncio.run(
                     stream_tts(inworld_api, text, inworld_voice, inworld_model)
                 ),
-                daemon=True,
+                require_success=True,
             )
-            playback_thread.start()
             return _return_thread(playback_thread)
         except Exception as e:
             Logger.warn(f"Error during InWorld TTS generation: {e}")
             _lm_error(f"Error during InWorld TTS generation: {e}", exc_info=True)
-            return None
+            raise
 
     if engine_key == "kokoro":
         Logger.print("ROUTING Kokoro Local TTS")
@@ -519,11 +582,10 @@ async def speak(text):
             get_settings("kokoro_voices_file"),
             get_settings("tts_output_device"),
         )
-        playback_thread = threading.Thread(
-            target=lambda: local_tts_runtime(engine_key, identity, kokoro_core, text),
-            daemon=True,
+        playback_thread = _start_playback(
+            "Kokoro TTS",
+            lambda: local_tts_runtime(engine_key, identity, kokoro_core, text),
         )
-        playback_thread.start()
         return _return_thread(playback_thread)
 
     if engine_key == "qwen3":
@@ -544,17 +606,16 @@ async def speak(text):
             get_settings("qwen3_tts_streaming_chunk_size"),
             get_settings("tts_output_device"),
         )
-        playback_thread = threading.Thread(
-            target=lambda: local_tts_runtime(engine_key, identity, qwen3_core, text),
-            daemon=True,
+        playback_thread = _start_playback(
+            "Qwen3 TTS",
+            lambda: local_tts_runtime(engine_key, identity, qwen3_core, text),
         )
-        playback_thread.start()
         return _return_thread(playback_thread)
 
     msg = f"Unknown TTS provider/engine: provider={current_provider!r} engine={engine_key!r}"
     Logger.warn(msg)
     _lm_error(msg)
-    return None
+    raise RuntimeError(msg)
 
 _CHAT_MODEL_TO_BACKEND = {
     "OpenAI":  Backend.CHATGPT,
@@ -652,7 +713,7 @@ async def response_novel(prompt: str) -> str:
         Logger.error(f"Error in NovelAI direct prompt generation: {exc}")
         return ""
 
-async def send_user_text(user_text: str) -> str:
+async def send_user_text(user_text: str) -> GenerationResult:
     global novel_client, chat_model
 
     current_chat_model = get_settings("chat_model") or chat_model
@@ -664,17 +725,32 @@ async def send_user_text(user_text: str) -> str:
         f"input_chars={len(user_text or '')}"
     )
     await _capture_vision_frame(current_chat_model, user_text)
+    model_setting = {
+        "OpenAI": "openai_model",
+        "Claude": "claude_model",
+        "Gemini": "gemini_model",
+        "Grok": "grok_model",
+        "NovelAI": "novel_model",
+        "Local": "local_model_filename",
+    }.get(current_chat_model, "")
+    current_model_name = get_settings(model_setting) if model_setting else ""
+
     async def _timed(label: str, coro):
         t0 = time.perf_counter()
         try:
-            result = await coro
+            raw_result = await coro
+            result = GenerationResult.from_value(
+                raw_result,
+                provider=label,
+                model=str(current_model_name or ""),
+            )
             elapsed_ms = (time.perf_counter() - t0) * 1000
             _lm_perf(
                 "LLM generation",
                 elapsed_ms,
                 detail=(
                     f"provider={label}, input_chars={len(user_text or '')}, "
-                    f"output_chars={len(result or '')}"
+                    f"output_chars={len(result.text)}"
                 ),
             )
             return result
@@ -694,12 +770,12 @@ async def send_user_text(user_text: str) -> str:
             return await _timed("OpenAI", open_response(user_text))
         except Exception as e:
             Logger.error(f"Error in OpenAI generation: {e}")
-            return ""
+            return GenerationResult(provider="OpenAI", model=str(current_model_name or ""))
 
     if current_chat_model == "NovelAI":
         Logger.quiet_print(user_text)
         api_token = get_auth("novelai", "token") or get_settings("NOVELAI_TOKEN")
-        novel_model = get_settings("NOVELAI_MODEL") or get_settings("novel_model") or "kayra"
+        novel_model = get_settings("NOVELAI_MODEL") or get_settings("novel_model") or "xialong-v1"
         if novel_client is None:
             novel_client = NovelAIClient(api_token=api_token)
             _lm_model("NovelAI client initialized")
@@ -751,7 +827,7 @@ async def send_user_text(user_text: str) -> str:
             return await _timed("Grok", grok_response(user_text))
         except Exception as e:
             Logger.error(f"Error in Grok generation: {e}")
-            return ""
+            return GenerationResult(provider="Grok", model=str(current_model_name or ""))
 
     if current_chat_model == "Gemini":
         Logger.quiet_print(user_text)
@@ -759,7 +835,7 @@ async def send_user_text(user_text: str) -> str:
             return await _timed("Gemini", gemini_response(user_text))
         except Exception as e:
             Logger.error(f"Error in Gemini generation: {e}")
-            return ""
+            return GenerationResult(provider="Gemini", model=str(current_model_name or ""))
 
     if current_chat_model == "Claude":
         Logger.quiet_print(user_text)
@@ -767,9 +843,9 @@ async def send_user_text(user_text: str) -> str:
             return await _timed("Claude", claude_response(user_text))
         except Exception as e:
             Logger.error(f"Error in Claude generation: {e}")
-            return ""
+            return GenerationResult(provider="Claude", model=str(current_model_name or ""))
 
     msg = f"LLM provider {current_chat_model!r} not recognized."
     Logger.warn(msg)
     _lm_error(msg)
-    return msg
+    return GenerationResult(text=msg, provider=str(current_chat_model or ""))

@@ -1,5 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import io
 import json
 from pathlib import Path
 import pickle
@@ -15,6 +16,25 @@ VECTORDB_MEMORY_TYPE = "w_ai_fu_long_term"
 VECTORDB_DATE_PREFIX_RE = re.compile(r"^\[[^\]\r\n]{1,32}\]\s*")
 MIN_VECTORDB_TS = 1_600_000_000_000
 MAX_VECTORDB_TS = 1_900_000_000_000
+MAX_ZIP_ENTRY_BYTES = 256 * 1024 * 1024
+
+
+class BlockedPickleContent(pickle.UnpicklingError):
+    """A database file tried to load a class or function during unpickling.
+    Legitimate vectordb2 databases contain only dicts, lists, strings, ints and
+    floats, so a global reference means the file is not w-AI-fu data
+    and is most likely a weaponized pickle...most likely
+    """
+
+class _RestrictedUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):
+        raise BlockedPickleContent(
+            f"Global object loading is disabled ({module}.{name})."
+        )
+
+
+def _safe_pickle_loads(raw: bytes) -> Any:
+    return _RestrictedUnpickler(io.BytesIO(raw)).load()
 
 @dataclass
 class WAIImportPreview:
@@ -25,6 +45,7 @@ class WAIImportPreview:
     vectordb_count: int
     character_count: int
     sample: list[str]
+    warnings: list[str] = field(default_factory=list)
 
 @dataclass
 class WAIImportResult:
@@ -37,6 +58,7 @@ class WAIImportResult:
     imported: int
     skipped: int
     failed: int
+    warnings: list[str] = field(default_factory=list)
 
 def _read_json_text(text: str, source: str) -> dict[str, Any]:
     data = json.loads(text)
@@ -51,8 +73,22 @@ def _read_zip_text(zip_path: Path, entry_name: str) -> str:
 
 def _read_zip_bytes(zip_path: Path, entry_name: str) -> bytes:
     with zipfile.ZipFile(zip_path) as archive:
+        info = archive.getinfo(entry_name)
+        if info.file_size > MAX_ZIP_ENTRY_BYTES:
+            raise ValueError(
+                f"{entry_name} declares {info.file_size / 1024 / 1024:.0f} MB "
+                f"uncompressed, above the {MAX_ZIP_ENTRY_BYTES / 1024 / 1024:.0f} MB "
+                "import limit; refusing to read it."
+            )
         with archive.open(entry_name) as handle:
-            return handle.read()
+            # Read one byte past the cap so a lying header is caught too.
+            data = handle.read(MAX_ZIP_ENTRY_BYTES + 1)
+        if len(data) > MAX_ZIP_ENTRY_BYTES:
+            raise ValueError(
+                f"{entry_name} expanded past the "
+                f"{MAX_ZIP_ENTRY_BYTES / 1024 / 1024:.0f} MB import limit."
+            )
+        return data
 
 def _find_zip_entry(zip_path: Path, suffix: str) -> str | None:
     suffix = suffix.replace("\\", "/").lower().strip("/")
@@ -436,11 +472,20 @@ def _records_from_scan(raw: bytes, source_label: str) -> list[dict[str, Any]]:
     return records
 
 
-def _extract_db(raw: bytes, source_label: str) -> list[dict[str, Any]]:
+def _extract_db(
+    raw: bytes,
+    source_label: str,
+    warnings: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    loaded = None
     try:
-        loaded = pickle.loads(raw)
+        loaded = _safe_pickle_loads(raw)
+    except BlockedPickleContent as exc:
+        if warnings is not None:
+            warnings.append(f"{source_label}: refused unsafe content ({exc})")
     except Exception:
-        loaded = None
+        # Truncated, garbage, or oversized. Fall through to the safe scanner.
+        pass
 
     if loaded is not None:
         db = loaded[0] if isinstance(loaded, list) and loaded else loaded
@@ -451,7 +496,10 @@ def _extract_db(raw: bytes, source_label: str) -> list[dict[str, Any]]:
                 pass
     return _records_from_scan(raw, source_label)
 
-def _load_db_memories(path: Path) -> tuple[list[dict[str, Any]], str]:
+def _load_db_memories(
+    path: Path,
+    warnings: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], str]:
     database_labels: list[str] = []
     memories: list[dict[str, Any]] = []
     seen = set()
@@ -459,7 +507,14 @@ def _load_db_memories(path: Path) -> tuple[list[dict[str, Any]], str]:
     if path.is_file() and path.suffix.lower() == ".zip":
         for entry in _zip_database_entries(path):
             database_labels.append(entry)
-            records = _extract_db(_read_zip_bytes(path, entry), entry)
+            try:
+                raw_entry = _read_zip_bytes(path, entry)
+            except (ValueError, OSError, KeyError, zipfile.BadZipFile) as exc:
+                # One bad entry shouldn't abort the whole import.
+                if warnings is not None:
+                    warnings.append(f"{entry}: skipped ({exc})")
+                continue
+            records = _extract_db(raw_entry, entry, warnings)
             for record in records:
                 normalized = " ".join(record["content"].lower().split())
                 if normalized in seen:
@@ -473,7 +528,7 @@ def _load_db_memories(path: Path) -> tuple[list[dict[str, Any]], str]:
                 raw = db_path.read_bytes()
             except OSError:
                 continue
-            records = _extract_db(raw, str(db_path))
+            records = _extract_db(raw, str(db_path), warnings)
             for record in records:
                 normalized = " ".join(record["content"].lower().split())
                 if normalized in seen:
@@ -487,7 +542,8 @@ def preview_import(path: str | Path) -> WAIImportPreview:
     source = Path(path)
     config, config_path, character_paths = _try_load_w_ai_fu_config(source)
     contextual_memories = _extract_contextual_memories(config)
-    vectordb_memories, database_path = _load_db_memories(source)
+    warnings: list[str] = []
+    vectordb_memories, database_path = _load_db_memories(source, warnings)
     if not config_path and not database_path:
         raise FileNotFoundError(
             "No w-AI-fu config.json or source/app/vectordb/database.txt was found."
@@ -503,13 +559,15 @@ def preview_import(path: str | Path) -> WAIImportPreview:
             item["content"]
             for item in (contextual_memories[:3] + vectordb_memories[:3])
         ],
+        warnings=warnings,
     )
 
 def import_contextual_memories(path: str | Path) -> WAIImportResult:
     source = Path(path)
     config, config_path, _character_paths = _try_load_w_ai_fu_config(source)
     contextual_memories = _extract_contextual_memories(config)
-    vectordb_memories, database_path = _load_db_memories(source)
+    warnings: list[str] = []
+    vectordb_memories, database_path = _load_db_memories(source, warnings)
     if not config_path and not database_path:
         raise FileNotFoundError(
             "No w-AI-fu config.json or source/app/vectordb/database.txt was found."
@@ -567,6 +625,7 @@ def import_contextual_memories(path: str | Path) -> WAIImportResult:
         imported=imported,
         skipped=skipped,
         failed=failed,
+        warnings=warnings,
     )
 
 import_memories = import_contextual_memories

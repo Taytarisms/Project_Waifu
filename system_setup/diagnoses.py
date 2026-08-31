@@ -32,6 +32,7 @@ PACKAGE_VERSION_NAMES = (
     ("nvidia-ml-py", ("nvidia-ml-py", "nvidia_ml_py")),
 )
 
+# This is important, if you can thing of other instances, make a PR!
 def _omp_flavor(name: str) -> str:
     n = name.lower()
     if n.startswith("libiompstubs"):
@@ -117,6 +118,7 @@ def _run_nvidia_smi(args: list[str]) -> str:
         return f"failed ({result.returncode}): {detail}"
     return (result.stdout or "").strip() or "no output"
 
+# Validating that there's no secondary processes that could create errors/freezes.
 def _print_openmp_verdict(scoped_dlls: list[Path]) -> None:
     risk_entries: list[tuple[str, str, str]] = []
     for path in scoped_dlls:

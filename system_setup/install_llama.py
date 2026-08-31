@@ -11,18 +11,17 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from gpu_compat import (  # noqa: E402
+from gpu_compat import (
     CUDA13_MIN_COMPUTE_CAPABILITY,
     detect_amd_gpu_names,
+    detect_gpu_names,
     detect_nvidia_compute_capability,
     detect_nvidia_driver_cuda_version,
-    detect_rocm_tooling,
     detect_vulkan_runtime,
     detect_vulkan_sdk,
     detect_windows_msvc_build_tools,
     format_compute_capability,
     format_gpu_names,
-    preferred_amd_gfx_target,
 )
 
 
@@ -33,8 +32,8 @@ PYPI_PACKAGE = "llama-cpp-python"
 KNOWN_FALLBACK_WHEELS = {
     "cu130": [
         "https://github.com/JamePeng/llama-cpp-python/releases/download/"
-        "v0.3.36-cu130-Basic-win-20260417/"
-        "llama_cpp_python-0.3.36+cu130.basic-cp313-cp313-win_amd64.whl"
+        "v0.3.38-cu130-Basic-win-20260504/"
+        "llama_cpp_python-0.3.38+cu130.basic-cp313-cp313-win_amd64.whl"
     ],
     "cu126": [
         "https://github.com/JamePeng/llama-cpp-python/releases/download/"
@@ -45,7 +44,7 @@ KNOWN_FALLBACK_WHEELS = {
 
 
 def _supports_driver(tier: str, driver_cuda: tuple[int, int] | None) -> bool:
-    if tier in {"cpu", "cpu-pypi", "cpu-source", "vulkan-source", "hip-source"}:
+    if tier in {"cpu", "cpu-pypi", "cpu-source", "vulkan-source"}:
         return True
     if driver_cuda is None:
         return True
@@ -62,10 +61,25 @@ def _supports_driver(tier: str, driver_cuda: tuple[int, int] | None) -> bool:
     return required is None or driver_cuda >= required
 
 
-def _candidate_tiers() -> list[str]:
+def _installed_torch_cuda_tier() -> str:
+    try:
+        import torch
+
+        version = str(getattr(getattr(torch, "version", None), "cuda", "") or "")
+        match = re.match(r"(\d+)[.](\d+)", version)
+        if match:
+            return f"cu{match.group(1)}{match.group(2)}"
+    except Exception:
+        pass
+    return ""
+
+
+def _candidate_tiers(platform_name: str | None = None) -> list[str]:
+    platform_name = platform_name or sys.platform
     cc = detect_nvidia_compute_capability()
     driver_cuda = detect_nvidia_driver_cuda_version()
     amd_gpus = detect_amd_gpu_names()
+    gpu_names = detect_gpu_names()
 
     print(f"NVIDIA compute capability: {format_compute_capability(cc)}")
     print(
@@ -76,16 +90,39 @@ def _candidate_tiers() -> list[str]:
     print(f"AMD GPU(s): {format_gpu_names(amd_gpus)}")
     print(f"Vulkan runtime detected: {'yes' if detect_vulkan_runtime() else 'no'}")
     print(f"Vulkan SDK detected: {detect_vulkan_sdk() or 'not found'}")
-    print(f"ROCm/HIP tooling detected: {'yes' if detect_rocm_tooling() else 'no'}")
 
-    if cc is None and amd_gpus:
-        preferred = ["vulkan-source", "hip-source", "cpu-pypi", "cpu-source"]
+    forced = os.environ.get("AI_COMPANION_LLAMA_BACKEND", "auto").strip().lower()
+    forced_tiers = {
+        "vulkan": "vulkan-source",
+        "metal": "metal-source",
+        "cpu": "cpu-pypi",
+    }
+    if forced != "auto":
+        selected = forced_tiers.get(forced)
+        if not selected:
+            raise ValueError(
+                "AI_COMPANION_LLAMA_BACKEND must be auto, vulkan, metal, or cpu"
+            )
+        return [selected] if selected == "cpu-pypi" else [selected, "cpu-pypi", "cpu-source"]
+
+    if platform_name == "darwin":
+        preferred = ["metal-source", "cpu-pypi", "cpu-source"]
+    elif cc is None and amd_gpus:
+        preferred = ["vulkan-source", "cpu-pypi", "cpu-source"]
+    elif cc is None and gpu_names and detect_vulkan_runtime():
+        preferred = ["vulkan-source", "cpu-pypi", "cpu-source"]
     elif cc is None:
         preferred = ["cpu-pypi", "cpu-source"]
     elif cc < CUDA13_MIN_COMPUTE_CAPABILITY:
         preferred = ["cu126", "cu124", "cu121", "cpu-pypi", "cpu-source"]
     else:
         preferred = ["cu131", "cu130", "cu128", "cu126", "cu124", "cu121", "cpu-pypi", "cpu-source"]
+
+    torch_tier = _installed_torch_cuda_tier()
+    if torch_tier in preferred:
+        preferred.remove(torch_tier)
+        preferred.insert(0, torch_tier)
+        print(f"Matching llama.cpp to installed PyTorch runtime first: {torch_tier}")
 
     return [tier for tier in preferred if _supports_driver(tier, driver_cuda)]
 
@@ -97,8 +134,6 @@ def _python_tag() -> str:
 def _platform_tag() -> str:
     if sys.platform.startswith("win"):
         return "win_amd64"
-    if sys.platform.startswith("linux"):
-        return "linux_x86_64"
     return ""
 
 
@@ -109,8 +144,6 @@ def _tier_from_text(text: str) -> str:
         return f"cu{match.group(1)}"
     if "vulkan" in lower:
         return "vulkan"
-    if "rocm" in lower or "hip" in lower:
-        return "hip"
     if "cpu" in lower and "cuda" not in lower and "cu12" not in lower and "cu13" not in lower:
         return "cpu"
     return ""
@@ -176,6 +209,11 @@ def _unique(items: Iterable[str]) -> list[str]:
     return result
 
 
+def _wheel_candidates(tier: str, discovered: dict[str, list[str]]) -> list[str]:
+    newest = discovered.get(tier, [])[:1]
+    return _unique([*newest, *KNOWN_FALLBACK_WHEELS.get(tier, [])])
+
+
 def _run_pip(args: list[str], *, env: dict[str, str] | None = None) -> int:
     cmd = [sys.executable, "-m", "pip", *args]
     print("Running:", " ".join(cmd))
@@ -202,12 +240,19 @@ def _install_build_helpers() -> int:
 def _source_env(cmake_args: str) -> dict[str, str]:
     env = os.environ.copy()
     env["FORCE_CMAKE"] = "1"
-    env["CMAKE_ARGS"] = cmake_args
+    build_scope = (
+        "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF "
+        "-DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF"
+    )
+    env["CMAKE_ARGS"] = f"{cmake_args} {build_scope}".strip()
     env.setdefault("CMAKE_BUILD_PARALLEL_LEVEL", str(max(1, (os.cpu_count() or 4) - 1)))
     vulkan_sdk = detect_vulkan_sdk()
     if vulkan_sdk:
-        bin_dir = str(Path(vulkan_sdk) / "Bin")
-        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        for dirname in ("Bin", "bin"):
+            candidate = Path(vulkan_sdk) / dirname
+            if candidate.is_dir():
+                env["PATH"] = str(candidate) + os.pathsep + env.get("PATH", "")
+                break
     return env
 
 
@@ -245,26 +290,19 @@ def _install_vulkan_source() -> int:
             )
         else:
             print("Skipping Vulkan llama-cpp-python build: Vulkan runtime/SDK not found.")
-        print("Install the Vulkan SDK from LunarG/Khronos for AMD GPU local model acceleration.")
+        print(
+            "Install Vulkan development packages (loader headers, glslc/shaderc, "
+            "and SPIR-V headers) or the LunarG SDK, then rerun setup."
+        )
         return 1
     return _install_source_backend("Vulkan llama-cpp-python build", "-DGGML_VULKAN=ON")
 
 
-def _install_hip_source() -> int:
-    if not detect_rocm_tooling():
-        print("Skipping HIP/ROCm llama-cpp-python build: ROCm/HIP tooling was not found.")
+def _install_metal_source() -> int:
+    if sys.platform != "darwin":
+        print("Skipping Metal llama-cpp-python build: Metal is only available on macOS.")
         return 1
-    cmake_args = "-DGGML_HIP=ON"
-    target = preferred_amd_gfx_target()
-    if target:
-        cmake_args = f"{cmake_args} -DAMDGPU_TARGETS={target}"
-        print(f"Using AMDGPU target: {target}")
-    else:
-        print(
-            "AMDGPU target could not be inferred. Set AI_COMPANION_AMDGPU_TARGETS "
-            "before setup if HIP compilation needs an explicit gfx target."
-        )
-    return _install_source_backend("HIP/ROCm llama-cpp-python build", cmake_args)
+    return _install_source_backend("Metal llama-cpp-python build", "-DGGML_METAL=ON")
 
 
 def _install_cpu_pypi() -> int:
@@ -282,12 +320,50 @@ def _install_cpu_source() -> int:
     return _install_source_backend("CPU llama-cpp-python build", "-DGGML_NATIVE=OFF")
 
 
-def _runtime_import_ok() -> bool:
-    code = subprocess.run(
-        [sys.executable, "-c", "from llama_cpp import Llama; print('llama_cpp import OK')"],
+def _runtime_status() -> tuple[bool, bool]:
+    probe = (
+        "import llama_cpp; "
+        "from files.system_setup.llama_runtime import load_dynamic_backends; "
+        "load_dynamic_backends(llama_cpp); "
+        "from llama_cpp import Llama; "
+        "print('OFFLOAD=' + str(bool(llama_cpp.llama_supports_gpu_offload())))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
         text=True,
-    ).returncode
-    return code == 0
+        cwd=str(SCRIPT_DIR.parents[1]),
+    )
+    output = "\n".join([result.stdout or "", result.stderr or ""])
+    if output.strip():
+        print(output.strip())
+    return result.returncode == 0, "OFFLOAD=True" in output
+
+
+def _runtime_import_ok() -> bool:
+    imported, _ = _runtime_status()
+    return imported
+
+
+def _finish_backend(label: str, code: int, *, expect_gpu: bool = False) -> bool:
+    if code != 0:
+        return False
+    imported, gpu_offload = _runtime_status()
+    if not imported:
+        print(
+            f"{label}: install reported success but 'import llama_cpp' failed "
+            "(missing runtime/DLLs, incompatible build, or wrong GPU target); "
+            "trying the next option."
+        )
+        return False
+    if expect_gpu and not gpu_offload:
+        print(
+            f"{label}: install completed, but llama_cpp reports no usable GPU "
+            "offload backend. Trying the next option."
+        )
+        return False
+    print(f"Runtime installed with {label}.")
+    return True
 
 
 def main() -> int:
@@ -301,36 +377,29 @@ def main() -> int:
     for tier in tiers:
         if tier == "vulkan-source":
             print("Trying runtime: vulkan-source")
-            if _install_vulkan_source() == 0 and _runtime_import_ok():
-                print("Runtime installed with Vulkan.")
+            if _finish_backend("Vulkan", _install_vulkan_source(), expect_gpu=True):
                 return 0
             continue
 
-        if tier == "hip-source":
-            print("Trying runtime: hip-source")
-            if _install_hip_source() == 0 and _runtime_import_ok():
-                print("Runtime installed with HIP/ROCm.")
+        if tier == "metal-source":
+            print("Trying runtime: metal-source")
+            if _finish_backend("Metal", _install_metal_source(), expect_gpu=True):
                 return 0
             continue
 
         if tier == "cpu-pypi":
             print("Trying runtime: cpu-pypi")
-            if _install_cpu_pypi() == 0 and _runtime_import_ok():
-                print("Runtime installed with CPU/PyPI.")
+            if _finish_backend("CPU/PyPI", _install_cpu_pypi()):
                 return 0
             continue
 
         if tier == "cpu-source":
             print("Trying runtime: cpu-source")
-            if _install_cpu_source() == 0 and _runtime_import_ok():
-                print("Runtime installed with CPU/source.")
+            if _finish_backend("CPU/source", _install_cpu_source()):
                 return 0
             continue
 
-        urls = _unique([
-            *discovered.get(tier, []),
-            *KNOWN_FALLBACK_WHEELS.get(tier, []),
-        ])
+        urls = _wheel_candidates(tier, discovered)
         if not urls:
             print(f"No appropriate wheel found for {tier}.")
             continue
@@ -338,10 +407,19 @@ def main() -> int:
         for url in urls:
             print(f"Trying runtime: {tier}")
             code = _install_url(url)
-            if code == 0 and _runtime_import_ok():
-                print(f"Runtime installed with {tier}.")
-                return 0
-            print(f"Installation failed with exit code {code}: {url}")
+            if code != 0:
+                print(f"Installation failed with exit code {code}: {url}")
+                continue
+            imported, gpu_offload = _runtime_status()
+            if not imported or not gpu_offload:
+                print(
+                    f"{tier}: wheel installed but no usable GPU backend loaded "
+                    "(missing runtime libraries, incompatible driver, or wrong build); "
+                    f"trying the next option: {url}"
+                )
+                continue
+            print(f"Runtime installed with {tier}.")
+            return 0
 
     print("ERROR: No compatible llama-cpp-python wheel/build could be installed.")
     if detect_amd_gpu_names():

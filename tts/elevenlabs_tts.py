@@ -9,6 +9,7 @@ import requests
 from pydub import AudioSegment
 
 from files.system_setup.audio_tools import configure_audio_tools, tts_output_dir
+from files.provider_capabilities import elevenlabs_v3
 from files.system_setup.settings import get_auth, get_settings
 from files.system_setup.system_logger import Logger
 from files.main_loop import turn_control
@@ -29,6 +30,35 @@ def _resolve_api_key() -> str:
     return _eleven_key
 
 
+def _number_setting(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(get_settings(name))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _build_payload(text: str) -> dict:
+    model = get_settings("eleven_model_id") or "eleven_v3"
+    voice_settings = {
+        "stability": _number_setting("eleven_stability", 0.5, 0.0, 1.0),
+        "style": _number_setting("eleven_style", 0.0, 0.0, 1.0),
+        "speed": _number_setting("eleven_speed", 1.0, 0.7, 1.2),
+    }
+    if not elevenlabs_v3(model):
+        voice_settings["similarity_boost"] = _number_setting(
+            "eleven_similarity", 0.75, 0.0, 1.0
+        )
+        voice_settings["use_speaker_boost"] = bool(
+            get_settings("eleven_speaker_boost")
+        )
+    return {
+        "text": text,
+        "model_id": model,
+        "voice_settings": voice_settings,
+    }
+
+
 def synthesize(text, voiceid=None):
     turn_control.raise_if_interrupted()
     api_key = _resolve_api_key()
@@ -47,16 +77,15 @@ def synthesize(text, voiceid=None):
         "xi-api-key": api_key,
         "Content-Type": "application/json",
     }
-    data = {
-        "text": text,
-        "model_id": get_settings("eleven_model_id"),
-        "voice_settings": {
-            "stability": 0.75,
-            "similarity": 0.75,
-        },
-    }
+    data = _build_payload(text)
     print(f"Sending a POST request to: {url}")
-    response = requests.post(url, headers=headers, json=data, stream=True)
+    response = requests.post(
+        url,
+        headers=headers,
+        json=data,
+        stream=True,
+        timeout=(10, 120),
+    )
     turn_control.raise_if_interrupted()
     print(response)
     if response.status_code != 200:

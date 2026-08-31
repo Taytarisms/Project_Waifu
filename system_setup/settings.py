@@ -1,6 +1,9 @@
 import json
+import os
+import threading
 import traceback
 from copy import deepcopy
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from files.system_setup.json_utils import load_json_safe
@@ -17,10 +20,20 @@ CONFIG_FILES = {
     "app": USERDATA_DIR / "app.json",
     "stt": USERDATA_DIR / "stt.json",
     "twitch": USERDATA_DIR / "twitch.json",
+    "stream_chat": USERDATA_DIR / "stream_chat.json",
 }
 
 settings: dict[str, Any] = {}
 sections: dict[str, dict[str, Any]] = {}
+_SETTINGS_LOCK = threading.RLock()
+
+
+def _synchronized(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        with _SETTINGS_LOCK:
+            return function(*args, **kwargs)
+    return wrapper
 
 KEY_ROUTES = {'NOVELAI_TOKEN': 'auth',
  'NOVELAI_USERNAME': 'auth',
@@ -39,6 +52,7 @@ KEY_ROUTES = {'NOVELAI_TOKEN': 'auth',
  'openai_presence_penalty': 'llm',
  'openai_frequency_penalty': 'llm',
  'openai_stop': 'llm',
+ 'openai_reasoning_effort': 'llm',
  'novel_model': 'llm',
  'NOVELAI_MODEL': 'llm',
  'novel_temperature': 'llm',
@@ -56,14 +70,17 @@ KEY_ROUTES = {'NOVELAI_TOKEN': 'auth',
  'claude_max_tokens': 'llm',
  'claude_top_p': 'llm',
  'claude_top_k': 'llm',
+ 'claude_thinking_effort': 'llm',
  'gemini_model': 'llm',
  'gemini_temperature': 'llm',
  'gemini_max_tokens': 'llm',
  'gemini_top_p': 'llm',
  'gemini_top_k': 'llm',
+ 'gemini_thinking_level': 'llm',
  'grok_model': 'llm',
  'grok_temperature': 'llm',
  'grok_max_tokens': 'llm',
+ 'grok_reasoning_effort': 'llm',
  'local_model_filename': 'llm',
  'local_model_family': 'llm',
  'local_mmproj_filename': 'llm',
@@ -178,7 +195,7 @@ KEY_ROUTES = {'NOVELAI_TOKEN': 'auth',
  'enable_vts': 'app',
  'enable_vts_idle_animation': 'app',
  'enable_vts_emotion_inference': 'app',
- 'vts_emotion_inference_default_on': 'app',
+ 'vts_emotion_mode': 'app',
  'vts_idle_await_response': 'app',
  'vts_idle_fps': 'app',
  'vts_emotion_reset_delay': 'app',
@@ -195,6 +212,12 @@ KEY_ROUTES = {'NOVELAI_TOKEN': 'auth',
  'stt_google_adjust_ambient': 'stt',
  'stt_google_energy_threshold': 'stt',
  'stt_device_index': 'stt',
+ 'stt_device_selection_mode': 'stt',
+ 'stt_device_id': 'stt',
+ 'stt_device_name': 'stt',
+ 'stt_device_host_api': 'stt',
+ 'stt_device_preferred_patterns': 'stt',
+ 'stt_pause_during_playback': 'stt',
  'stt_model_name': 'stt',
  'stt_device': 'stt',
  'stt_compute_type': 'stt',
@@ -204,10 +227,27 @@ KEY_ROUTES = {'NOVELAI_TOKEN': 'auth',
  'stt_post_speech_ms': 'stt',
  'stt_segment_max_ms': 'stt',
  'stt_min_length_ms': 'stt',
+ 'stt_partial_interval_ms': 'stt',
+ 'stt_beam_size': 'stt',
  'stt_enable_partials': 'stt',
  'TWITCH_POLICY': 'twitch',
  'TWITCH_PAUSED': 'twitch',
- 'TWITCH_IGNORED_PREFIXES': 'twitch'}
+ 'TWITCH_IGNORED_PREFIXES': 'twitch',
+ 'STREAM_CHAT_POLICY': 'stream_chat',
+ 'STREAM_CHAT_PAUSED': 'stream_chat',
+ 'STREAM_CHAT_IGNORE_COMMANDS': 'stream_chat',
+ 'STREAM_CHAT_IGNORED_PREFIXES': 'stream_chat',
+ 'STREAM_CHAT_ENABLED_PROVIDERS': 'stream_chat',
+ 'STREAM_CHAT_KEEP_LAST': 'stream_chat',
+ 'STREAM_CHAT_GLOBAL_BACKLOG': 'stream_chat',
+ 'STREAM_CHAT_PROVIDER_BACKLOG': 'stream_chat',
+ 'STREAM_CHAT_MIGRATED_FROM_TWITCH': 'stream_chat',
+ 'YOUTUBE_AUTO_CONNECT': 'stream_chat',
+ 'YOUTUBE_AUTO_MONITOR': 'stream_chat',
+ 'YOUTUBE_VIDEO_ID': 'stream_chat',
+ 'KICK_AUTO_CONNECT': 'stream_chat',
+ 'KICK_CHANNEL_SLUG': 'stream_chat',
+ 'KICK_WEBHOOK_URL': 'stream_chat'}
 
 DEFAULTS = {'auth': {'novelai': {'username': '', 'token': ''},
           'openai': {'token': ''},
@@ -226,16 +266,39 @@ DEFAULTS = {'auth': {'novelai': {'username': '', 'token': ''},
                      'client_secret': '',
                      'bot_id': '',
                      'owner_id': ''},
+          'youtube': {'client_id': '',
+                      'client_secret': '',
+                      'access_token': '',
+                      'refresh_token': '',
+                      'token_expires_at': 0,
+                      'channel_id': '',
+                      'channel_name': '',
+                      'bot_access_token': '',
+                      'bot_refresh_token': '',
+                      'bot_channel_id': '',
+                      'bot_channel_name': ''},
+          'kick': {'client_id': '',
+                   'client_secret': '',
+                   'access_token': '',
+                   'refresh_token': '',
+                   'token_expires_at': 0,
+                   'broadcaster_user_id': '',
+                   'broadcaster_name': '',
+                   'bot_access_token': '',
+                   'bot_refresh_token': '',
+                   'bot_user_id': '',
+                   'bot_name': ''},
           'username': {'user': ''}},
  'llm': {'chat_model': '',
-         'openai_model': '',
+         'openai_model': 'gpt-5.6-luna',
          'openai_temperature': 0.0,
          'openai_max_tokens': 512,
          'openai_top_p': 1.0,
          'openai_presence_penalty': 0.0,
          'openai_frequency_penalty': 0.0,
          'openai_stop': '',
-         'novel_model': 'kayra',
+         'openai_reasoning_effort': 'medium',
+         'novel_model': 'xialong-v1',
          'NOVELAI_MODEL': 'kayra',
          'novel_temperature': 0.8,
          'novel_max_tokens': 512,
@@ -252,14 +315,17 @@ DEFAULTS = {'auth': {'novelai': {'username': '', 'token': ''},
          'claude_max_tokens': 1024,
          'claude_top_p': 1.0,
          'claude_top_k': 0,
+         'claude_thinking_effort': 'medium',
          'gemini_model': 'gemini-2.5-flash',
          'gemini_temperature': 1.0,
          'gemini_max_tokens': 1024,
          'gemini_top_p': 1.0,
          'gemini_top_k': 0,
-         'grok_model': 'grok-4.3',
+         'gemini_thinking_level': 'medium',
+         'grok_model': 'grok-4.5',
          'grok_temperature': 1.0,
          'grok_max_tokens': 1024,
+         'grok_reasoning_effort': 'medium',
          'local_model_filename': '',
          'local_model_family': 'auto',
          'local_mmproj_filename': '',
@@ -324,9 +390,9 @@ DEFAULTS = {'auth': {'novelai': {'username': '', 'token': ''},
          'openai_tts_speed': 1.0,
          'openai_tts_instructions': '',
          'inworld_tts_voice': 'Ashley',
-         'inworld_tts_model': 'inworld-tts-1.5-mini',
+         'inworld_tts_model': 'inworld-tts-2',
          'inworld_tts_voice_id': 'Ashley',
-         'inworld_tts_model_id': 'inworld-tts-1.5-mini',
+         'inworld_tts_model_id': 'inworld-tts-2',
          'inworld_tts_audio_encoding': 'MP3',
          'inworld_tts_sample_rate': 24000,
          'inworld_tts_bit_rate': 32000,
@@ -335,14 +401,14 @@ DEFAULTS = {'auth': {'novelai': {'username': '', 'token': ''},
          'inworld_tts_temperature': 1.0,
          'inworld_tts_apply_text_normalization': True,
          'inworld_tts_timestamp_type': 'NONE',
-         'inworld_tts_warmup': True,
+         'inworld_tts_warmup': False,
          'kokoro_voice': 'af_heart',
          'kokoro_speed': 1.0,
          'kokoro_model_file': 'kokoro-v1.0.onnx',
          'kokoro_voices_file': 'voices-v1.0.bin',
          'qwen3_tts_preset': '',
          'qwen3_tts_model_id': 'Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice',
-         'qwen3_tts_backend': 'faster',
+         'qwen3_tts_backend': 'auto',
          'qwen3_tts_device': 'auto',
          'qwen3_tts_speaker': 'ryan',
          'qwen3_tts_language': 'English',
@@ -371,10 +437,10 @@ DEFAULTS = {'auth': {'novelai': {'username': '', 'token': ''},
          'captions_file_path': '',
          'reminder_state': False,
          'enable_finetune_sampling': False,
-         'enable_vts': True,
-         'enable_vts_idle_animation': True,
-         'enable_vts_emotion_inference': True,
-         'vts_emotion_inference_default_on': True,
+         'enable_vts': False,
+         'enable_vts_idle_animation': False,
+         'enable_vts_emotion_inference': False,
+         'vts_emotion_mode': 'heuristic',
          'vts_idle_await_response': True,
          'vts_idle_fps': 10,
          'vts_emotion_reset_delay': 0.35,
@@ -391,6 +457,12 @@ DEFAULTS = {'auth': {'novelai': {'username': '', 'token': ''},
          'stt_google_adjust_ambient': True,
          'stt_google_energy_threshold': '',
          'stt_device_index': '',
+         'stt_device_selection_mode': 'automatic',
+         'stt_device_id': '',
+         'stt_device_name': '',
+         'stt_device_host_api': '',
+         'stt_device_preferred_patterns': 'CABLE Output\nVB-Audio',
+         'stt_pause_during_playback': True,
          'stt_model_name': 'tiny',
          'stt_device': 'cuda',
          'stt_compute_type': 'float16',
@@ -400,10 +472,27 @@ DEFAULTS = {'auth': {'novelai': {'username': '', 'token': ''},
          'stt_post_speech_ms': 600,
          'stt_segment_max_ms': 15000,
          'stt_min_length_ms': 1000,
+         'stt_partial_interval_ms': 500,
+         'stt_beam_size': 1,
          'stt_enable_partials': True},
  'twitch': {'TWITCH_POLICY': 'latest-buffered',
             'TWITCH_PAUSED': False,
-            'TWITCH_IGNORED_PREFIXES': ''}}
+            'TWITCH_IGNORED_PREFIXES': ''},
+ 'stream_chat': {'STREAM_CHAT_POLICY': 'latest-buffered',
+                 'STREAM_CHAT_PAUSED': False,
+                 'STREAM_CHAT_IGNORE_COMMANDS': False,
+                 'STREAM_CHAT_IGNORED_PREFIXES': '',
+                 'STREAM_CHAT_ENABLED_PROVIDERS': ['twitch'],
+                 'STREAM_CHAT_KEEP_LAST': 4,
+                 'STREAM_CHAT_GLOBAL_BACKLOG': 100,
+                 'STREAM_CHAT_PROVIDER_BACKLOG': 40,
+                 'STREAM_CHAT_MIGRATED_FROM_TWITCH': False,
+                 'YOUTUBE_AUTO_CONNECT': False,
+                 'YOUTUBE_AUTO_MONITOR': True,
+                 'YOUTUBE_VIDEO_ID': '',
+                 'KICK_AUTO_CONNECT': False,
+                 'KICK_CHANNEL_SLUG': '',
+                 'KICK_WEBHOOK_URL': ''}}
 
 AUTH_ALIASES = {'NOVELAI_USERNAME': ('novelai', 'username'),
  'NOVELAI_TOKEN': ('novelai', 'token'),
@@ -428,10 +517,20 @@ def _read_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     return load_json_safe(path, default, dict, logger=print)
 
 
+@_synchronized
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with temporary.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _merge_defaults(data: dict[str, Any], default: dict[str, Any]) -> bool:
@@ -450,6 +549,7 @@ def _merge_defaults(data: dict[str, Any], default: dict[str, Any]) -> bool:
     return changed
 
 
+@_synchronized
 def load_settings() -> None:
     global sections
     try:
@@ -464,10 +564,30 @@ def load_settings() -> None:
 
             sections[section] = data
 
+        _migrate_stream_chat_settings()
         _merge_sections()
     except Exception:
         print("Unexpected error loading settings:")
         print(traceback.format_exc())
+
+
+def _migrate_stream_chat_settings() -> None:
+    stream = sections.get("stream_chat", {})
+    twitch = sections.get("twitch", {})
+    if not isinstance(stream, dict) or not isinstance(twitch, dict):
+        return
+    if stream.get("STREAM_CHAT_MIGRATED_FROM_TWITCH"):
+        return
+    mappings = {
+        "STREAM_CHAT_POLICY": "TWITCH_POLICY",
+        "STREAM_CHAT_PAUSED": "TWITCH_PAUSED",
+        "STREAM_CHAT_IGNORED_PREFIXES": "TWITCH_IGNORED_PREFIXES",
+    }
+    for target, source in mappings.items():
+        if source in twitch:
+            stream[target] = deepcopy(twitch[source])
+    stream["STREAM_CHAT_MIGRATED_FROM_TWITCH"] = True
+    _write_json(CONFIG_FILES["stream_chat"], stream)
 
 
 def _merge_sections() -> None:
@@ -498,6 +618,7 @@ def _merge_sections() -> None:
         if canonical in settings:
             settings[alias] = settings[canonical]
 
+@_synchronized
 def save_settings(key: str, value: Any) -> None:
     try:
         if not sections:
@@ -525,6 +646,7 @@ def save_settings(key: str, value: Any) -> None:
 def reload_settings() -> None:
     load_settings()
 
+@_synchronized
 def cleanup_misplaced_settings() -> None:
     if not sections:
         load_settings()
@@ -563,6 +685,7 @@ def get_bool_setting(key: str, default: bool = False) -> bool:
     return default
 
 
+@_synchronized
 def get_settings(key: str) -> Any:
     try:
         if not sections:
@@ -587,6 +710,7 @@ def get_settings(key: str) -> Any:
         print(traceback.format_exc())
         return ""
 
+@_synchronized
 def save_auth(group: str, key: str, value: Any) -> None:
     try:
         if not sections:
@@ -601,6 +725,7 @@ def save_auth(group: str, key: str, value: Any) -> None:
         print(traceback.format_exc())
 
 
+@_synchronized
 def get_auth(group: str, key: str) -> Any:
     try:
         if not sections:
