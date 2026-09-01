@@ -5,9 +5,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from files.system_setup.settings import get_auth
+from files.provider_capabilities import (
+    GEMINI_CHAT_MODELS,
+    gemini_supports_sampling,
+    normalize_gemini_model,
+)
+from files.system_setup.settings import get_auth, get_settings
 from files.system_setup.system_logger import Logger
 from files.vision.VisionWatcher import get_watcher
+from files.llm.generation_result import GenerationResult
 
 _client = None
 message_log: List[Dict[str, Any]] = []
@@ -16,16 +22,7 @@ _system_prompt_loaded = False
 _system_prompt_mtime: float | None = None
 SYSTEM_MESSAGE_FILE = Path(__file__).with_name("system_message_gemini.txt")
 
-AVAILABLE_MODELS = [
-    "gemini-3.1-pro",
-    "gemini-3-flash",
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-]
+AVAILABLE_MODELS = GEMINI_CHAT_MODELS
 
 
 class Parameters:
@@ -35,20 +32,72 @@ class Parameters:
         self.temperature: float   = 1.0
         self.top_p: float         = 1.0
         self.top_k: Optional[int] = None
+        self.thinking_level: str  = "medium"
         self.system: Optional[str]= None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
             "model":       self.model,
             "max_tokens":  self.max_tokens,
-            "temperature": self.temperature,
-            "top_p":       self.top_p,
+            "thinking_level": self.thinking_level,
         }
-        if self.top_k is not None:
-            d["top_k"] = self.top_k
+        if gemini_supports_sampling(self.model):
+            d["temperature"] = self.temperature
+            d["top_p"] = self.top_p
+            if self.top_k is not None:
+                d["top_k"] = self.top_k
         if self.system:
             d["system"] = self.system
         return d
+
+
+def build_gemini_params(settings: dict | None = None) -> Dict[str, Any]:
+    if settings is not None:
+        params = dict(settings)
+    else:
+        def saved(name, default):
+            value = get_settings(name)
+            return default if value in ("", None) else value
+        params = {
+            "model": saved("gemini_model", "gemini-2.5-flash"),
+            "max_tokens": int(saved("gemini_max_tokens", 1024)),
+            "temperature": float(saved("gemini_temperature", 1.0)),
+            "top_p": float(saved("gemini_top_p", 1.0)),
+            "top_k": int(saved("gemini_top_k", 0)),
+            "thinking_level": saved("gemini_thinking_level", "medium"),
+        }
+    params.setdefault("model", "gemini-2.5-flash")
+    params.setdefault("max_tokens", 1024)
+    params["model"] = normalize_gemini_model(params["model"])
+    return params
+
+
+def build_gemini_config(params: dict, system_prompt: str = "") -> Dict[str, Any]:
+    model = str(params.get("model") or "gemini-2.5-flash")
+    config: Dict[str, Any] = {
+        "max_output_tokens": int(params.get("max_tokens") or 1024),
+    }
+    if gemini_supports_sampling(model):
+        config["temperature"] = float(params.get("temperature", 1.0))
+        config["top_p"] = float(params.get("top_p", 1.0))
+        top_k = int(params.get("top_k") or 0)
+        if top_k > 0:
+            config["top_k"] = top_k
+    thinking_config: Dict[str, Any] = {"include_thoughts": True}
+    if model.lower().startswith("gemini-3"):
+        level = str(params.get("thinking_level") or "medium").strip().lower()
+        if level not in {"minimal", "low", "medium", "high"}:
+            level = "medium"
+        if level == "minimal" and model.lower().startswith(
+            ("gemini-3.7-", "gemini-3.1-pro")
+        ):
+            level = "low"
+        thinking_config["thinking_level"] = level
+    config["thinking_config"] = thinking_config
+    explicit_system = params.get("system")
+    if explicit_system or system_prompt:
+        config["system_instruction"] = explicit_system or system_prompt
+    return config
 
 
 def _get_client():
@@ -60,7 +109,7 @@ def _get_client():
         raise RuntimeError(
             "No Google API key found. Add your key in Settings → LLM → Gemini."
         )
-    from google import genai  # lazy import
+    from google import genai  # lazy import cause lazy
     _client = genai.Client(api_key=api_key)
     return _client
 
@@ -112,15 +161,16 @@ def reload_system_message(force: bool = True) -> None:
     _system_prompt_mtime = mtime
 
 
-async def gemini_response(user_text: str, settings: dict = None) -> str:
+async def gemini_response(user_text: str, settings: dict = None) -> GenerationResult:
     global message_log, _system_prompt
     reload_system_message(force=False)
-    params = settings or Parameters().to_dict()
-    contents: List[Dict[str, Any]] = []
-    for msg in message_log:
-        role = "user" if msg["role"] == "user" else "model"
-        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-    contents.append({"role": "user", "parts": [{"text": user_text}]})
+    params = build_gemini_params(settings)
+    contents: List[Any] = list(message_log)
+    current_user_content: Dict[str, Any] = {
+        "role": "user",
+        "parts": [{"text": user_text}],
+    }
+    contents.append(current_user_content)
     watcher = get_watcher()
     injection = getattr(watcher, "last_injection", None)
     if injection and injection.vision_active:
@@ -130,24 +180,20 @@ async def gemini_response(user_text: str, settings: dict = None) -> str:
                 vision_parts.append({"text": block["text"]})
             elif "inline_data" in block:
                 vision_parts.append(block)
-        contents[-1] = {"role": "user", "parts": vision_parts}
+        current_user_content = {"role": "user", "parts": vision_parts}
+        contents[-1] = current_user_content
 
     try:
         client = _get_client()
     except RuntimeError as e:
         Logger.error(str(e))
-        return ""
+        return GenerationResult(provider="Gemini", model=str(params.get("model") or ""))
 
     from google import genai
     from google.genai.errors import APIError
 
     gen_config = genai.types.GenerateContentConfig(
-        max_output_tokens = params.get("max_tokens",  1024),
-        temperature       = params.get("temperature", 1.0),
-        top_p             = params.get("top_p",       1.0),
-        **({"top_k": params["top_k"]} if params.get("top_k") else {}),
-        **({"system_instruction": params["system"]} if params.get("system")
-           else ({"system_instruction": _system_prompt} if _system_prompt else {})),
+        **build_gemini_config(params, _system_prompt)
     )
     t0 = time.perf_counter()
     try:
@@ -159,13 +205,27 @@ async def gemini_response(user_text: str, settings: dict = None) -> str:
     except APIError as e:
         Logger.error(f"Gemini API error: {e.message}")
         print(traceback.format_exc())
-        return ""
+        return GenerationResult(provider="Gemini", model=str(params.get("model") or ""))
     except Exception as e:
         Logger.error(f"Error in Gemini LLM Generation: {e}")
         print(traceback.format_exc())
-        return ""
+        return GenerationResult(provider="Gemini", model=str(params.get("model") or ""))
     t1    = time.perf_counter()
-    text  = response.text
+    answer_parts: List[str] = []
+    thought_parts: List[str] = []
+    candidate_content = None
+    if getattr(response, "candidates", None):
+        candidate_content = getattr(response.candidates[0], "content", None)
+    for part in getattr(candidate_content, "parts", None) or []:
+        part_text = str(getattr(part, "text", "") or "").strip()
+        if not part_text:
+            continue
+        if bool(getattr(part, "thought", False)):
+            thought_parts.append(part_text)
+        else:
+            answer_parts.append(part_text)
+    text = "\n\n".join(answer_parts).strip() or str(response.text or "").strip()
+    reasoning = "\n\n".join(thought_parts).strip()
     usage = getattr(response, "usage_metadata", None)
     in_tok  = getattr(usage, "prompt_token_count",     "?") if usage else "?"
     out_tok = getattr(usage, "candidates_token_count", "?") if usage else "?"
@@ -176,7 +236,18 @@ async def gemini_response(user_text: str, settings: dict = None) -> str:
         f"characters={len(text)}"
     )
     Logger.quiet_print(text)
-    message_log.append({"role": "user",      "content": user_text})
-    message_log.append({"role": "assistant", "content": text})
+    message_log.append(current_user_content)
+    if candidate_content is not None:
+        # Keep Google's thought signatures intact for the next turn.
+        message_log.append(candidate_content)
+    else:
+        message_log.append({"role": "model", "parts": [{"text": text}]})
 
-    return text
+    return GenerationResult(
+        text=text,
+        reasoning=reasoning,
+        reasoning_kind="provider_summary" if reasoning else "none",
+        provider="Gemini",
+        model=str(params.get("model") or ""),
+        usage={"input_tokens": in_tok, "output_tokens": out_tok},
+    )

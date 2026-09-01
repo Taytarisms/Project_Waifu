@@ -47,7 +47,7 @@ PROJECT_ROOT  = Path(__file__).resolve().parent.parent
 CHARACTER_DIR = PROJECT_ROOT / "characters"
 DEFAULT_CHARACTER = "Abby"
 
-NAI_OA_MODELS = {"xialong-v1"}
+NAI_OA_MODELS = {"xialong-v1", "glm-4-6"}
 NAI_LEGACY_MODELS = {"kayra", "erato", "clio"}
 
 HistoryEntry = Dict[str, str]
@@ -64,6 +64,9 @@ _TEMPLATE_LEAK_PATTERNS = [
 ]
 
 # Cause Novel does this cute thing where it prints the template sometimes so we gotta block that out!
+# Also, if you need it, the API docs are here: https://docs.novelai.net/en/scripting/api-reference
+# Source API GH: https://github.com/Aedial/novelai-api
+
 _PROMPT_LEAK_CUT_PATTERNS = [
     r"\[ ?user\b",
     r"\[ ?assistant\b",
@@ -477,28 +480,14 @@ class NovelAIClient:
         user_text = extract_latest_user_message(str(custom_prompt))
         history = self.get_history()
 
-        if model_key == "xialong-v1":
-            if await self.can_use_xialong():
-                reply = await self.generate_openai_compatible(
-                    user_text=user_text,
-                    parameters=parameters,
-                    model_name=model_key,
-                    system_text=system_text,
-                    history=history,
-                )
-            else:
-                prompt = format_kayra_instruction(
-                    user_text,
-                    character_name,
-                    history=history,
-                    user_name=user_name,
-                )
-                reply = await self.generate_prompt_completion(
-                    prompt,
-                    parameters,
-                    character=display_name,
-                    route=route,
-                )
+        if model_key in NAI_OA_MODELS:
+            reply = await self.generate_openai_compatible(
+                user_text=user_text,
+                parameters=parameters,
+                model_name=model_key,
+                system_text=system_text,
+                history=history,
+            )
 
         elif model_key in NAI_LEGACY_MODELS:
             prompt = format_kayra_instruction(

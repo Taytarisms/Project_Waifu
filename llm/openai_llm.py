@@ -6,14 +6,17 @@ from pathlib import Path
 from datetime import datetime
 
 from files.system_setup.settings import get_auth, get_settings
+from files.provider_capabilities import OPENAI_CHAT_MODELS
 from files.system_setup.system_logger import Logger
 from files.vision.VisionWatcher import get_watcher
+from files.llm.generation_result import GenerationResult
 
 client: Optional[AsyncOpenAI] = None
 _client_token: Optional[str] = None
 message_log: List[Dict[str, Any]] = []
 SYSTEM_MESSAGE_FILE = Path(__file__).with_name("system_message_openai.txt")
 _system_loaded = False
+AVAILABLE_MODELS = OPENAI_CHAT_MODELS
 
 
 def get_day_and_weekday():
@@ -83,6 +86,7 @@ class Parameters:
         self.top_p: float = 1.0
         self.frequency_penalty: float = 0.0
         self.presence_penalty: float = 0.0
+        self.reasoning_effort: str = "medium"
         self.n: int = 1
         self.stream: bool = False
         self.stop = ["<eot>"]
@@ -95,6 +99,7 @@ class Parameters:
             "top_p": self.top_p,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
+            "reasoning_effort": self.reasoning_effort,
             "stop": self.stop,
         }
 
@@ -109,15 +114,73 @@ def build_openai_params(settings: dict | None = None) -> Dict[str, Any]:
         stop = stop_raw
     else:
         stop = []
+    def saved(name, default):
+        value = get_settings(name)
+        return default if value in ("", None) else value
     return {
-        "model": get_settings("openai_model") or "gpt-4.1",
-        "max_tokens": int(get_settings("openai_max_tokens") or 512),
-        "temperature": float(get_settings("openai_temperature") or 0.7),
-        "top_p": float(get_settings("openai_top_p") or 1.0),
-        "frequency_penalty": float(get_settings("openai_frequency_penalty") or 0.0),
-        "presence_penalty": float(get_settings("openai_presence_penalty") or 0.0),
+        "model": saved("openai_model", "gpt-5.6-luna"),
+        "max_tokens": int(saved("openai_max_tokens", 512)),
+        "temperature": float(saved("openai_temperature", 0.7)),
+        "top_p": float(saved("openai_top_p", 1.0)),
+        "frequency_penalty": float(saved("openai_frequency_penalty", 0.0)),
+        "presence_penalty": float(saved("openai_presence_penalty", 0.0)),
         "stop": stop or None,
+        "reasoning_effort": saved("openai_reasoning_effort", "medium"),
     }
+
+
+def build_openai_request(params: dict, messages: list) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "model": params["model"],
+        "input": messages,
+        "max_output_tokens": int(params["max_tokens"]),
+        "store": False,
+        "timeout": 30.0,
+    }
+    model_name = str(params["model"]).lower()
+    if model_name.startswith("gpt-5"):
+        effort = str(params.get("reasoning_effort") or "medium").strip().lower()
+        if effort not in {"none", "low", "medium", "high", "xhigh"}:
+            effort = "medium"
+        kwargs["reasoning"] = {"effort": effort, "summary": "auto"}
+        kwargs["include"] = ["reasoning.encrypted_content"]
+    else:
+        kwargs.update({
+            "temperature": float(params["temperature"]),
+            "top_p": float(params["top_p"]),
+        })
+    return kwargs
+
+
+def _responses_user_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or "")
+    converted = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            converted.append({"type": "input_text", "text": block.get("text", "")})
+        elif block.get("type") == "image_url":
+            image = block.get("image_url") or {}
+            url = image.get("url") if isinstance(image, dict) else image
+            if url:
+                converted.append({"type": "input_image", "image_url": url})
+    return converted
+
+
+def _openai_reasoning_summary(response: Any) -> str:
+    parts: List[str] = []
+    for item in getattr(response, "output", None) or []:
+        if str(getattr(item, "type", "") or "") != "reasoning":
+            continue
+        for summary in getattr(item, "summary", None) or []:
+            text = str(getattr(summary, "text", "") or "").strip()
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts).strip()
 
 
 def system_message(system_text: Optional[str] = None) -> None:
@@ -134,7 +197,7 @@ def system_message(system_text: Optional[str] = None) -> None:
         ensure_system_message_loaded(force=True)
 
 
-async def open_response(user_text, settings: dict = None):
+async def open_response(user_text, settings: dict = None) -> GenerationResult:
     global message_log
     ensure_system_message_loaded()
     params = build_openai_params(settings)
@@ -143,7 +206,7 @@ async def open_response(user_text, settings: dict = None):
     watcher = get_watcher()
     injection = getattr(watcher, "last_injection", None)
     if injection and injection.vision_active:
-        user_content = injection.content
+        user_content = _responses_user_content(injection.content)
     else:
         user_content = user_text
     working_messages.append({
@@ -153,31 +216,28 @@ async def open_response(user_text, settings: dict = None):
     try:
         openai_client = get_openai_client()
 
-        kwargs = {
-            "model": params["model"],
-            "messages": working_messages,
-            "timeout": 30.0,
-        }
-        model_name = str(params["model"]).lower()
-        is_gpt5_family = model_name.startswith("gpt-5")
-        if is_gpt5_family:
-            kwargs["max_completion_tokens"] = params["max_tokens"]
-        else:
-            kwargs.update({
-                "temperature": params["temperature"],
-                "max_tokens": params["max_tokens"],
-                "top_p": params["top_p"],
-                "presence_penalty": params["presence_penalty"],
-                "frequency_penalty": params["frequency_penalty"],
-            })
-        if params.get("stop"):
-            kwargs["stop"] = params["stop"]
-        completion = await openai_client.chat.completions.create(**kwargs)
-        text = completion.choices[0].message.content or ""
+        kwargs = build_openai_request(params, working_messages)
+        try:
+            completion = await openai_client.responses.create(**kwargs)
+        except Exception as first_error:
+            error_text = str(first_error).lower()
+            if "summary" not in error_text and "verification" not in error_text:
+                raise
+            fallback_kwargs = dict(kwargs)
+            reasoning = dict(fallback_kwargs.get("reasoning") or {})
+            reasoning.pop("summary", None)
+            fallback_kwargs["reasoning"] = reasoning
+            completion = await openai_client.responses.create(**fallback_kwargs)
+        text = str(completion.output_text or "").strip()
+        reasoning_summary = _openai_reasoning_summary(completion)
     except Exception as e:
         Logger.error(f"Error in LLM Generation: {e}")
         print(traceback.format_exc())
-        return f"Error in OpenAI generation: {e}"
+        return GenerationResult(
+            text=f"Error in OpenAI generation: {e}",
+            provider="OpenAI",
+            model=str(params.get("model") or ""),
+        )
     t1 = time.perf_counter()
     Logger.notify(
         f"[LLM TTFC]: {(t1 - t0):.2f}s | "
@@ -185,8 +245,18 @@ async def open_response(user_text, settings: dict = None):
     )
     Logger.quiet_print(text)
     message_log = working_messages
-    message_log.append({
-        "role": "assistant",
-        "content": text,
-    })
-    return text
+    for item in getattr(completion, "output", None) or []:
+        if hasattr(item, "model_dump"):
+            message_log.append(item.model_dump(exclude_none=True))
+    usage = getattr(completion, "usage", None)
+    return GenerationResult(
+        text=text,
+        reasoning=reasoning_summary,
+        reasoning_kind="provider_summary" if reasoning_summary else "none",
+        provider="OpenAI",
+        model=str(params.get("model") or ""),
+        usage={
+            "input_tokens": getattr(usage, "input_tokens", "?") if usage else "?",
+            "output_tokens": getattr(usage, "output_tokens", "?") if usage else "?",
+        },
+    )

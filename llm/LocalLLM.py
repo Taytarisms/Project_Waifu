@@ -14,6 +14,10 @@ try:
     configure_process_environment()
 except Exception:
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+import llama_cpp as _llama_cpp
+from files.system_setup.llama_runtime import load_dynamic_backends
+
+load_dynamic_backends(_llama_cpp)
 from llama_cpp import Llama
 try:
     from llama_cpp import llama_chat_format as _llama_chat_format
@@ -328,13 +332,11 @@ def build_chat_formatter(family: ModelFamily, mmproj_path: Optional[str], enable
 
     base_cls = spec.handler_class
 
-    # Build the patched version with a new string
     if spec.suppress_errors and hasattr(base_cls, "CHAT_FORMAT"):
         patched = base_cls.CHAT_FORMAT
         for token in spec.suppress_errors:
             patched = patched.replace(token, "")
 
-        # Create a one-off subclass with the cleaned template
         PatchedCls = type(
             f"_Patched{base_cls.__name__}",
             (base_cls,),
@@ -553,7 +555,7 @@ def _build_llama_kwargs(
         elif nvidia_cc is None and amd_gpus:
             print(
                 "AMD GPU detected; allowing llama.cpp GPU offload if the "
-                f"installed runtime has Vulkan/HIP support: {format_gpu_names(amd_gpus)}"
+                f"installed runtime has Vulkan support: {format_gpu_names(amd_gpus)}"
             )
         elif nvidia_cc is None:
             print("No NVIDIA CUDA-capable or AMD GPU found; using CPU-only local model load.")
@@ -594,11 +596,8 @@ def _is_retryable_llama_load_error(exc: Exception) -> bool:
         "cudart",
         "ggml_cuda",
         "ggml_vulkan",
-        "ggml_hip",
         "ggml_backend",
         "vulkan",
-        "hip",
-        "rocblas",
         "no gpu support",
         "no kernel image",
         "invalid device function",
@@ -620,38 +619,93 @@ def _partial_gpu_layer_attempts(n_gpu_layers: int) -> list[int]:
     return attempts
 
 
-# Attempt to remove thinking channels from most LLM's sinc they don't require it. May not work since some models don't output thinking tokens as cleanly as others.
-async def cleaned_response(text: str) -> str:
+def split_local_response(text: str):
+    from files.llm.generation_result import GenerationResult
+
     if not text:
+        return GenerationResult(provider="Local", reasoning_kind="local_trace")
+
+    answer = str(text).strip()
+    reasoning_parts: List[str] = []
+
+    def collect(match) -> str:
+        thought = str(match.group(1) or "").strip()
+        if thought:
+            reasoning_parts.append(thought)
         return ""
 
-    text = text.strip()
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    if "</think>" in text.lower():
-        text = re.split(r"</think>", text, maxsplit=1, flags=re.IGNORECASE)[-1]
-    text = re.sub(
-        r"<\|channel\|>thought\s*.*?<channel\|>",
-        "",
-        text,
+    answer = re.sub(
+        r"<think>(.*?)</think>",
+        collect,
+        answer,
         flags=re.DOTALL | re.IGNORECASE,
     )
-    if "<channel|>" in text:
-        text = text.split("<channel|>")[-1]
-    text = re.sub(r"^\s*<\|channel\|>\s*", "", text)
-    text = text.replace("<|think|>", "")
-    text = re.sub(
-        r"<\|begin_of_box\|>.*?<\|end_of_box\|>",
-        "",
-        text,
+    if "</think>" in answer.lower():
+        before, after = re.split(
+            r"</think>", answer, maxsplit=1, flags=re.IGNORECASE
+        )
+        if before.strip():
+            reasoning_parts.append(before.strip())
+        answer = after
+
+    channel_pattern = (
+        r"<\|channel\|>\s*(?:thought|analysis)\s*"
+        r"(?:<\|message\|>)?(.*?)"
+        r"(?=<\|channel\|>\s*(?:final|assistant)|<channel\|>|$)"
+    )
+    answer = re.sub(
+        channel_pattern,
+        collect,
+        answer,
         flags=re.DOTALL | re.IGNORECASE,
     )
-    text = re.sub(r"<\|end_of_box\|>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"<nothink>", "", text, flags=re.IGNORECASE)
-    m = re.search(r"(?m)(\[[A-Za-z][A-Za-z0-9_\- ]{0,40}\])", text)
+    answer = re.sub(
+        r"<\|begin_of_box\|>(.*?)<\|end_of_box\|>",
+        collect,
+        answer,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if "<channel|>" in answer:
+        before, answer = answer.rsplit("<channel|>", 1)
+        if before.strip():
+            reasoning_parts.append(before.strip())
+
+    answer = re.sub(
+        r"<\|channel\|>\s*(?:final|assistant)?\s*(?:<\|message\|>)?",
+        "",
+        answer,
+        flags=re.IGNORECASE,
+    )
+    answer = answer.replace("<|think|>", "")
+    answer = re.sub(r"<\|end(?:oftext)?\|>", "", answer, flags=re.IGNORECASE)
+    answer = re.sub(r"<\|end_of_box\|>", "", answer, flags=re.IGNORECASE)
+    answer = re.sub(r"<nothink>", "", answer, flags=re.IGNORECASE)
+    m = re.search(r"(?m)(\[[A-Za-z][A-Za-z0-9_\- ]{0,40}\])", answer)
     if m and m.start() > 0:
-        text = text[m.start():]
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text
+        answer = answer[m.start():]
+    answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
+    cleaned_reasoning_parts = []
+    for part in reasoning_parts:
+        cleaned = re.sub(
+            r"<\|(?:end|endoftext|start|message)\|>\s*(?:assistant|model)?",
+            "",
+            part,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        if cleaned:
+            cleaned_reasoning_parts.append(cleaned)
+    reasoning = "\n\n".join(cleaned_reasoning_parts)
+    return GenerationResult(
+        text=answer,
+        reasoning=reasoning,
+        reasoning_kind="local_trace" if reasoning else "none",
+        provider="Local",
+    )
+
+
+async def cleaned_response(text: str) -> str:
+    return split_local_response(text).text
 
 
 def ensure_exists(path: str, label: str) -> None:
@@ -760,7 +814,6 @@ class LocalLLM:
         if chat_handler is not None:
             llama_kwargs["chat_handler"] = chat_handler
 
-        # swa_full is only really needed on Gemma 4 so we'll guard it against it
         if effective_family in (ModelFamily.GEMMA4,):
             llama_kwargs["swa_full"] = True
 
@@ -930,7 +983,7 @@ class LocalLLM:
         max_dimensions: Optional[int] = None,
         image_quality:  Optional[int] = None,
         subsampling:    Optional[str] = None,
-    ) -> str:
+    ):
         max_dimensions = max_dimensions or self.config.screen_max_dim
         image_quality  = image_quality  or self.config.screenshot_quality
         subsampling    = subsampling    or self.config.screenshot_subsampling
@@ -971,7 +1024,7 @@ class LocalLLM:
         history       = history or []
         system_prompt = self.resolve_system_prompt(system_prompt)
 
-        # Qwen3/3.5: append /think or /no_think so the GGUF Jinja template
+        # Qwen3/3.5: append /think or /no_think so the GGUF Jinja template. I think you can activate/disable through the system message.
         # enables or suppresses the thinking block at generation time.
         if self.spec.supports_thinking:
             suffix = "/think" if self.config.enable_thinking else "/no_think"
@@ -1056,7 +1109,7 @@ class LocalLLM:
             repeat_penalty=repeat_penalty,
             seed=seed,
         )
-        return await cleaned_response(resp["choices"][0]["message"]["content"])
+        return split_local_response(resp["choices"][0]["message"]["content"])
 
     async def generate_vision(
         self,
@@ -1075,7 +1128,7 @@ class LocalLLM:
         temperature:   float = 0.5,
         seed:          int   = -1,
         max_tokens:    int   = 256,
-    ) -> str:
+    ):
         messages = self.build_vision_message(
             text=text,
             image_path=image_path,
@@ -1097,7 +1150,7 @@ class LocalLLM:
             repeat_penalty=repeat_penalty,
             seed=seed,
         )
-        return await cleaned_response(resp["choices"][0]["message"]["content"])
+        return split_local_response(resp["choices"][0]["message"]["content"])
 
 
 ########################
@@ -1184,7 +1237,7 @@ async def response_local(
     temperature:       float = 0.5,
     max_tokens:        int   = 256,
     force_new_context: bool  = False,
-) -> str:
+):
     if not text:
         print("Call received empty text")
         return ""
@@ -1227,16 +1280,16 @@ async def response_local(
 
         if save_to_history and result:
             add_user_message(text)
-            add_assistant_message(result)
+            add_assistant_message(result.text)
             trim_history(max_history)
 
         print(f"Total Inference Time: {time.time() - started:.2f}s")
-        return result or ""
+        return result
 
     except Exception as e:
         print(f"Exception in generation: {e}")
         print(traceback.format_exc())
-        return ""
+        raise RuntimeError(f"Local LLM generation failed: {e}") from e
 
 
 async def response_vision(
@@ -1252,7 +1305,7 @@ async def response_vision(
     top_p:           float = 0.95,
     min_p:           float = 0.05,
     repeat_penalty:  float = 1.1,
-) -> str:
+):
     max_history = max_history or DEFAULT_CONFIG.max_history_messages
 
     try:
@@ -1279,16 +1332,16 @@ async def response_vision(
         )
 
         if save_to_history and result:
-            add_assistant_message(result)
+            add_assistant_message(result.text)
             trim_history(DEFAULT_CONFIG.max_history_messages)
 
         print(f"Total Inference Time: {time.time() - started:.2f}s")
-        return result or ""
+        return result
 
     except Exception as e:
         print(f"Error in Vision processing: {e}")
         print(traceback.format_exc())
-        return ""
+        raise RuntimeError(f"Local vision generation failed: {e}") from e
 
 
 if __name__ == "__main__":

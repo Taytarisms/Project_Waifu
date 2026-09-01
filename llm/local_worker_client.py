@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 import atexit
 import json
@@ -10,6 +8,8 @@ import threading
 from collections import deque
 from pathlib import Path
 from typing import Any
+
+from files.llm.generation_result import GenerationResult
 
 
 class LocalLLMWorkerClient:
@@ -32,6 +32,10 @@ class LocalLLMWorkerClient:
         if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
             creationflags = subprocess.CREATE_NO_WINDOW
 
+        worker_env = os.environ.copy()
+        worker_env["PYTHONIOENCODING"] = "utf-8"
+        worker_env["PYTHONUTF8"] = "1"
+
         self.proc = subprocess.Popen(
             [sys.executable, "-u", str(worker)],
             stdin=subprocess.PIPE,
@@ -43,6 +47,7 @@ class LocalLLMWorkerClient:
             bufsize=1,
             cwd=str(root),
             creationflags=creationflags,
+            env=worker_env,
         )
         threading.Thread(target=self._drain_stderr, daemon=True).start()
 
@@ -55,7 +60,7 @@ class LocalLLMWorkerClient:
             if text:
                 self.stderr_tail.append(text)
             try:
-                sys.stderr.write(f"[LocalLLM worker] {line}")
+                sys.stderr.write(f"{line}")
                 sys.stderr.flush()
             except Exception:
                 pass
@@ -79,7 +84,13 @@ class LocalLLMWorkerClient:
                 self.proc.stdin.flush()
                 line = self.proc.stdout.readline()
             except (BrokenPipeError, OSError) as exc:
+                failed_proc = self.proc
                 self.proc = None
+                if failed_proc.poll() is None:
+                    try:
+                        failed_proc.terminate()
+                    except OSError:
+                        pass
                 raise RuntimeError(f"Local LLM worker pipe failed: {exc}") from exc
 
         if not line:
@@ -121,12 +132,14 @@ class LocalLLMWorkerClient:
 _local_worker = LocalLLMWorkerClient()
 
 
-async def response_local_via_worker(text: str, **kwargs: Any) -> str:
+async def response_local_via_worker(text: str, **kwargs: Any) -> GenerationResult:
     response = await asyncio.to_thread(
         _local_worker.request,
         {"cmd": "generate", "text": text, "kwargs": kwargs},
     )
-    return response.get("result", "")
+    return GenerationResult.from_value(
+        response.get("result", ""), provider="Local"
+    )
 
 
 async def local_init_via_worker() -> None:
