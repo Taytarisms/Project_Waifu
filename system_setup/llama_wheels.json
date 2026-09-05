@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "pilot": {
+    "enabled": false,
+    "repository": "Taytarisms/Project_Waifu",
+    "release_tag": "llama-vulkan-0.3.49-test.1",
+    "jamepeng_ref": "c31ed3038fe20aa5d43ac859ace7dd944b37f3c4",
+    "llama_cpp_ref": "d230ddd763ffe27781c7ffd237ea78b639b36b6d",
+    "wheels": [
+      {
+        "tier": "vulkan",
+        "python_tag": "cp313",
+        "platform_tag": "win_amd64",
+        "filename": "llama_cpp_python-0.3.49-cp313-cp313-win_amd64.whl",
+        "sha256_asset": "llama_cpp_python-0.3.49-cp313-cp313-win_amd64.whl.sha256"
+      }
+    ]
+  }
+}

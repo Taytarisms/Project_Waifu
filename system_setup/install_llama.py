@@ -1,11 +1,16 @@
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote, urlparse
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -28,6 +33,17 @@ from gpu_compat import (
 RELEASES_API = "https://api.github.com/repos/JamePeng/llama-cpp-python/releases?per_page=100"
 JAMEPENG_SOURCE_URL = "git+https://github.com/JamePeng/llama-cpp-python.git"
 PYPI_PACKAGE = "llama-cpp-python"
+WHEEL_MANIFEST_PATH = SCRIPT_DIR / "llama_wheels.json"
+
+
+@dataclass(frozen=True)
+class WheelCandidate:
+    url: str
+    filename: str = ""
+    sha256: str = ""
+    checksum_url: str = ""
+    source: str = "release discovery"
+    require_checksum: bool = False
 
 KNOWN_FALLBACK_WHEELS = {
     "cu130": [
@@ -44,7 +60,7 @@ KNOWN_FALLBACK_WHEELS = {
 
 
 def _supports_driver(tier: str, driver_cuda: tuple[int, int] | None) -> bool:
-    if tier in {"cpu", "cpu-pypi", "cpu-source", "vulkan-source"}:
+    if tier in {"cpu", "cpu-pypi", "cpu-source", "vulkan", "vulkan-source"}:
         return True
     if driver_cuda is None:
         return True
@@ -93,7 +109,7 @@ def _candidate_tiers(platform_name: str | None = None) -> list[str]:
 
     forced = os.environ.get("AI_COMPANION_LLAMA_BACKEND", "auto").strip().lower()
     forced_tiers = {
-        "vulkan": "vulkan-source",
+        "vulkan": "vulkan",
         "metal": "metal-source",
         "cpu": "cpu-pypi",
     }
@@ -103,14 +119,18 @@ def _candidate_tiers(platform_name: str | None = None) -> list[str]:
             raise ValueError(
                 "AI_COMPANION_LLAMA_BACKEND must be auto, vulkan, metal, or cpu"
             )
-        return [selected] if selected == "cpu-pypi" else [selected, "cpu-pypi", "cpu-source"]
+        if selected == "cpu-pypi":
+            return [selected]
+        if selected == "vulkan":
+            return ["vulkan", "vulkan-source", "cpu-pypi", "cpu-source"]
+        return [selected, "cpu-pypi", "cpu-source"]
 
     if platform_name == "darwin":
         preferred = ["metal-source", "cpu-pypi", "cpu-source"]
     elif cc is None and amd_gpus:
-        preferred = ["vulkan-source", "cpu-pypi", "cpu-source"]
+        preferred = ["vulkan", "vulkan-source", "cpu-pypi", "cpu-source"]
     elif cc is None and gpu_names and detect_vulkan_runtime():
-        preferred = ["vulkan-source", "cpu-pypi", "cpu-source"]
+        preferred = ["vulkan", "vulkan-source", "cpu-pypi", "cpu-source"]
     elif cc is None:
         preferred = ["cpu-pypi", "cpu-source"]
     elif cc < CUDA13_MIN_COMPUTE_CAPABILITY:
@@ -158,6 +178,87 @@ def _version_score(text: str) -> tuple[int, int, int, int]:
         minor = int(version_match.group(2))
     date = int(date_match.group(1)) if date_match else 0
     return major, minor, date, len(text)
+
+
+def _load_wheel_manifest(path: Path = WHEEL_MANIFEST_PATH) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid llama wheel manifest at {path}: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Invalid llama wheel manifest at {path}: root must be an object")
+    if manifest.get("schema_version") != 1:
+        raise ValueError(
+            f"Invalid llama wheel manifest at {path}: unsupported schema_version"
+        )
+    return manifest
+
+
+def _safe_release_component(value: object, label: str) -> str:
+    text = str(value or "").strip()
+    if not text or text in {".", ".."} or "/" in text or "\\" in text:
+        raise ValueError(f"Invalid {label} in llama wheel manifest")
+    return text
+
+
+def _manifest_wheel_candidates(
+    tier: str,
+    manifest: dict,
+    *,
+    python_tag: str | None = None,
+    platform_tag: str | None = None,
+) -> list[WheelCandidate]:
+    pilot = manifest.get("pilot")
+    if not isinstance(pilot, dict) or not pilot.get("enabled", False):
+        return []
+
+    repository = str(pilot.get("repository") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise ValueError("Invalid pilot repository in llama wheel manifest")
+    release_tag = _safe_release_component(pilot.get("release_tag"), "release_tag")
+    python_tag = python_tag or _python_tag()
+    platform_tag = platform_tag or _platform_tag()
+
+    entries = pilot.get("wheels")
+    if not isinstance(entries, list):
+        raise ValueError("Invalid pilot wheels list in llama wheel manifest")
+
+    candidates: list[WheelCandidate] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("tier") != tier:
+            continue
+        if entry.get("python_tag") != python_tag:
+            continue
+        if entry.get("platform_tag") != platform_tag:
+            continue
+
+        filename = _safe_release_component(entry.get("filename"), "wheel filename")
+        if not filename.lower().endswith(".whl"):
+            raise ValueError("Pilot wheel filename must end with .whl")
+        checksum_asset = _safe_release_component(
+            entry.get("sha256_asset"), "sha256 asset"
+        )
+        expected_sha256 = str(entry.get("sha256") or "").strip().lower()
+        if expected_sha256 and not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValueError("Invalid sha256 value in llama wheel manifest")
+
+        base = (
+            f"https://github.com/{repository}/releases/download/"
+            f"{quote(release_tag, safe='')}/"
+        )
+        candidates.append(
+            WheelCandidate(
+                url=base + quote(filename, safe=""),
+                filename=filename,
+                sha256=expected_sha256,
+                checksum_url=base + quote(checksum_asset, safe=""),
+                source=f"Project Waifu pilot release {release_tag}",
+                require_checksum=True,
+            )
+        )
+    return candidates
 
 
 def _fetch_release_wheels() -> dict[str, list[str]]:
@@ -209,9 +310,26 @@ def _unique(items: Iterable[str]) -> list[str]:
     return result
 
 
-def _wheel_candidates(tier: str, discovered: dict[str, list[str]]) -> list[str]:
-    newest = discovered.get(tier, [])[:1]
-    return _unique([*newest, *KNOWN_FALLBACK_WHEELS.get(tier, [])])
+def _wheel_candidates(
+    tier: str,
+    discovered: dict[str, list[str]],
+    manifest: dict | None = None,
+) -> list[WheelCandidate]:
+    candidates = _manifest_wheel_candidates(tier, manifest or {})
+    legacy_urls = _unique([
+        *discovered.get(tier, [])[:1],
+        *KNOWN_FALLBACK_WHEELS.get(tier, []),
+    ])
+    candidates.extend(WheelCandidate(url=url) for url in legacy_urls)
+
+    seen: set[str] = set()
+    result: list[WheelCandidate] = []
+    for candidate in candidates:
+        if candidate.url in seen:
+            continue
+        seen.add(candidate.url)
+        result.append(candidate)
+    return result
 
 
 def _run_pip(args: list[str], *, env: dict[str, str] | None = None) -> int:
@@ -223,6 +341,89 @@ def _run_pip(args: list[str], *, env: dict[str, str] | None = None) -> int:
 
 def _install_url(url: str) -> int:
     return _run_pip(["install", "--upgrade", url])
+
+
+def _download_file(url: str, destination: Path) -> None:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Project Waifu Setup"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        with destination.open("wb") as output:
+            shutil.copyfileobj(response, output)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _parse_sha256(text: str, expected_filename: str) -> str:
+    unnamed: list[str] = []
+    for line in text.splitlines():
+        match = re.fullmatch(
+            r"\s*([0-9A-Fa-f]{64})(?:\s+\*?(.+?))?\s*",
+            line,
+        )
+        if not match:
+            continue
+        checksum = match.group(1).lower()
+        name = str(match.group(2) or "").strip()
+        if not name:
+            unnamed.append(checksum)
+            continue
+        if Path(name).name == expected_filename:
+            return checksum
+    if len(unnamed) == 1:
+        return unnamed[0]
+    raise ValueError(f"No SHA-256 checksum found for {expected_filename}")
+
+
+def _fetch_sha256(url: str, expected_filename: str) -> str:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Project Waifu Setup"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        text = response.read().decode("utf-8-sig")
+    return _parse_sha256(text, expected_filename)
+
+
+def _install_wheel_candidate(candidate: WheelCandidate) -> int:
+    if not candidate.require_checksum:
+        return _install_url(candidate.url)
+
+    filename = candidate.filename or Path(urlparse(candidate.url).path).name
+    if not filename or Path(filename).name != filename or not filename.endswith(".whl"):
+        print(f"Refusing invalid wheel filename from {candidate.source}.")
+        return 1
+
+    try:
+        expected_sha256 = candidate.sha256
+        if not expected_sha256:
+            if not candidate.checksum_url:
+                raise ValueError("release does not provide a checksum asset")
+            expected_sha256 = _fetch_sha256(candidate.checksum_url, filename)
+
+        with tempfile.TemporaryDirectory(prefix="project-waifu-llama-") as temp_dir:
+            wheel_path = Path(temp_dir) / filename
+            print(f"Downloading verified wheel from {candidate.source}: {filename}")
+            _download_file(candidate.url, wheel_path)
+            actual_sha256 = _sha256_file(wheel_path)
+            if actual_sha256.lower() != expected_sha256.lower():
+                print(
+                    f"Checksum mismatch for {filename}: expected "
+                    f"{expected_sha256.lower()}, got {actual_sha256.lower()}."
+                )
+                return 1
+            print(f"SHA-256 verified for {filename}.")
+            return _run_pip(["install", "--upgrade", str(wheel_path)])
+    except Exception as exc:
+        print(f"Could not install verified wheel from {candidate.source}: {exc}")
+        return 1
 
 
 def _install_build_helpers() -> int:
@@ -369,6 +570,11 @@ def _finish_backend(label: str, code: int, *, expect_gpu: bool = False) -> bool:
 def main() -> int:
     tiers = _candidate_tiers()
     try:
+        manifest = _load_wheel_manifest()
+    except ValueError as exc:
+        print(f"Ignoring pilot wheel manifest: {exc}")
+        manifest = {}
+    try:
         discovered = _fetch_release_wheels()
     except Exception as exc:
         print(f"Couldn't find release(s): {exc}")
@@ -399,23 +605,26 @@ def main() -> int:
                 return 0
             continue
 
-        urls = _wheel_candidates(tier, discovered)
-        if not urls:
+        candidates = _wheel_candidates(tier, discovered, manifest)
+        if not candidates:
             print(f"No appropriate wheel found for {tier}.")
             continue
 
-        for url in urls:
+        for candidate in candidates:
             print(f"Trying runtime: {tier}")
-            code = _install_url(url)
+            code = _install_wheel_candidate(candidate)
             if code != 0:
-                print(f"Installation failed with exit code {code}: {url}")
+                print(
+                    f"Installation failed with exit code {code}: "
+                    f"{candidate.url}"
+                )
                 continue
             imported, gpu_offload = _runtime_status()
             if not imported or not gpu_offload:
                 print(
                     f"{tier}: wheel installed but no usable GPU backend loaded "
                     "(missing runtime libraries, incompatible driver, or wrong build); "
-                    f"trying the next option: {url}"
+                    f"trying the next option: {candidate.url}"
                 )
                 continue
             print(f"Runtime installed with {tier}.")
@@ -424,10 +633,23 @@ def main() -> int:
     print("ERROR: No compatible llama-cpp-python wheel/build could be installed.")
     if detect_amd_gpu_names():
         print("AMD GPU detected, but no AMD-ready llama-cpp-python runtime could be installed.")
+        if detect_vulkan_runtime():
+            print(
+                "The prebuilt Vulkan wheel was unavailable, failed verification, "
+                "or could not load with the installed driver."
+            )
+        else:
+            print("Install or update the AMD graphics driver to provide the Vulkan runtime.")
         if not detect_vulkan_sdk():
-            print("For AMD GPU acceleration, install the Vulkan SDK, then rerun setup.")
+            print(
+                "Only the source-build fallback requires the Vulkan SDK; "
+                "the prebuilt wheel does not."
+            )
         if sys.platform.startswith("win") and not detect_windows_msvc_build_tools():
-            print("For source builds on Windows, install Visual Studio 2022 Build Tools with Desktop development with C++.")
+            print(
+                "Only the source-build fallback requires Visual Studio 2022 "
+                "Build Tools with Desktop development with C++."
+            )
     print("Local LLM will be unavailable until llama-cpp-python is installed.")
     return 1
 
