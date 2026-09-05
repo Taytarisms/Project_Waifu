@@ -33,7 +33,7 @@
     "openai_tts_instructions": "",
     "NOVELAI_VOICE_SEED": "galette",
     "tts_output_device": null,
-    "inworld_tts_voice": "default-ov2t4cqj6dkurtxbjdt6qa__jo-c_inworld2",
+    "inworld_tts_voice": "",
     "inworld_tts_model": "inworld-tts-2",
     "tts_engine": "inworld",
     "eleven_voice": "",
