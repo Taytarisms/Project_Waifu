@@ -1,6 +1,6 @@
 {
     "stt_mode": "Push To Talk",
-    "stt_engine": "Local Whisper",
+    "stt_engine": "OpenAI Transcription",
     "stt_openai_model": "gpt-4o-transcribe",
     "stt_openai_chunk_seconds": 5.0,
     "stt_device_index": "1",

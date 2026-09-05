@@ -761,12 +761,16 @@ class LLMProviderPage(ctk.CTkFrame):
             text="Token cleared.", text_color=theme.MUTED_TEXT
         )
 
-    def _prompt_auth_token(self, requirement):
+    def _prompt_auth_token(self, requirement, *, activate_after_save=False):
         AuthTokenDialog(
             self,
             title=requirement["title"],
             label=requirement["label"],
-            on_save=lambda token: self._save_auth_and_activate(requirement, token)
+            on_save=lambda token: self._save_auth_token(
+                requirement,
+                token,
+                activate_after_save=activate_after_save,
+            ),
         )
 
     def _ensure_auth_token(self) -> bool:
@@ -776,10 +780,10 @@ class LLMProviderPage(ctk.CTkFrame):
         token = get_auth(requirement["group"], requirement["key"]) if get_auth else ""
         if token:
             return True
-        self._prompt_auth_token(requirement)
+        self._prompt_auth_token(requirement, activate_after_save=True)
         return False
 
-    def _save_auth_and_activate(self, requirement, token):
+    def _save_auth_token(self, requirement, token, *, activate_after_save=False):
         save_auth(requirement["group"], requirement["key"], token)
         if requirement["group"] == "novelai":
             save_auth("novelai", "mail", "")
@@ -790,8 +794,13 @@ class LLMProviderPage(ctk.CTkFrame):
                 text="Token saved.",
                 text_color=theme.SUCCESS,
             )
-        self.status_label.configure(text="Token saved. Activating provider...")
-        self.activate_provider()
+        if activate_after_save:
+            self.status_label.configure(text="Token saved. Activating provider...")
+            self.activate_provider()
+        else:
+            self.status_label.configure(
+                text="Token saved. The active LLM provider was not changed."
+            )
 
     def _refresh_novelai_user_info(self, token: str):
         if not token or not save_auth:

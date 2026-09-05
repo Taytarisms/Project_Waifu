@@ -1,5 +1,5 @@
 {
-    "chat_model": "OpenAI",
+    "chat_model": "Claude",
     "openai_model": "gpt-4.1",
     "openai_temperature": 0.7,
     "openai_max_tokens": 392,
@@ -38,12 +38,12 @@
     "local_screenshot_quality": 82,
     "local_screenshot_subsampling": "4:2:0",
     "local_enable_thinking": false,
-    "claude_model": "claude-sonnet-4-6",
+    "claude_model": "claude-haiku-4-5-20251001",
     "claude_temperature": 1.0,
     "claude_max_tokens": 1024,
     "claude_top_p": 1.0,
     "claude_top_k": 0,
-    "gemini_model": "gemini-2.5-flash",
+    "gemini_model": "gemini-3.6-flash",
     "gemini_temperature": 1.0,
     "gemini_max_tokens": 1024,
     "gemini_top_p": 1.0,
@@ -61,5 +61,6 @@
     "grok_reasoning_effort": "medium",
     "openai_reasoning_effort": "medium",
     "claude_thinking_effort": "medium",
-    "gemini_thinking_level": "medium"
+    "gemini_thinking_level": "medium",
+    "claude_thinking_mode": "adaptive"
 }

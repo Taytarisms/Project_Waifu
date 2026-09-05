@@ -5,10 +5,11 @@ from files.system_setup.system_logger import Logger
 from .narrator import get_narrator
 
 _bg_loop: asyncio.AbstractEventLoop | None = None
+_bg_thread: threading.Thread | None = None
 _bg_lock = threading.Lock()
 
 def _ensure_bg_loop() -> asyncio.AbstractEventLoop:
-    global _bg_loop
+    global _bg_loop, _bg_thread
     with _bg_lock:
         if _bg_loop is not None and not _bg_loop.is_closed():
             return _bg_loop
@@ -21,13 +22,40 @@ def _ensure_bg_loop() -> asyncio.AbstractEventLoop:
             asyncio.set_event_loop(loop)
             _bg_loop = loop
             ready.set()
-            loop.run_forever()
+            try:
+                loop.run_forever()
+            finally:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
+                _bg_loop = None
 
-        t = threading.Thread(target=_runner, daemon=True)
-        t.start()
+        _bg_thread = threading.Thread(target=_runner, daemon=True)
+        _bg_thread.start()
         ready.wait(timeout=2.0)
         assert _bg_loop is not None
         return _bg_loop
+
+
+def stop_background_loop(timeout: float = 2.0) -> None:
+    global _bg_thread
+    with _bg_lock:
+        loop = _bg_loop
+        thread = _bg_thread
+    if loop is None:
+        return
+    loop.call_soon_threadsafe(loop.stop)
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=timeout)
+    with _bg_lock:
+        if thread is None or not thread.is_alive():
+            _bg_thread = None
     
 def is_enabled() -> bool:
     return get_narrator().is_enabled()

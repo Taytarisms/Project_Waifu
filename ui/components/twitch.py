@@ -153,8 +153,14 @@ class TwitchAuthDialog(ctk.CTkToplevel):
         self.grab_set()
         self.geometry("560x460")
         self._on_complete = on_complete
-        self._client_id     = ctk.StringVar(value=get_auth("twitch", "client_id") if get_auth else "")
-        self._client_secret = ctk.StringVar(value=get_auth("twitch", "client_secret") if get_auth else "")
+        self._client_id = str(
+            (get_auth("twitch", "client_id") if get_auth else "") or ""
+        )
+        self._client_secret = str(
+            (get_auth("twitch", "client_secret") if get_auth else "") or ""
+        )
+        self._client_id_entry = None
+        self._client_secret_entry = None
         self._state         = secrets.token_hex(16)
         self._bot_access    = ""
         self._bot_refresh   = ""
@@ -215,6 +221,8 @@ class TwitchAuthDialog(ctk.CTkToplevel):
     def _clear(self):
         for w in self._container.winfo_children():
             w.destroy()
+        self._client_id_entry = None
+        self._client_secret_entry = None
 
     def _title(self, text: str):
         ctk.CTkLabel(
@@ -250,8 +258,12 @@ class TwitchAuthDialog(ctk.CTkToplevel):
             wraplength=420,
         ).pack(anchor="w", pady=(0, 14))
 
-        self._field(self._container, "Client ID", self._client_id)
-        self._field(self._container, "Client Secret", self._client_secret, show="*")
+        self._client_id_entry = self._field(
+            self._container, "Client ID", self._client_id
+        )
+        self._client_secret_entry = self._field(
+            self._container, "Client Secret", self._client_secret, show="*"
+        )
 
         ctk.CTkLabel(
             self._container,
@@ -284,22 +296,27 @@ class TwitchAuthDialog(ctk.CTkToplevel):
             command=self._validate_credentials,
         ).pack(anchor="e", pady=(18, 0))
 
-    def _field(self, parent, label: str, var: ctk.StringVar, show: str = ""):
+    def _field(self, parent, label: str, initial_value: str, show: str = ""):
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=4)
         ctk.CTkLabel(row, text=label, width=110, anchor="w",
                      text_color=theme.TEXT).pack(side="left")
-        ctk.CTkEntry(row, textvariable=var, show=show,
-                     width=300).pack(side="left", padx=(8, 0))
+        entry = ctk.CTkEntry(row, show=show, width=300)
+        entry.pack(side="left", padx=(8, 0))
+        if initial_value:
+            entry.insert(0, initial_value)
+        return entry
 
     def _validate_credentials(self):
-        cid = self._client_id.get().strip()
-        sec = self._client_secret.get().strip()
+        cid = self._client_id_entry.get().strip()
+        sec = self._client_secret_entry.get().strip()
         if not cid or not sec:
             self._cred_status.configure(
                 text="Both Client ID and Client Secret are required.",
                 text_color=theme.DANGER)
             return
+        self._client_id = cid
+        self._client_secret = sec
         if save_auth:
             save_auth("twitch", "client_id", cid)
             save_auth("twitch", "client_secret", sec)
@@ -359,7 +376,7 @@ class TwitchAuthDialog(ctk.CTkToplevel):
     def _start_single_auth(self):
         self._state = secrets.token_hex(16)
         url = _build_auth_url(
-            self._client_id.get().strip(),
+            self._client_id,
             SINGLE_ACCOUNT_SCOPES,
             self._state,
         )
@@ -384,8 +401,8 @@ class TwitchAuthDialog(ctk.CTkToplevel):
 
         try:
             tokens = _exchange_code(
-                self._client_id.get().strip(),
-                self._client_secret.get().strip(),
+                self._client_id,
+                self._client_secret,
                 code,
             )
             validate = _validate_token(tokens["access_token"])
@@ -457,7 +474,7 @@ class TwitchAuthDialog(ctk.CTkToplevel):
     def _start_bot_auth(self):
         self._state = secrets.token_hex(16)
         url = _build_auth_url(
-            self._client_id.get().strip(), BOT_SCOPES, self._state)
+            self._client_id, BOT_SCOPES, self._state)
         webbrowser.open(url)
         if not self._widget_alive(self._bot_status):
             return
@@ -478,8 +495,8 @@ class TwitchAuthDialog(ctk.CTkToplevel):
             return
         try:
             tokens   = _exchange_code(
-                self._client_id.get().strip(),
-                self._client_secret.get().strip(),
+                self._client_id,
+                self._client_secret,
                 code)
             validate = _validate_token(tokens["access_token"])
 
@@ -536,7 +553,7 @@ class TwitchAuthDialog(ctk.CTkToplevel):
     def _start_channel_auth(self):
         self._state = secrets.token_hex(16)
         url = _build_auth_url(
-            self._client_id.get().strip(), CHANNEL_SCOPES, self._state)
+            self._client_id, CHANNEL_SCOPES, self._state)
         webbrowser.open(url)
         if not self._widget_alive(self._chan_status):
             return
@@ -557,8 +574,8 @@ class TwitchAuthDialog(ctk.CTkToplevel):
             return
         try:
             tokens   = _exchange_code(
-                self._client_id.get().strip(),
-                self._client_secret.get().strip(),
+                self._client_id,
+                self._client_secret,
                 code)
             validate = _validate_token(tokens["access_token"])
 

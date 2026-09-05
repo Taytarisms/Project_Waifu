@@ -12,6 +12,7 @@ _GLOBAL_SCROLL_SEQUENCES = {
     "<KeyRelease-Shift_R>",
 }
 _SCROLLABLES = weakref.WeakValueDictionary()
+_NATIVE_WHEEL_CLASSES = {"Listbox", "Text", "Treeview"}
 
 
 class AppScrollableFrame(ctk.CTkScrollableFrame):
@@ -124,6 +125,28 @@ def window_scroll(widget):
     return None
 
 
+def _native_scroll_owns_wheel(widget, horizontal: bool = False) -> bool:
+    current = widget
+    view_name = "xview" if horizontal else "yview"
+    while current is not None:
+        try:
+            if _SCROLLABLES.get(str(current)) is not None:
+                return False
+            widget_class = str(current.winfo_class())
+        except Exception:
+            widget_class = ""
+
+        view = getattr(current, view_name, None)
+        if widget_class in _NATIVE_WHEEL_CLASSES and callable(view):
+            try:
+                first, last = view()
+                return float(first) > 0.0 or float(last) < 1.0
+            except Exception:
+                return False
+        current = getattr(current, "master", None)
+    return False
+
+
 def set_bindings(root) -> None:
     if getattr(root, "app_scroll", False):
         return
@@ -136,12 +159,18 @@ def set_bindings(root) -> None:
         return handler
 
     def on_mousewheel(event):
-        frame = window_scroll(getattr(event, "widget", None))
+        event_widget = getattr(event, "widget", None)
+        horizontal = shift_pressed["value"] or bool(
+            getattr(event, "state", 0) & 0x0001
+        )
+        if _native_scroll_owns_wheel(event_widget, horizontal):
+            return
+
+        frame = window_scroll(event_widget)
         if frame is None:
             return
 
         canvas = frame._parent_canvas
-        horizontal = shift_pressed["value"] or bool(getattr(event, "state", 0) & 0x0001)
         view = canvas.xview if horizontal else canvas.yview
         if view() == (0.0, 1.0):
             return

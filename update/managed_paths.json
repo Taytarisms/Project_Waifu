@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "managed_roots": [
+    "assets/",
+    "closed_captions/",
+    "fine_tune/",
+    "llm/",
+    "main_loop/",
+    "memory/",
+    "moderation/",
+    "speech_to_text/",
+    "stream_chat/",
+    "system_setup/",
+    "tests/",
+    "tts/",
+    "twitch_chat/",
+    "ui/",
+    "update/",
+    "vision/",
+    "vtube_studio/"
+  ],
+  "managed_files": [
+    "provider_capabilities.py",
+    "requirements.txt"
+  ]
+}

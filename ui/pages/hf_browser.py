@@ -1,4 +1,5 @@
 import threading
+import tkinter as tk
 import customtkinter as ctk
 
 from files.ui.components.scrolling import AppScrollableFrame
@@ -395,6 +396,8 @@ class HFModelBrowserPage(ctk.CTkFrame):
         super().__init__(master, fg_color=theme.APP_BG)
         self.app = app
         self.return_category = return_category
+        self._destroyed = False
+        self._search_generation = 0
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
 
@@ -490,6 +493,9 @@ class HFModelBrowserPage(ctk.CTkFrame):
 
     def _do_search(self):
         query = self._search_var.get().strip() or "GGUF"
+        vision_only = bool(self._vision_only.get())
+        self._search_generation += 1
+        generation = self._search_generation
         self._status.configure(text="Searching HuggingFace…")
 
         # Clear existing cards just so the Ui isn't being overwhelmed
@@ -498,21 +504,68 @@ class HFModelBrowserPage(ctk.CTkFrame):
 
         threading.Thread(
             target=self._fetch,
-            args=(query,),
+            args=(query, vision_only, generation),
             daemon=True,
         ).start()
 
-    def _fetch(self, query: str):
+    def _fetch(self, query: str, vision_only: bool, generation: int):
         if not _checker_ok:
-            self.after(0, lambda: self._status.configure(text="model_checker not available."))
+            self._schedule_search_result(
+                generation,
+                error="model_checker not available.",
+            )
             return
 
-        models = fetch_hf_models(query=query, limit=30)
+        try:
+            models = fetch_hf_models(query=query, limit=30)
+        except Exception as exc:
+            self._schedule_search_result(generation, error=f"Search failed: {exc}")
+            return
 
-        if self._vision_only.get():
+        if vision_only:
             models = [m for m in models if m.get("has_vision")]
 
-        self.after(0, lambda: self._render_cards(models))
+        self._schedule_search_result(generation, models=models)
+
+    def _alive(self) -> bool:
+        if self._destroyed:
+            return False
+        try:
+            return bool(self.winfo_exists())
+        except (tk.TclError, RuntimeError):
+            return False
+
+    def _schedule_search_result(
+        self,
+        generation: int,
+        models: list | None = None,
+        error: str | None = None,
+    ) -> None:
+        def apply_result():
+            if not self._alive() or generation != self._search_generation:
+                return
+            try:
+                if error:
+                    self._status.configure(text=error)
+                else:
+                    self._render_cards(models or [])
+            except (tk.TclError, RuntimeError):
+                return
+
+        if not self._alive():
+            return
+        try:
+            self.after(0, apply_result)
+        except (tk.TclError, RuntimeError):
+            return
+
+    def destroy(self):
+        self._destroyed = True
+        self._search_generation += 1
+        try:
+            return super().destroy()
+        except tk.TclError:
+            return None
 
     def _render_cards(self, models: list):
         if not models:

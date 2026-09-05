@@ -48,7 +48,7 @@ BASE_17B = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
 DEFAULT_TEXT = (
     "Hello! This is a Qwen three text to speech test using the selected voice preset. "
-    "If this sounds good, it can be wired directly into the companion app."
+    "If this sounds good, then... You're stinky!"
 )
 
 def _detect_device(requested: str = "auto") -> str:
@@ -65,8 +65,6 @@ def _detect_device(requested: str = "auto") -> str:
 
 
 def _detect_backend(requested: str, device: str) -> str:
-    if requested == "faster":
-        return "faster"
     if requested == "upstream":
         return "upstream"
 
@@ -99,7 +97,7 @@ def _detect_attn(device: str) -> str:
 class Qwen3TTSConfig(TTSConfig):
     model_id: str = CUSTOMVOICE_06B
     device: str = "auto"              # auto | cuda:0 | mps | cpu
-    backend: str = "faster"           # auto | faster | upstream
+    backend: str = "auto"             # auto | faster | upstream
     speaker: str = "ryan"
     language: str = "English"
     instruct: str = ""
@@ -176,7 +174,12 @@ class Qwen3TTSEngine(TTSEngineBase):
 
     def _load_faster(self, model_id: str):
         from faster_qwen3_tts import FasterQwen3TTS
-        self._model = FasterQwen3TTS.from_pretrained(model_id)
+        self._model = FasterQwen3TTS.from_pretrained(
+            model_id,
+            device=self._device,
+            dtype=_detect_dtype(self._device),
+            attn_implementation=_detect_attn(self._device),
+        )
 
     def _load_upstream(self, model_id: str):
         import torch

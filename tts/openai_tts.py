@@ -1,13 +1,16 @@
-from pathlib import Path
+import uuid
 from openai import OpenAI, AsyncOpenAI
-import pyaudio, threading, os, tempfile, wave, sys
+import pyaudio, os, tempfile, wave, sys
 from pydub import AudioSegment
 from pydub.utils import make_chunks
 from files.system_setup.settings import get_auth, get_settings
 from files.system_setup.audio_tools import tts_output_dir
+from files.provider_capabilities import (
+    openai_tts_supports_instructions,
+    openai_tts_voice_supported,
+)
 
 _OUTPUT_DIR = tts_output_dir("openai")
-_SPEECH_FILE = _OUTPUT_DIR / "speech.mp3"
 
 _client = None
 _async_client = None
@@ -44,38 +47,53 @@ def interrupt_tts_playback(value: bool):
 
 interrupt_tts_flag = False
 
-def openai_tts(text, model=str, voice=str):
-    client = get_openai_tts_client()
-    speech_file_path = _SPEECH_FILE
-    with client.audio.speech.with_streaming_response.create(
-        model=model,
-        voice=voice,
-        input=text,
-    ) as response:
-        response.stream_to_file(speech_file_path)
-        print("File Saved!")
+def build_openai_tts_request(text: str, model: str, voice: str) -> dict:
+    if not openai_tts_voice_supported(model, voice):
+        raise ValueError(f"Voice '{voice}' is not supported by OpenAI model '{model}'.")
     try:
-        from files.closed_captions import caption_coordinator
-        caption_coordinator.audio_ready(str(speech_file_path))
-    except Exception as _e:
-        print(f"Caption error: {_e}")
+        speed = float(get_settings("openai_tts_speed") or 1.0)
+    except (TypeError, ValueError):
+        speed = 1.0
+    request = {
+        "model": model,
+        "voice": voice,
+        "input": text,
+        "speed": max(0.25, min(4.0, speed)),
+    }
+    instructions = str(get_settings("openai_tts_instructions") or "").strip()
+    if instructions and openai_tts_supports_instructions(model):
+        request["instructions"] = instructions
+    return request
 
+
+def openai_tts(text, model: str, voice: str):
+    client = get_openai_tts_client()
+    speech_file_path = _OUTPUT_DIR / f"speech_{uuid.uuid4().hex}.mp3"
     try:
-        audio_segment = AudioSegment.from_mp3(speech_file_path)
-    except Exception as e:
-        print("Error loading audio file:", e)
-        return None
-    playback_thread = threading.Thread(
-        target=play_audio_segment,
-        args=(audio_segment,),
-        daemon=True,
-    )
-    playback_thread.start()
-    try:
-        os.remove(speech_file_path)
-    except Exception as e:
-        print("Error deleting audio file:", e)
-    return playback_thread
+        with client.audio.speech.with_streaming_response.create(
+            **build_openai_tts_request(text, model, voice)
+        ) as response:
+            response.stream_to_file(speech_file_path)
+            print("File Saved!")
+
+        try:
+            from files.closed_captions import caption_coordinator
+            caption_coordinator.audio_ready(str(speech_file_path))
+        except Exception as _e:
+            print(f"Caption error: {_e}")
+
+        try:
+            audio_segment = AudioSegment.from_mp3(speech_file_path)
+        except Exception as exc:
+            raise RuntimeError(f"Could not decode OpenAI TTS audio: {exc}") from exc
+
+        play_audio_segment(audio_segment)
+        return True
+    finally:
+        try:
+            speech_file_path.unlink(missing_ok=True)
+        except Exception as exc:
+            print("Error deleting audio file:", exc)
 
 def play_audio_segment(audio_segment):
     global interrupt_tts_flag
@@ -107,24 +125,15 @@ def play_audio_segment(audio_segment):
 
 OUTPUT_DEVICE_INDEX = None
 CHUNK_SIZE = 4096
-pause_event = threading.Event()
-pause_event.set()
-interrupt_tts_flag = False
 
-def interrupt_tts_playback(value: bool):
-    global interrupt_tts_flag
-    interrupt_tts_flag = value
-    print("Playback interrupted.")
-
-async def openai_stream_and_decode(text, api_key: str, model=str, voice=str) -> str:
+async def openai_stream_and_decode(text, api_key: str, model: str, voice: str) -> str:
     openai_client = get_async_openai_tts_client(api_key)
     audio_bytes = bytearray()
 
+    request = build_openai_tts_request(text, model, voice)
+    request["response_format"] = "wav"
     async with openai_client.audio.speech.with_streaming_response.create(
-        model=model,   # Use a valid model.
-        voice=voice,            # Use a valid voice.
-        input=text,
-        response_format="wav",    # Request WAV output.
+        **request
     ) as response:
         async for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
             audio_bytes.extend(chunk)
@@ -167,6 +176,6 @@ def openai_playback_worker(temp_filename):
     wf.close()
     os.remove(temp_filename)
 
-async def openai_stream_tts_main(text: str, api_key: str, model:str, voice: str):
+async def openai_stream_tts_main(text: str, api_key: str, model: str, voice: str):
     temp_filename = await openai_stream_and_decode(text, api_key, model, voice)
     openai_playback_worker(temp_filename)

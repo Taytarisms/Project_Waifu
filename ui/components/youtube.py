@@ -12,6 +12,7 @@ import customtkinter as ctk
 import requests
 
 from files.system_setup.settings import get_auth, save_auth
+from files.system_setup.system_logger import Logger
 from files.ui import theme
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -21,13 +22,26 @@ READ_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
 
 
 class _OAuthCallback(http.server.BaseHTTPRequestHandler):
-    result: dict = {}
-
     def do_GET(self):
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        type(self).result = {key: values[0] for key, values in query.items() if values}
-        body = b"YouTube authorization received. You can close this window and return to AI Companion."
-        self.send_response(200)
+        result = {key: values[0] for key, values in query.items() if values}
+        self.server.oauth_result = result
+
+        expected_state = str(getattr(self.server, "oauth_expected_state", "") or "")
+        returned_state = str(result.get("state") or "")
+        state_matches = bool(
+            expected_state
+            and returned_state
+            and secrets.compare_digest(returned_state, expected_state)
+        )
+        if state_matches:
+            status = 200
+            body = b"YouTube authorization received. You can close this window and return to AI Companion."
+        else:
+            status = 400
+            body = b"YouTube authorization callback rejected. Return to AI Companion and try again."
+
+        self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -35,6 +49,33 @@ class _OAuthCallback(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, _format, *_args):
         return
+
+
+def _create_oauth_callback_server(expected_state: str) -> http.server.HTTPServer:
+    # This must remain synchronous. ThreadingHTTPServer.handle_request() returns
+    # before its handler thread has stored the callback, which races the state
+    # check in _authorize_worker.
+    server = http.server.HTTPServer(("localhost", 0), _OAuthCallback)
+    server.oauth_expected_state = expected_state
+    server.oauth_result = {}
+    server.timeout = 180
+    return server
+
+
+def _validated_oauth_result(result: dict, expected_state: str) -> str:
+    if not result:
+        raise RuntimeError("Authorization timed out or returned no callback")
+
+    returned_state = str(result.get("state") or "")
+    if not returned_state or not secrets.compare_digest(returned_state, expected_state):
+        raise RuntimeError("Google authorization state did not match")
+    if result.get("error"):
+        raise RuntimeError(result.get("error_description") or result["error"])
+
+    code = str(result.get("code") or "")
+    if not code:
+        raise RuntimeError("Authorization returned no code")
+    return code
 
 
 class YouTubeAuthDialog(ctk.CTkToplevel):
@@ -115,13 +156,12 @@ class YouTubeAuthDialog(ctk.CTkToplevel):
 
     def _authorize_worker(self, client_id: str, client_secret: str):
         server = None
+        stage = "starting the local callback listener"
         try:
             state = secrets.token_urlsafe(24)
             verifier = secrets.token_urlsafe(64)
             challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-            _OAuthCallback.result = {}
-            server = http.server.ThreadingHTTPServer(("localhost", 0), _OAuthCallback)
-            server.timeout = 180
+            server = _create_oauth_callback_server(state)
             redirect_uri = f"http://localhost:{server.server_port}/"
             query = urllib.parse.urlencode({
                 "client_id": client_id,
@@ -135,15 +175,11 @@ class YouTubeAuthDialog(ctk.CTkToplevel):
                 "code_challenge_method": "S256",
             })
             webbrowser.open(f"{AUTH_URL}?{query}")
+            stage = "waiting for the Google callback"
             server.handle_request()
-            result = dict(_OAuthCallback.result)
-            if result.get("state") != state:
-                raise RuntimeError("Google authorization state did not match")
-            if result.get("error"):
-                raise RuntimeError(result.get("error_description") or result["error"])
-            code = result.get("code")
-            if not code:
-                raise RuntimeError("Authorization timed out or returned no code")
+            result = dict(server.oauth_result)
+            code = _validated_oauth_result(result, state)
+            stage = "exchanging the authorization code"
             token_data = {
                 "client_id": client_id,
                 "code": code,
@@ -159,6 +195,7 @@ class YouTubeAuthDialog(ctk.CTkToplevel):
             access_token = str(tokens.get("access_token") or "")
             if not access_token:
                 raise RuntimeError("Google returned no access token")
+            stage = "reading the authorized YouTube channel"
             identity_response = requests.get(
                 CHANNELS_URL,
                 params={"part": "id,snippet", "mine": "true"},
@@ -178,6 +215,10 @@ class YouTubeAuthDialog(ctk.CTkToplevel):
             save_auth("youtube", "channel_name", str(channel.get("snippet", {}).get("title") or ""))
             self.after(0, self._authorization_complete)
         except Exception as exc:
+            Logger.error(
+                f"YouTube authorization failed while {stage}: "
+                f"{type(exc).__name__}: {exc}"
+            )
             self.after(0, self._authorization_failed, str(exc))
         finally:
             if server is not None:

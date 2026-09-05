@@ -3,7 +3,8 @@ import customtkinter as ctk
 from files.ui.components.scrolling import AppScrollableFrame
 from files.speech_to_text import stt_controls
 from files.speech_to_text.audio_devices import parse_preferred_patterns, resolve_input_device
-from files.system_setup.settings import get_settings, save_settings
+from files.system_setup.settings import get_auth, get_settings, save_auth, save_settings
+from files.ui.components.auth_dialog import AuthTokenDialog
 from files.ui import theme
 
 
@@ -238,13 +239,62 @@ class STTPage(ctk.CTkFrame):
             self.openai_model_var,
             ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"],
         )
+        has_key = bool(get_auth("openai", "token"))
+        self.openai_auth_status_label = ctk.CTkLabel(
+            frame,
+            text="OpenAI API key saved." if has_key else "No OpenAI API key saved.",
+            text_color=theme.SUCCESS if has_key else theme.MUTED_TEXT,
+        )
+        self.openai_auth_status_label.pack(anchor="w", padx=16, pady=(8, 4))
+        auth_buttons = ctk.CTkFrame(frame, fg_color="transparent")
+        auth_buttons.pack(fill="x", padx=16, pady=(0, 8))
+        ctk.CTkButton(
+            auth_buttons,
+            text="Set STT API Key",
+            command=self._prompt_openai_key,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ctk.CTkButton(
+            auth_buttons,
+            text="Clear Key",
+            fg_color=theme.DANGER,
+            command=self._clear_openai_key,
+        ).pack(side="left", fill="x", expand=True, padx=(4, 0))
         ctk.CTkLabel(
             frame,
-            text="Audio leaves this computer only after VAD or push-to-talk completes an utterance.",
+            text=(
+                "This shared OpenAI credential can also be used by OpenAI LLM/TTS, "
+                "but saving it here never changes the active LLM provider. Audio "
+                "leaves this computer only after an utterance completes."
+            ),
             text_color=theme.MUTED_TEXT,
             wraplength=700,
             justify="left",
         ).pack(anchor="w", padx=16, pady=(6, 14))
+
+    def _prompt_openai_key(self):
+        AuthTokenDialog(
+            self,
+            title="OpenAI Speech-to-Text API Key",
+            label=(
+                "Paste the OpenAI API key used for transcription. Saving it will "
+                "not switch your active language-model provider."
+            ),
+            on_save=self._save_openai_key,
+        )
+
+    def _save_openai_key(self, token: str):
+        save_auth("openai", "token", token)
+        self.openai_auth_status_label.configure(
+            text="OpenAI API key saved. Active LLM unchanged.",
+            text_color=theme.SUCCESS,
+        )
+
+    def _clear_openai_key(self):
+        save_auth("openai", "token", "")
+        self.openai_auth_status_label.configure(
+            text="OpenAI API key cleared.",
+            text_color=theme.MUTED_TEXT,
+        )
 
     def _build_google_settings(self):
         frame = self._card(

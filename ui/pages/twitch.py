@@ -38,10 +38,14 @@ def normalize_color(value, fallback="#FFFFFF") -> str:
     if not value:
         return fallback
     color = str(value).strip()
-    if color.startswith("#") and len(color) == 7:
-        return color
     if color.lower().startswith("0x") and len(color) == 8:
-        return "#" + color[2:]
+        color = "#" + color[2:]
+    if color.startswith("#") and len(color) == 7:
+        try:
+            int(color[1:], 16)
+        except ValueError:
+            return fallback
+        return color
     return fallback
 
 def resolve_tier(tags: dict):
@@ -245,7 +249,7 @@ class ChatterDetailPanel(AppScrollableFrame):
 
         px = 16
         tier = tier_from_role(chatter.get("role", ""))
-        name_color = tier[1] if tier else chatter.get("color", "#FFFFFF")
+        name_color = tier[1] if tier else normalize_color(chatter.get("color"))
         user_id = chatter.get("user_id", "")
 
         BANNER_H = 90
@@ -832,7 +836,7 @@ class MiddleColumn(ctk.CTkFrame):
 
     def _add_roster_row(self, chatter: dict):
         tier = tier_from_role(chatter.get("role", ""))
-        name_color = tier[1] if tier else chatter.get("color", "#FFFFFF")
+        name_color = tier[1] if tier else normalize_color(chatter.get("color"))
 
         row = ctk.CTkFrame(self._roster_frame, fg_color=theme.APP_BG, corner_radius=8)
         row.pack(fill="x", pady=3)

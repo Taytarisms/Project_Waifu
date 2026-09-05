@@ -39,6 +39,26 @@ def id_to_seeds(voice_seed: str | int | None) -> tuple[int, str]:
     except ValueError:
         return -1, raw
 
+
+def build_novel_tts_payload(
+    speak: str,
+    voice_seed: str,
+    version: str = "v2",
+) -> dict:
+    version = str(version or "v2").strip().lower()
+    if version not in {"v1", "v2"}:
+        version = "v2"
+
+    voice_id, seed = id_to_seeds(voice_seed)
+    return {
+        "text": speak,
+        "voice": voice_id,
+        "seed": seed,
+        "opus": False,
+        "version": version,
+    }
+
+
 FFMPEG_PATH = _find_ffmpeg()
 
 class NovelTTSClient:
@@ -56,22 +76,15 @@ class NovelTTSClient:
             "Content-Type": "application/json",
         }
 
-    async def generate_tts(self, speak: str, voice_seed: str) -> str:
+    async def generate_tts(
+        self,
+        speak: str,
+        voice_seed: str,
+        version: str = "v2",
+    ) -> str:
         url = "https://api.novelai.net/ai/generate-voice"
         headers = self.get_auth_headers()
-
-        try:
-            voice_id, seed = id_to_seeds(voice_seed)
-        except ValueError:
-            voice_id = 0
-
-        payload = {
-            "text": speak,
-            "voice": voice_id,
-            "seed": seed,
-            "opus": False,
-            "version": "v2",
-        }
+        payload = build_novel_tts_payload(speak, voice_seed, version)
 
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(url, headers=headers, json=payload)
@@ -96,18 +109,25 @@ class NovelTTSClient:
         mp3_path = self.audio_path_for(file_id, "mp3")
         wav_path = self.audio_path_for(file_id, "wav")
 
-        subprocess.run(
+        conversion = subprocess.run(
             [
                 FFMPEG_PATH,
-                "-loglevel", "quiet",
+                "-loglevel", "error",
                 "-y",
                 "-i", mp3_path,
                 "-filter:a", f"volume={volume_modifier}dB",
                 wav_path,
-            ]
+            ],
+            capture_output=True,
+            text=True,
         )
+        if conversion.returncode != 0 or not os.path.isfile(wav_path):
+            detail = (conversion.stderr or "unknown FFmpeg error").strip()
+            print(f"NovelAI TTS conversion failed: {detail}", file=sys.stderr)
+            return False
 
         final_device = device_index if device is None else device
+        wave_file = None
         try:
             wave_file = wave.open(wav_path, "rb")
             virtual_cable_stream = audio.open(
@@ -118,8 +138,9 @@ class NovelTTSClient:
                 output_device_index=final_device,
             )
         except Exception as e:
-            print("Cannot use selected audio device as output.", file=sys.stderr)
-            wave_file.close()
+            print(f"Cannot use selected audio device as output: {e}", file=sys.stderr)
+            if wave_file is not None:
+                wave_file.close()
             return False
 
         data = wave_file.readframes(8192)

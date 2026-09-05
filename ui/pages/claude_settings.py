@@ -29,11 +29,17 @@ class ClaudeSettingsPage(ctk.CTkFrame):
 
         self.model_var       = ctk.StringVar(value=self._setting("claude_model",       "claude-sonnet-4-6"))
         self.temperature_var = ctk.DoubleVar(value=float(self._setting("claude_temperature", 1.0)))
-        self.max_tokens_var  = ctk.DoubleVar(value=float(self._setting("claude_max_tokens",  1024)))
+        self.max_tokens_var  = ctk.DoubleVar(value=float(self._setting("claude_max_tokens",  4096)))
         self.top_p_var       = ctk.DoubleVar(value=float(self._setting("claude_top_p",       1.0)))
         self.top_k_var       = ctk.DoubleVar(value=float(self._setting("claude_top_k",       0)))
+        saved_thinking_effort = str(self._setting("claude_thinking_effort", "medium"))
+        saved_thinking_mode = str(self._setting("claude_thinking_mode", "adaptive"))
+        if saved_thinking_effort.lower() in {"none", "off", "disabled"}:
+            saved_thinking_mode = "disabled"
+            saved_thinking_effort = "medium"
+        self.thinking_mode_var = ctk.StringVar(value=saved_thinking_mode)
         self.thinking_effort_var = ctk.StringVar(
-            value=self._setting("claude_thinking_effort", "medium")
+            value=saved_thinking_effort
         )
 
         self._combo_row("Model",       self.model_var,       CLAUDE_MODELS, row=1)
@@ -42,10 +48,16 @@ class ClaudeSettingsPage(ctk.CTkFrame):
         self._slider_row("Top P",       self.top_p_var,       0.0,  1.0,  row=4)
         self._slider_row("Top K",       self.top_k_var,       0,    500,  row=5, is_int=True)
         self._combo_row(
-            "Thinking Effort",
-            self.thinking_effort_var,
-            ["none", "low", "medium", "high", "max"],
+            "Thinking Mode",
+            self.thinking_mode_var,
+            ["adaptive", "disabled"],
             row=6,
+        )
+        self._combo_row(
+            "Adaptive Effort",
+            self.thinking_effort_var,
+            ["low", "medium", "high", "max"],
+            row=7,
         )
 
         ctk.CTkLabel(
@@ -53,20 +65,22 @@ class ClaudeSettingsPage(ctk.CTkFrame):
             text=(
                 "Sampling controls are saved for compatible older models. "
                 "They are automatically omitted for Opus 4.7+ and Claude 5. "
-                "Reasoning summaries use adaptive thinking on Claude 4.6+ and "
-                "can increase latency and token usage."
+                "Claude 4.6+ uses the selected adaptive thinking mode. While it "
+                "is enabled, incompatible sampling controls are omitted to prevent "
+                "invalid-request errors. Max Tokens is shared by thinking and the "
+                "visible answer; 4096 or more is recommended with adaptive thinking."
             ),
             text_color=theme.MUTED_TEXT,
             anchor="w",
             font=ctk.CTkFont(size=11),
             wraplength=560,
-        ).grid(row=7, column=0, sticky="w", padx=18, pady=(0, 12))
+        ).grid(row=8, column=0, sticky="w", padx=18, pady=(0, 12))
 
         ctk.CTkButton(
             self,
             text="Save Claude Settings",
             command=self.save,
-        ).grid(row=8, column=0, sticky="w", padx=18, pady=(10, 8))
+        ).grid(row=9, column=0, sticky="w", padx=18, pady=(10, 8))
 
         self.status_label = ctk.CTkLabel(
             self,
@@ -74,7 +88,7 @@ class ClaudeSettingsPage(ctk.CTkFrame):
             text_color=theme.MUTED_TEXT,
             anchor="w",
         )
-        self.status_label.grid(row=9, column=0, sticky="w", padx=18, pady=(0, 18))
+        self.status_label.grid(row=10, column=0, sticky="w", padx=18, pady=(0, 18))
 
     def _setting(self, key, default):
         if not get_settings:
@@ -120,6 +134,7 @@ class ClaudeSettingsPage(ctk.CTkFrame):
             "claude_max_tokens":  int(self.max_tokens_var.get()),
             "claude_top_p":       float(self.top_p_var.get()),
             "claude_top_k":       int(self.top_k_var.get()),
+            "claude_thinking_mode": self.thinking_mode_var.get().strip(),
             "claude_thinking_effort": self.thinking_effort_var.get().strip(),
         }
         if save_settings:

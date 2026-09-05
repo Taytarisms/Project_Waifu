@@ -5,6 +5,7 @@ import wave
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 import edge_tts
 import pyaudio
 from pydub import AudioSegment
@@ -65,7 +66,12 @@ class EdgeBackend(NarratorBackend):
         wav_path = self._OUTPUT_DIR / f"narrator_{unique}.wav"
 
         try:
-            communicate = edge_tts.Communicate(text, voice or "en-US-AvaNeural")
+            connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
+            communicate = edge_tts.Communicate(
+                text,
+                voice or "en-US-AvaNeural",
+                connector=connector,
+            )
             await communicate.save(str(mp3_path))
         except Exception as e:
             Logger.warn(f"edge_tts.save failed: {e}")
