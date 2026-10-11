@@ -1,5 +1,6 @@
 import threading
 import time
+from collections import Counter
 from typing import Any
 import requests
 
@@ -31,11 +32,22 @@ class YouTubeProvider(StreamChatProvider):
         self._running = False
         self._live_chat_id = ""
         self._video_id = ""
+        self._lifecycle_lock = threading.Lock()
+        self._page_token = ""
+        self._first_batch = True
+        self._failures = 0
+        self._request_counts = Counter()
 
     def is_running(self) -> bool:
         return self._running and bool(self._thread and self._thread.is_alive())
 
     def start(self) -> None:
+        with self._lifecycle_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
         if self.is_running():
             return
         if not get_auth("youtube", "refresh_token") and not get_auth("youtube", "access_token"):
@@ -43,7 +55,12 @@ class YouTubeProvider(StreamChatProvider):
                 "youtube", "error", "Authorize a YouTube broadcaster account first"
             )
             return
-        self._stop_event.clear()
+        self._stop_event = threading.Event()
+        self._live_chat_id = ""
+        self._page_token = ""
+        self._first_batch = True
+        self._failures = 0
+        self._request_counts.clear()
         self._running = True
         self._thread = threading.Thread(
             target=self._run,
@@ -53,14 +70,22 @@ class YouTubeProvider(StreamChatProvider):
         self._thread.start()
 
     def stop(self) -> None:
+        with self._lifecycle_lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
         self._stop_event.set()
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=2.0)
-        self._thread = None
-        self._running = False
-        self._live_chat_id = ""
-        get_stream_chat_hub().update_provider_status("youtube", "disconnected")
+        alive = bool(thread and thread.is_alive())
+        if not alive:
+            self._thread = None
+            self._running = False
+        get_stream_chat_hub().update_provider_status(
+            "youtube", "stopping" if alive else "disconnected",
+            "Waiting for the current request to finish" if alive else "",
+        )
 
     def _run(self) -> None:
         hub = get_stream_chat_hub()
@@ -84,7 +109,7 @@ class YouTubeProvider(StreamChatProvider):
                                 "No active live chat; checking again",
                                 account,
                             )
-                            self._stop_event.wait(15.0)
+                            self._stop_event.wait(300.0)
                             continue
                     hub.update_provider_status(
                         "youtube",
@@ -96,20 +121,35 @@ class YouTubeProvider(StreamChatProvider):
                 except requests.HTTPError as exc:
                     status = exc.response.status_code if exc.response is not None else "HTTP"
                     detail = self._api_error(exc)
-                    if status in (401, 403):
+                    reason = self._api_reason(exc)
+                    if self._stop_event.is_set():
+                        break
+                    self._failures += 1
+                    if status == 401 and self._failures == 1:
                         save_auth("youtube", "token_expires_at", 0)
+                    elif reason not in {"rateLimitExceeded", "userRateLimitExceeded"} and status != 429 and not (isinstance(status, int) and status >= 500):
+                        hub.update_provider_status("youtube", "error", detail, account)
+                        Logger.warn(f"YouTube stopped: {detail}. Resolve the error before reconnecting.")
+                        return
                     hub.update_provider_status("youtube", "reconnecting", detail, account)
                     Logger.warn(f"YouTube chat API error: {detail}")
-                    self._live_chat_id = ""
-                    self._stop_event.wait(8.0)
+                    self._stop_event.wait(min(300.0, 8.0 * 2 ** min(self._failures - 1, 6)))
                 except Exception as exc:
+                    if self._stop_event.is_set():
+                        break
+                    if not isinstance(exc, requests.RequestException):
+                        hub.update_provider_status("youtube", "error", str(exc), account)
+                        Logger.warn(f"YouTube reader stopped: {exc}")
+                        return
+                    self._failures += 1
                     hub.update_provider_status("youtube", "reconnecting", str(exc), account)
                     Logger.warn(f"YouTube chat reader error: {exc}")
-                    self._live_chat_id = ""
-                    self._stop_event.wait(8.0)
+                    self._stop_event.wait(min(300.0, 8.0 * 2 ** min(self._failures - 1, 6)))
         finally:
             self._running = False
-            hub.update_provider_status("youtube", "disconnected")
+            Logger.print(f"YouTube session API request counts: {dict(self._request_counts)}")
+            if self._stop_event.is_set():
+                hub.update_provider_status("youtube", "disconnected")
 
     def _access_token(self) -> str:
         token = get_auth("youtube", "access_token") or ""
@@ -146,6 +186,9 @@ class YouTubeProvider(StreamChatProvider):
         return token
 
     def _get(self, path: str, token: str, **params) -> dict[str, Any]:
+        self._request_counts[path] += 1
+        if sum(self._request_counts.values()) % 100 == 0:
+            Logger.print(f"YouTube session API request counts: {dict(self._request_counts)}")
         response = self._session.get(
             f"{API_ROOT}/{path}",
             params=params,
@@ -153,6 +196,7 @@ class YouTubeProvider(StreamChatProvider):
             timeout=45,
         )
         response.raise_for_status()
+        self._failures = 0
         return response.json()
 
     def _discover_live_chat(self, token: str) -> tuple[str, str]:
@@ -174,7 +218,6 @@ class YouTubeProvider(StreamChatProvider):
             part="id,snippet",
             broadcastStatus="active",
             broadcastType="all",
-            mine="true",
             maxResults=5,
         )
         items = data.get("items") or []
@@ -184,29 +227,36 @@ class YouTubeProvider(StreamChatProvider):
         return str(broadcast.get("id") or ""), str(broadcast.get("snippet", {}).get("liveChatId") or "")
 
     def _poll_chat(self, token: str) -> None:
-        page_token = ""
-        first_batch = True
         while not self._stop_event.is_set() and self._live_chat_id:
+            token = self._access_token()
+            if self._stop_event.is_set():
+                return
             params = {
                 "liveChatId": self._live_chat_id,
                 "part": "id,snippet,authorDetails",
                 "maxResults": 200,
             }
-            if page_token:
-                params["pageToken"] = page_token
+            if self._page_token:
+                params["pageToken"] = self._page_token
             data = self._get("liveChat/messages", token, **params)
-            page_token = str(data.get("nextPageToken") or page_token)
+            if self._stop_event.is_set():
+                return
+            self._page_token = str(data.get("nextPageToken") or self._page_token)
             items = data.get("items") or []
-            if first_batch:
+            if self._first_batch:
                 # The first list response can contain historical messages. Start at its continuation token so the AI only answers new arrivals but also keeping it contextually aware...
-                first_batch = False
+                self._first_batch = False
             else:
                 for item in items:
                     self._handle_item(item)
             if data.get("offlineAt"):
                 self._live_chat_id = ""
+            if not self._live_chat_id:
+                self._page_token = ""
+                self._first_batch = True
+                self._stop_event.wait(300.0)
                 return
-            interval = max(1.0, float(data.get("pollingIntervalMillis") or 5000) / 1000.0)
+            interval = max(5.0, float(data.get("pollingIntervalMillis") or 5000) / 1000.0)
             self._stop_event.wait(interval)
 
     def _handle_item(self, item: dict[str, Any]) -> None:
@@ -274,6 +324,14 @@ class YouTubeProvider(StreamChatProvider):
             "membershipGiftingEvent": "gift_sub",
             "giftMembershipReceivedEvent": "gift_sub",
         }.get(event_type, "milestone")
+
+    @staticmethod
+    def _api_reason(exc: requests.HTTPError) -> str:
+        try:
+            errors = exc.response.json().get("error", {}).get("errors", [])
+            return str(errors[0].get("reason", "")) if errors else ""
+        except Exception:
+            return ""
 
     @staticmethod
     def _api_error(exc: requests.HTTPError) -> str:

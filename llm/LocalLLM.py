@@ -680,9 +680,8 @@ def split_local_response(text: str):
     answer = re.sub(r"<\|end(?:oftext)?\|>", "", answer, flags=re.IGNORECASE)
     answer = re.sub(r"<\|end_of_box\|>", "", answer, flags=re.IGNORECASE)
     answer = re.sub(r"<nothink>", "", answer, flags=re.IGNORECASE)
-    m = re.search(r"(?m)(\[[A-Za-z][A-Za-z0-9_\- ]{0,40}\])", answer)
-    if m and m.start() > 0:
-        answer = answer[m.start():]
+    # Emotion tags are formatting, not a boundary between reasoning and speech.
+    # Preserve any spoken text preceding a tag (including refusals).
     answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
     cleaned_reasoning_parts = []
     for part in reasoning_parts:
@@ -951,8 +950,12 @@ class LocalLLM:
         system_tokens = self.count_tokens(self.extract_message(system_msg))
         context_size  = int(getattr(self, "effective_n_ctx", self.config.n_ctx) or self.config.n_ctx)
         available     = context_size - system_tokens - reserve
-        if available < 512:
-            available = max(512, context_size // 2)
+        if available <= 0:
+            raise ValueError("Local context is too small for the system prompt and generation budget. "
+                             "Increase context size or lower Max Tokens.")
+        if conversation and self.count_tokens(self.extract_message(conversation[-1])) > available:
+            raise ValueError("Current message and memory exceed the available local context. "
+                             "Lower the conversation memory budget or increase context size.")
 
         current_tokens  = 0
         kept: List[Dict[str, Any]] = []
@@ -1109,7 +1112,10 @@ class LocalLLM:
             repeat_penalty=repeat_penalty,
             seed=seed,
         )
-        return split_local_response(resp["choices"][0]["message"]["content"])
+        result = split_local_response(resp["choices"][0]["message"]["content"])
+        result.usage = dict(resp.get("usage") or {})
+        result.usage["finish_reason"] = resp["choices"][0].get("finish_reason", "")
+        return result
 
     async def generate_vision(
         self,
@@ -1237,6 +1243,8 @@ async def response_local(
     temperature:       float = 0.5,
     max_tokens:        int   = 256,
     force_new_context: bool  = False,
+    utility_system_prompt: Optional[str] = None,
+    memory_context: str = "",
 ):
     if not text:
         print("Call received empty text")
@@ -1248,7 +1256,10 @@ async def response_local(
         llm            = await local_init()
         started        = time.time()
         active_history = history if history is not None else get_history()
-        use_vision = llm.spec.is_vision and should_use_vision()
+        request_system = utility_system_prompt if utility_system_prompt is not None else system_message
+        if memory_context:
+            request_system = "\n\n".join(filter(None, [request_system, memory_context]))
+        use_vision = utility_system_prompt is None and llm.spec.is_vision and should_use_vision()
 
         if use_vision:
             print(f"Vision path active — capturing screen for prompt")
@@ -1256,7 +1267,7 @@ async def response_local(
                 text=text,
                 screenshot=True,
                 history=active_history,
-                system_prompt=system_message,
+                system_prompt=request_system,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_k=top_k,
@@ -1268,7 +1279,7 @@ async def response_local(
             result = await llm.generate_text(
                 text=text,
                 history=active_history,
-                system_prompt=system_message,
+                system_prompt=request_system,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_k=top_k,

@@ -28,7 +28,7 @@ AVAILABLE_MODELS = GEMINI_CHAT_MODELS
 class Parameters:
     def __init__(self):
         self.model: str           = "gemini-2.5-flash"
-        self.max_tokens: int      = 1024
+        self.max_tokens: int      = 4096
         self.temperature: float   = 1.0
         self.top_p: float         = 1.0
         self.top_k: Optional[int] = None
@@ -60,14 +60,14 @@ def build_gemini_params(settings: dict | None = None) -> Dict[str, Any]:
             return default if value in ("", None) else value
         params = {
             "model": saved("gemini_model", "gemini-2.5-flash"),
-            "max_tokens": int(saved("gemini_max_tokens", 1024)),
+            "max_tokens": int(saved("gemini_max_tokens", 4096)),
             "temperature": float(saved("gemini_temperature", 1.0)),
             "top_p": float(saved("gemini_top_p", 1.0)),
             "top_k": int(saved("gemini_top_k", 0)),
             "thinking_level": saved("gemini_thinking_level", "medium"),
         }
     params.setdefault("model", "gemini-2.5-flash")
-    params.setdefault("max_tokens", 1024)
+    params.setdefault("max_tokens", 4096)
     params["model"] = normalize_gemini_model(params["model"])
     return params
 
@@ -75,7 +75,7 @@ def build_gemini_params(settings: dict | None = None) -> Dict[str, Any]:
 def build_gemini_config(params: dict, system_prompt: str = "") -> Dict[str, Any]:
     model = str(params.get("model") or "gemini-2.5-flash")
     config: Dict[str, Any] = {
-        "max_output_tokens": int(params.get("max_tokens") or 1024),
+        "max_output_tokens": int(params.get("max_tokens") or 4096),
     }
     if gemini_supports_sampling(model):
         config["temperature"] = float(params.get("temperature", 1.0))
@@ -161,7 +161,7 @@ def reload_system_message(force: bool = True) -> None:
     _system_prompt_mtime = mtime
 
 
-async def gemini_response(user_text: str, settings: dict = None) -> GenerationResult:
+async def gemini_response(user_text: str, settings: dict = None, on_event=None) -> GenerationResult:
     global message_log, _system_prompt
     reload_system_message(force=False)
     params = build_gemini_params(settings)
@@ -196,6 +196,20 @@ async def gemini_response(user_text: str, settings: dict = None) -> GenerationRe
         **build_gemini_config(params, _system_prompt)
     )
     t0 = time.perf_counter()
+    if on_event is not None:
+        from files.llm.streaming import GenerationStream, collect_gemini_stream
+        text, reasoning, content, usage = await collect_gemini_stream(
+            client, params["model"], contents, gen_config, GenerationStream(on_event)
+        )
+        # Commit history only after a complete successful stream.
+        message_log.extend([current_user_content, content])
+        return GenerationResult(
+            text=text, reasoning=reasoning,
+            reasoning_kind="provider_summary" if reasoning else "none",
+            provider="Gemini", model=params["model"],
+            usage={"input_tokens": getattr(usage, "prompt_token_count", None),
+                   "output_tokens": getattr(usage, "candidates_token_count", None)},
+        )
     try:
         response = await client.aio.models.generate_content(
             model    = params.get("model", "gemini-2.5-flash"),
@@ -230,7 +244,7 @@ async def gemini_response(user_text: str, settings: dict = None) -> GenerationRe
     in_tok  = getattr(usage, "prompt_token_count",     "?") if usage else "?"
     out_tok = getattr(usage, "candidates_token_count", "?") if usage else "?"
     Logger.notify(
-        f"[GEMINI TTFC]: {(t1 - t0):.2f}s | "
+        f"[GEMINI complete]: {(t1 - t0):.2f}s | "
         f"prompt_msgs={len(message_log)} | "
         f"in={in_tok} | out={out_tok} | "
         f"characters={len(text)}"

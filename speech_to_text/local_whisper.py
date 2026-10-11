@@ -1,5 +1,6 @@
 import queue
 import threading
+import time
 from typing import Callable, Optional
 
 import numpy as np
@@ -7,6 +8,7 @@ import numpy as np
 from files.speech_to_text.stt_config import STTConfig
 from files.speech_to_text.utterance_capture import SAMPLE_RATE, UtteranceCapture
 from files.system_setup.system_logger import Logger
+from files.speech_to_text.transcription_work import WorkGate, drain
 
 
 class STTCore:
@@ -28,6 +30,9 @@ class STTCore:
         self._latest_partial: Optional[np.ndarray] = None
         self._asr_thread: Optional[threading.Thread] = None
         self._session = 0
+        self._work = WorkGate()
+        self._preview_seconds = 0.0
+        self._next_preview_at = 0.0
 
     def _status(self, phase: str, detail: str = "") -> None:
         if self._on_status:
@@ -42,11 +47,14 @@ class STTCore:
         on_status: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         if self._asr_thread and self._asr_thread.is_alive():
+            if self._stop.is_set():
+                raise RuntimeError("Previous local transcription is still stopping.")
             return
         self._on_text = on_text
         self._on_status = on_status
         self._stop.clear()
         self._paused.clear()
+        self._work.resume()
         self._session += 1
         session = self._session
         self._status("starting", f"Loading local model {self.cfg.model_name!r}.")
@@ -62,6 +70,7 @@ class STTCore:
         self._capture = UtteranceCapture(
             input_device_index=self.input_device_index,
             cfg=self.cfg,
+            protect_pending_audio=True,
             on_final=lambda audio: self._queue_final(audio, session),
             on_partial=lambda audio: self._queue_partial(audio, session),
         )
@@ -86,27 +95,34 @@ class STTCore:
         if session != self._session or self._stop.is_set() or not self.cfg.enable_partials:
             return
         with self._partial_lock:
-            self._latest_partial = audio
+            if time.perf_counter() < self._next_preview_at or not self._final_q.empty():
+                return
+            self._latest_partial = self._work.make(audio, partial=True)
 
     def _queue_final(self, audio: np.ndarray, session: int) -> None:
         if session != self._session or self._stop.is_set():
             return
         with self._partial_lock:
             self._latest_partial = None
+        work = self._work.make(audio)
+        if work is None:
+            return
         try:
-            self._final_q.put_nowait(audio)
+            self._final_q.put_nowait(work)
         except queue.Full:
             try:
                 self._final_q.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._final_q.put_nowait(audio)
+                self._final_q.put_nowait(work)
             except queue.Full:
                 Logger.warn("Local Whisper dropped an utterance because transcription is behind.")
 
     def _take_partial(self) -> Optional[np.ndarray]:
         with self._partial_lock:
+            if time.perf_counter() < self._next_preview_at or not self._final_q.empty():
+                return None
             audio = self._latest_partial
             self._latest_partial = None
             return audio
@@ -136,32 +152,51 @@ class STTCore:
                 final_audio = None
 
             if final_audio is not None:
+                if not self._work.valid(final_audio):
+                    continue
+                started = time.perf_counter()
                 try:
-                    text = self._transcribe(final_audio, partial=False)
+                    text = self._transcribe(final_audio.audio, partial=False)
+                    Logger.detail(f"STT Local Whisper: queue wait={started - final_audio.queued_at:.3f}s, transcription={time.perf_counter() - started:.3f}s")
                     if text and self._on_text and session == self._session and not self._stop.is_set():
-                        self._on_text(text, False)
-                    if session == self._session:
+                        self._work.deliver(final_audio, text, self._on_text)
+                    if session == self._session and self._work.valid(final_audio):
                         if self._paused.is_set() and self.cfg.push_to_talk:
                             self._status("armed", "Push-to-talk is ready.")
                         elif not self._paused.is_set():
                             self._status("listening", "Local Whisper is listening.")
                 except Exception as exc:
                     Logger.warn(f"Local Whisper transcription failed: {exc}")
-                    self._status("degraded", f"Local transcription failed: {exc}")
+                    if self._work.valid(final_audio):
+                        self._status("degraded", f"Local transcription failed: {exc}")
                 continue
 
             partial_audio = self._take_partial()
             if partial_audio is None:
                 continue
+            if not self._work.valid(partial_audio, partial=True):
+                continue
+            started = time.perf_counter()
             try:
-                text = self._transcribe(partial_audio, partial=True)
+                text = self._transcribe(partial_audio.audio, partial=True)
                 if text and self._on_text and session == self._session and not self._stop.is_set():
-                    self._on_text(text, True)
+                    self._work.deliver(partial_audio, text, self._on_text, partial=True)
             except Exception as exc:
                 Logger.warn(f"Local Whisper partial transcription failed: {exc}")
+            finally:
+                duration = time.perf_counter() - started
+                self._preview_seconds = max(duration, self._preview_seconds * 0.8)
+                self._next_preview_at = time.perf_counter() + max(
+                    self.cfg.partial_interval_ms / 1000.0, self._preview_seconds)
+                with self._partial_lock:
+                    self._latest_partial = None
 
     def pause(self) -> None:
         self._paused.set()
+        self._work.invalidate()
+        drain(self._final_q)
+        with self._partial_lock:
+            self._latest_partial = None
         if self._capture:
             self._capture.pause(discard=True)
         self._status("paused", "Microphone capture is paused.")
@@ -176,9 +211,11 @@ class STTCore:
         self._paused.clear()
         if self._capture:
             self._capture.resume()
+        self._work.resume()
         self._status("listening", "Microphone capture resumed.")
 
     def stop(self) -> None:
+        self._work.invalidate()
         self._session += 1
         self._stop.set()
         if self._capture:
@@ -193,7 +230,7 @@ class STTCore:
         thread = self._asr_thread
         if thread and thread.is_alive():
             thread.join(timeout=2.0)
-        self._asr_thread = None
+        self._asr_thread = thread if thread and thread.is_alive() else None
         if not thread or not thread.is_alive():
             self._model = None
         else:

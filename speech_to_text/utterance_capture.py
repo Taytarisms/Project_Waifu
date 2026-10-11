@@ -94,6 +94,7 @@ class VADUtteranceSegmenter:
         partial_interval = max(0.1, self.cfg.partial_interval_ms / 1000.0)
         if (
             self.cfg.enable_partials
+            and is_speech
             and self.on_partial is not None
             and now - self._last_partial_at >= partial_interval
         ):
@@ -142,8 +143,12 @@ class UtteranceCapture:
         cfg: STTConfig,
         on_final: Callable[[np.ndarray], None],
         on_partial: Optional[Callable[[np.ndarray], None]] = None,
+        protect_pending_audio: bool = False,
     ) -> None:
         self.input_device_index = input_device_index
+        self._protect_pending_audio = protect_pending_audio
+        self._audio_epoch = 0
+        self._audio_lock = threading.RLock()
         self.cfg = cfg
         self._segmenter = VADUtteranceSegmenter(
             cfg,
@@ -223,7 +228,7 @@ class UtteranceCapture:
         self._put_audio(mono.copy(), self._capture_rate)
 
     def _put_audio(self, block: np.ndarray, sample_rate: int) -> None:
-        item = ("audio", (block, sample_rate))
+        item = ("audio", (block, sample_rate, self._audio_epoch))
         try:
             self._queue.put_nowait(item)
             return
@@ -288,17 +293,31 @@ class UtteranceCapture:
                     value.set()
                 continue
             if command == "audio":
-                block, sample_rate = value
-                self._segmenter.feed(self._pcm16(block, int(sample_rate)))
+                block, sample_rate, epoch = value
+                with self._audio_lock:
+                    if self._protect_pending_audio and epoch != self._audio_epoch:
+                        continue
+                    self._segmenter.feed(self._pcm16(block, int(sample_rate)))
 
     def pause(self, *, discard: bool = True) -> None:
         self._paused.set()
         if discard:
-            self._put_control("reset", None)
+            if not self._protect_pending_audio:
+                self._put_control("reset", None)
+                return
+            with self._audio_lock:
+                self._audio_epoch += 1
+                self._segmenter.reset()
 
     def resume(self) -> None:
-        self._put_control("reset", None)
-        self._paused.clear()
+        if not self._protect_pending_audio:
+            self._put_control("reset", None)
+            self._paused.clear()
+            return
+        with self._audio_lock:
+            self._audio_epoch += 1
+            self._segmenter.reset()
+            self._paused.clear()
 
     def force_flush_and_pause(self) -> None:
         self._paused.set()

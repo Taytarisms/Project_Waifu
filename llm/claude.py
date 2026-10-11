@@ -282,7 +282,7 @@ def reload_system_message(force: bool = True) -> None:
     _system_prompt_mtime = mtime
 
 
-async def claude_response(user_text: str, settings: dict = None) -> GenerationResult:
+async def claude_response(user_text: str, settings: dict = None, on_event=None) -> GenerationResult:
     global message_log, _system_prompt
     reload_system_message(force=False)
     params = build_claude_params(settings)
@@ -311,9 +311,12 @@ async def claude_response(user_text: str, settings: dict = None) -> GenerationRe
     total_output_tokens = 0
 
     try:
-        completion = await client.messages.create(
-            **build_claude_request(params, message_log, _system_prompt)
-        )
+        request = build_claude_request(params, message_log, _system_prompt)
+        if on_event is not None:
+            from files.llm.cloud_streams import claude_stream
+            completion = await claude_stream(client, request, on_event)
+        else:
+            completion = await client.messages.create(**request)
         input_tokens, output_tokens = _usage_tokens(completion)
         total_input_tokens += input_tokens
         total_output_tokens += output_tokens
@@ -347,13 +350,16 @@ async def claude_response(user_text: str, settings: dict = None) -> GenerationRe
                 f"output_tokens={total_output_tokens})."
             )
     except Exception as e:
+        if on_event is not None:
+            del message_log[history_length:]
+            raise
         Logger.error(f"Error in Claude LLM Generation: {e}")
         print(traceback.format_exc())
         del message_log[history_length:]
         return GenerationResult(provider="Claude", model=str(params.get("model") or ""))
     t1 = time.perf_counter()
     Logger.notify(
-        f"[CLAUDE TTFC]: {(t1 - t0):.2f}s | "
+        f"[CLAUDE complete]: {(t1 - t0):.2f}s | "
         f"prompt_msgs={len(message_log)} | "
         f"in={total_input_tokens} | out={total_output_tokens} | "
         f"stop={stop_reason} | "

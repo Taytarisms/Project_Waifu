@@ -568,6 +568,10 @@ def _finish_backend(label: str, code: int, *, expect_gpu: bool = False) -> bool:
 
 
 def main() -> int:
+    if os.environ.get("AI_COMPANION_LLAMA_BACKEND", "auto").strip().lower() == "vulkan":
+        # Explicit Vulkan setup must never silently succeed with a CPU build.
+        from install_vulkan import main as install_vulkan
+        return install_vulkan([])
     tiers = _candidate_tiers()
     try:
         manifest = _load_wheel_manifest()

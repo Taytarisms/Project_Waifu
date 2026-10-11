@@ -19,8 +19,45 @@ class Logger:
         cls.current_turn_id = None
 
     @classmethod
+    def stream_answer(cls, turn_id, speaker, text):
+        ui = cls.ui_ref
+        if ui is not None and turn_id:
+            try:
+                ui.after(0, lambda: ui.stream_answer(turn_id, speaker, text))
+            except Exception:
+                pass
+
+    @classmethod
     def bind_ui(cls, ui):
         cls.ui_ref = ui
+
+    @classmethod
+    def turn_metric(cls, text, turn_id):
+        cls.quiet_print(text)
+        ui = cls.ui_ref
+        if ui is not None and turn_id:
+            try:
+                ui.after(0, lambda: ui.log_status(text, turn_id))
+            except Exception:
+                pass
+
+    @classmethod
+    def detail(cls, text):
+        cls.quiet_print(text)
+        try:
+            from files.ui.pages.logs import LogManager
+            LogManager.record("LATENCY", text)
+        except Exception:
+            pass
+
+    @classmethod
+    def memory_summary(cls, summary):
+        ui = cls.ui_ref
+        if ui is not None and hasattr(ui, "show_memory_summary"):
+            payload = {"id": summary["id"], "text": summary["text"],
+                       "count": len(summary.get("turn_ids", [])),
+                       "created_at": summary.get("created_at")}
+            ui.after(0, lambda: ui.show_memory_summary(payload))
 
     @classmethod
     def unbind_ui(cls):

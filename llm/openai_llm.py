@@ -79,7 +79,7 @@ def get_openai_client() -> AsyncOpenAI:
 class Parameters:
     def __init__(self):
         self.model: str | None = None
-        self.max_tokens: int = 300
+        self.max_tokens: int = 4096
         self.prompt: dict[str, str] | None = None
         self.messages: List[Dict[str, str]] = []
         self.temperature: float = 1.0
@@ -119,7 +119,7 @@ def build_openai_params(settings: dict | None = None) -> Dict[str, Any]:
         return default if value in ("", None) else value
     return {
         "model": saved("openai_model", "gpt-5.6-luna"),
-        "max_tokens": int(saved("openai_max_tokens", 512)),
+        "max_tokens": int(saved("openai_max_tokens", 4096)),
         "temperature": float(saved("openai_temperature", 0.7)),
         "top_p": float(saved("openai_top_p", 1.0)),
         "frequency_penalty": float(saved("openai_frequency_penalty", 0.0)),
@@ -197,7 +197,7 @@ def system_message(system_text: Optional[str] = None) -> None:
         ensure_system_message_loaded(force=True)
 
 
-async def open_response(user_text, settings: dict = None) -> GenerationResult:
+async def open_response(user_text, settings: dict = None, on_event=None) -> GenerationResult:
     global message_log
     ensure_system_message_loaded()
     params = build_openai_params(settings)
@@ -218,8 +218,14 @@ async def open_response(user_text, settings: dict = None) -> GenerationResult:
 
         kwargs = build_openai_request(params, working_messages)
         try:
-            completion = await openai_client.responses.create(**kwargs)
+            if on_event is not None:
+                from files.llm.cloud_streams import openai_stream
+                completion = await openai_stream(openai_client, kwargs, on_event)
+            else:
+                completion = await openai_client.responses.create(**kwargs)
         except Exception as first_error:
+            if on_event is not None:
+                raise
             error_text = str(first_error).lower()
             if "summary" not in error_text and "verification" not in error_text:
                 raise
@@ -231,6 +237,8 @@ async def open_response(user_text, settings: dict = None) -> GenerationResult:
         text = str(completion.output_text or "").strip()
         reasoning_summary = _openai_reasoning_summary(completion)
     except Exception as e:
+        if on_event is not None:
+            raise
         Logger.error(f"Error in LLM Generation: {e}")
         print(traceback.format_exc())
         return GenerationResult(
@@ -240,7 +248,7 @@ async def open_response(user_text, settings: dict = None) -> GenerationResult:
         )
     t1 = time.perf_counter()
     Logger.notify(
-        f"[LLM TTFC]: {(t1 - t0):.2f}s | "
+        f"[OpenAI complete]: {(t1 - t0):.2f}s | "
         f"prompt_msgs={len(working_messages)} | characters={len(text)}"
     )
     Logger.quiet_print(text)

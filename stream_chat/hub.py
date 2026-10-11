@@ -1,6 +1,7 @@
 import queue
 import threading
 import time
+import math
 from collections import OrderedDict
 from itertools import count
 from pathlib import Path
@@ -45,6 +46,12 @@ class StreamChatHub:
         self.provider_backlog = _setting_int("STREAM_CHAT_PROVIDER_BACKLOG", 40)
         self.enabled_providers = _enabled_from_settings()
         self.paused = bool(get_settings("STREAM_CHAT_PAUSED"))
+        self.cooldown_enabled = get_bool_setting("STREAM_CHAT_COOLDOWN_ENABLED", default=False)
+        try:
+            self.cooldown_seconds = self._validate_cooldown(get_settings("STREAM_CHAT_COOLDOWN_SECONDS") or 20)
+        except (ValueError, TypeError):
+            self.cooldown_seconds = 20.0
+        self._last_dispatch_finished = None
 
         self._priority: list[StreamChatMessage] = []
         self._standard: list[StreamChatMessage] = []
@@ -149,6 +156,8 @@ class StreamChatHub:
         return True
 
     def enqueue(self, message: StreamChatMessage) -> bool:
+        if not self._twitch_input_allowed(message):
+            return False
         if (
             not message.text
             or message.provider not in self.enabled_providers
@@ -169,6 +178,15 @@ class StreamChatHub:
             self._condition.notify_all()
         self._notify_queue()
         return True
+
+    @staticmethod
+    def _twitch_input_allowed(message):
+        if message.provider != "twitch" or not get_bool_setting("TWITCH_REDEEM_ONLY", default=False):
+            return True
+        reward_id = str(get_settings("TWITCH_INPUT_REWARD_ID") or "").strip()
+        return bool(reward_id and message.event_type == "input_redemption"
+                    and isinstance(message.raw, dict)
+                    and message.raw.get("reward_id") == reward_id)
 
     def _refresh_blocked_authors(self) -> None:
         now = time.time()
@@ -379,10 +397,32 @@ class StreamChatHub:
             except Exception:
                 pass
 
+    @staticmethod
+    def _validate_cooldown(seconds):
+        seconds = float(seconds)
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("Cooldown must be a positive number of seconds.")
+        return seconds
+
+    def set_cooldown(self, enabled, seconds):
+        seconds = self._validate_cooldown(seconds)
+        save_settings("STREAM_CHAT_COOLDOWN_SECONDS", seconds)
+        save_settings("STREAM_CHAT_COOLDOWN_ENABLED", bool(enabled))
+        with self._condition:
+            self.cooldown_enabled = bool(enabled)
+            self.cooldown_seconds = seconds
+            self._condition.notify_all()
+        self._notify_queue()
+
+    def _cooldown_remaining(self):
+        if not self.cooldown_enabled or self._last_dispatch_finished is None:
+            return 0.0
+        return max(0.0, self.cooldown_seconds - (time.monotonic() - self._last_dispatch_finished))
+
     def _dispatch_loop(self) -> None:
         while True:
             with self._condition:
-                self._condition.wait_for(
+                ready = self._condition.wait_for(
                     lambda: not self._running
                     or (
                         not self.paused
@@ -393,6 +433,16 @@ class StreamChatHub:
                 )
                 if not self._running:
                     return
+                # wait_for may time out while paused: never dequeue then.
+                if not ready:
+                    continue
+                # Recheck queued items when redeem-only settings change.
+                self._standard[:] = [m for m in self._standard if self._twitch_input_allowed(m)]
+                self._priority[:] = [m for m in self._priority if self._twitch_input_allowed(m)]
+                remaining = self._cooldown_remaining()
+                if remaining > 0:
+                    self._condition.wait(timeout=min(remaining, 0.5))
+                    continue
                 item = select_next(
                     self._standard,
                     self._priority,
@@ -410,6 +460,7 @@ class StreamChatHub:
             finally:
                 with self._condition:
                     self._in_pipeline = False
+                    self._last_dispatch_finished = time.monotonic()
                     self._condition.notify_all()
                 self._notify_queue()
 

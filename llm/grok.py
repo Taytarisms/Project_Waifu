@@ -27,7 +27,7 @@ AVAILABLE_MODELS = GROK_CHAT_MODELS
 class Parameters:
     def __init__(self):
         self.model: str         = "grok-4.5"
-        self.max_tokens: int    = 1024
+        self.max_tokens: int    = 4096
         self.temperature: float = 1.0
         self.reasoning_effort: str = "medium"
         self.system_prompt: str = "You are Grok, a helpful AI assistant."
@@ -51,12 +51,12 @@ def build_grok_params(settings: dict | None = None) -> Dict[str, Any]:
             return default if value in ("", None) else value
         params = {
             "model": saved("grok_model", "grok-4.5"),
-            "max_tokens": int(saved("grok_max_tokens", 1024)),
+            "max_tokens": int(saved("grok_max_tokens", 4096)),
             "temperature": float(saved("grok_temperature", 1.0)),
             "reasoning_effort": saved("grok_reasoning_effort", "medium"),
         }
     params.setdefault("model", "grok-4.5")
-    params.setdefault("max_tokens", 1024)
+    params.setdefault("max_tokens", 4096)
     params.setdefault("temperature", 1.0)
     return params
 
@@ -65,7 +65,7 @@ def build_grok_chat_kwargs(params: dict, messages: list) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
         "model": str(params.get("model") or "grok-4.5"),
         "messages": messages,
-        "max_tokens": int(params.get("max_tokens") or 1024),
+        "max_tokens": int(params.get("max_tokens") or 4096),
         "temperature": float(params.get("temperature", 1.0)),
     }
     effort = str(params.get("reasoning_effort") or "").strip().lower()
@@ -106,7 +106,7 @@ def system_message(system_prompt: Optional[str] = None, settings: dict | None = 
     _chat_model = str(params["model"])
     _chat_config = (
         _chat_model,
-        int(params.get("max_tokens") or 1024),
+        int(params.get("max_tokens") or 4096),
         float(params.get("temperature", 1.0)),
         str(params.get("reasoning_effort") or "").lower(),
     )
@@ -158,7 +158,7 @@ def reload_system_message(force: bool = True) -> None:
     _chat_config = ()
 
 
-async def grok_response(user_text: str, settings: dict = None) -> GenerationResult:
+async def grok_response(user_text: str, settings: dict = None, on_event=None) -> GenerationResult:
     global _chat, _chat_model, _chat_config, message_log
     reload_system_message(force=False)
     params = build_grok_params(settings)
@@ -171,7 +171,7 @@ async def grok_response(user_text: str, settings: dict = None) -> GenerationResu
             return GenerationResult(provider="Grok", model=str(params.get("model") or ""))
     desired_config = (
         str(params.get("model") or "grok-4.5"),
-        int(params.get("max_tokens") or 1024),
+        int(params.get("max_tokens") or 4096),
         float(params.get("temperature", 1.0)),
         str(params.get("reasoning_effort") or "").lower(),
     )
@@ -183,9 +183,18 @@ async def grok_response(user_text: str, settings: dict = None) -> GenerationResu
             return GenerationResult(provider="Grok", model=str(params.get("model") or ""))
     t0 = time.perf_counter()
     try:
-        _chat.append(xai_user(user_text))
-        response = await _chat.sample()
+        if on_event is not None:
+            from files.llm.cloud_streams import grok_stream
+            working_chat = _get_client().chat.create(**build_grok_chat_kwargs(params, list(_chat.messages)))
+            working_chat.append(xai_user(user_text))
+            response = await grok_stream(working_chat, on_event)
+            _chat = working_chat
+        else:
+            _chat.append(xai_user(user_text))
+            response = await _chat.sample()
     except Exception as e:
+        if on_event is not None:
+            raise
         Logger.error(f"Error in Grok LLM Generation: {e}")
         print(traceback.format_exc())
         return GenerationResult(provider="Grok", model=str(params.get("model") or ""))
@@ -193,7 +202,7 @@ async def grok_response(user_text: str, settings: dict = None) -> GenerationResu
     text = str(response.content or "").strip()
     reasoning = str(getattr(response, "reasoning_content", "") or "").strip()
     Logger.notify(
-        f"[GROK TTFC]: {(t1 - t0):.2f}s | "
+        f"[GROK complete]: {(t1 - t0):.2f}s | "
         f"prompt_msgs={len(message_log)} | "
         f"characters={len(text)}"
     )

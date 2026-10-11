@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 import httpx
+from files.llm.novelai_runtime import coordinated, runtime, status_code
 
 try:
     from aiohttp import ClientSession
@@ -111,7 +112,7 @@ def looks_like_prompt_leak(text: str) -> bool:
 def sanitize_novelai_reply(text: str, *, cut_newline: bool = True) -> str:
     if not text:
         return ""
-    text = _strip_template_artifacts(str(text))
+    text = _strip_template_artifacts(str(text).lstrip())
     match = _PROMPT_LEAK_RE.search(text)
     if match:
         text = text[:match.start()]
@@ -178,7 +179,25 @@ def load_character(name: str | None = DEFAULT_CHARACTER) -> dict:
 def load_char_name(character_key: str | None = DEFAULT_CHARACTER) -> str:
     character_key = _safe_character_name(character_key)
     character = load_character(character_key)
-    return character.get("name") or character_key or "Assistant"
+    return character.get("char_name") or character.get("name") or character_key or "Assistant"
+
+
+def legacy_model(parameters):
+    key = str(parameters.get("legacy_model") or "kayra").lower()
+    models = {"kayra": Model.Kayra, "clio": Model.Clio, "erato": Model.Erato}
+    if key not in models:
+        raise ValueError(f"Unsupported NovelAI completion model: {key}")
+    return models[key]
+
+
+def dialogue_name(value):
+    return re.sub(r"[\r\n:]", " ", str(value or "Assistant")).strip()
+
+
+def unlabel(text, name):
+    text = str(text or "").strip()
+    prefix = name + ":"
+    return text[len(prefix):].lstrip() if text.casefold().startswith(prefix.casefold()) else text
 
 def normalize_character_card(char: dict) -> dict:
     return {
@@ -194,9 +213,11 @@ def build_novelai_completion_prompt(
     character: dict,
     history: Optional[List[HistoryEntry]] = None,
     user_name: str = "User",
+    preserve_context: bool = False,
 ) -> str:
     char = normalize_character_card(character)
-    name = char["name"]
+    name = dialogue_name(char["name"])
+    user_name = dialogue_name(user_name)
     persona = (char["persona"] or "").strip()
     personality = (char["personality"] or "").strip()
     examples = (char["example_dialogue"] or "").strip()
@@ -224,21 +245,23 @@ def build_novelai_completion_prompt(
         lines.append("***")
         lines.append("[ Style: chat ]")
         lines.append("")
+        examples = examples.replace("{{char}}", name).replace("{{user}}", user_name)
+        examples = re.sub(r"(?m)^User:", lambda _: user_name + ":", examples)
         lines.append(examples)
+        lines.append("***")
 
     for entry in (history or []):
         role = entry.get("role", "")
-        content = clean_history_content(entry.get("content") or "")
+        content = str(entry.get("content") or "").strip()
         if not content:
             continue
 
-        if role == "user":
-            lines.append(f"{user_name}: {content}")
-        elif role == "assistant":
-            lines.append(f"{name}: {content}")
+        if role in ("user", "assistant"):
+            historical_name = dialogue_name(entry.get("speaker") or (user_name if role == "user" else name))
+            lines.append(f"{historical_name}: {unlabel(content, historical_name)}")
 
-    clean_user_text = extract_latest_user_message(user_text)
-    lines.append(f"{user_name}: {clean_user_text}")
+    clean_user_text = user_text if preserve_context else extract_latest_user_message(user_text)
+    lines.append(f"{user_name}: {unlabel(clean_user_text, user_name)}")
     lines.append(f"{name}:")
 
     return "\n".join(lines).strip()
@@ -249,6 +272,7 @@ def format_kayra_instruction(
     character_name: str = DEFAULT_CHARACTER,
     history: Optional[List[HistoryEntry]] = None,
     user_name: str = "User",
+    preserve_context: bool = False,
 ) -> str:
     character = load_character(character_name)
     return build_novelai_completion_prompt(
@@ -256,6 +280,7 @@ def format_kayra_instruction(
         character=character,
         history=history,
         user_name=user_name,
+        preserve_context=preserve_context,
     )
 
 def _get_param(parameters: Dict[str, Any], key: str, default: Any) -> Any:
@@ -460,6 +485,7 @@ class NovelAIClient:
     async def can_use_xialong(self) -> bool:
         return await self.detect_tier() == "Opus"
 
+    @coordinated
     async def generate_full(
         self,
         custom_prompt: Union[str, List[int]],
@@ -472,13 +498,19 @@ class NovelAIClient:
         max_history_turns: int = 20,
         save_history: bool = True,
         route: Optional[str] = None,
+        preserve_context: bool = False,
+        history_override: Optional[List[HistoryEntry]] = None,
+        memory_context: str = "",
     ) -> str:
         self.trim_history(max_history_turns)
 
         model_key = (model_name or "kayra").lower()
+        parameters = dict(parameters, legacy_model=model_key)
         display_name = load_char_name(character_name)
-        user_text = extract_latest_user_message(str(custom_prompt))
-        history = self.get_history()
+        user_text = str(custom_prompt) if preserve_context else extract_latest_user_message(str(custom_prompt))
+        history = history_override if history_override is not None else self.get_history()
+        if memory_context:
+            system_text = "\n\n".join(filter(None, [system_text, memory_context]))
 
         if model_key in NAI_OA_MODELS:
             reply = await self.generate_openai_compatible(
@@ -487,42 +519,35 @@ class NovelAIClient:
                 model_name=model_key,
                 system_text=system_text,
                 history=history,
+                preserve_context=preserve_context,
             )
 
         elif model_key in NAI_LEGACY_MODELS:
+            parameters["speaker_names"] = list({user_name, display_name} | {
+                str(entry["speaker"]) for entry in history if entry.get("speaker")})
             prompt = format_kayra_instruction(
                 user_text,
                 character_name,
                 history=history,
                 user_name=user_name,
+                preserve_context=preserve_context,
             )
             reply = await self.generate_prompt_completion(
-                prompt,
+                (memory_context + "\n\n" + prompt) if memory_context else prompt,
                 parameters,
                 character=display_name,
                 route=route,
             )
 
         else:
-            Logger.warn(f"Unknown NovelAI model {model_name!r}, falling back to Kayra.")
-            prompt = format_kayra_instruction(
-                user_text,
-                character_name,
-                history=history,
-                user_name=user_name,
-            )
-            reply = await self.generate_prompt_completion(
-                prompt,
-                parameters,
-                character=display_name,
-                route=route,
-            )
+            raise ValueError(f"Unsupported NovelAI model: {model_name}")
         reply = sanitize_novelai_reply(reply)
         if save_history and reply and not looks_like_prompt_leak(reply):
             self.add_to_history("user", user_text)
             self.add_to_history("assistant", reply)
         return reply
 
+    @coordinated
     async def generate_prompt_completion(
         self,
         prompt: Union[str, List[int]],
@@ -537,6 +562,12 @@ class NovelAIClient:
         try:
             return await self.generate_legacy_high(prompt, parameters, character=character)
         except Exception as e:
+            # HTTP rejections are not evidence that the high-level route is
+            # incompatible. Repeating a 429/401/5xx through another route is futile.
+            if status_code(e) is not None:
+                raise
+            if not (isinstance(e, RuntimeError) and "high-level route is unavailable" in str(e)):
+                raise
             Logger.warn(f"NovelAI high-level route failed; falling back to low route: {e}")
             return await self.generate_legacy_low(prompt, parameters, character=character)
 
@@ -553,6 +584,7 @@ class NovelAIClient:
             character=character,
         )
 
+    @coordinated
     async def generate_legacy_high(
         self,
         custom_prompt: Union[str, List[int]],
@@ -563,8 +595,11 @@ class NovelAIClient:
         if NovelAIAPI is None or ClientSession is None or GlobalSettings is None:
             raise RuntimeError("novelai_api high-level route is unavailable.")
 
-        model = Model.Kayra
-        preset = Preset.from_official(model, "Carefree")
+        model = legacy_model(parameters)
+        preset_name = {Model.Kayra: "Carefree", Model.Clio: "Fresh Coffee", Model.Erato: "Dragonfruit"}[model]
+        preset = Preset.from_official(model, preset_name)
+        if preset is None:
+            raise ValueError(f"NovelAI preset {preset_name} unavailable for {model.value}")
 
         preset.max_length = int(_get_param(parameters, "max_output_length", 150))
         preset.min_length = int(_get_param(parameters, "min_length", 1))
@@ -572,6 +607,12 @@ class NovelAIClient:
         preset.temperature = float(_get_param(parameters, "temperature", 0.8))
         preset.length_penalty = float(_get_param(parameters, "length_penalty", 1.0))
         preset.stop_sequences = _legacy_stop_sequences(model, character)
+        for speaker in parameters.get("speaker_names", []):
+            preset.stop_sequences.append(Tokenizer.encode(model, "\n" + dialogue_name(speaker) + ":"))
+        if parameters.get("utility_summary"):
+            preset.stop_sequences += [Tokenizer.encode(model, "\n\n")]
+        if parameters.get("summary_single_line"):
+            preset.stop_sequences += [Tokenizer.encode(model, marker) for marker in ("\n", "{")]
         global_settings = GlobalSettings(num_logprobs=GlobalSettings.NO_LOGPROBS)
         global_settings.bias_dinkus_asterism = False
         global_settings.generate_until_sentence = True
@@ -588,21 +629,18 @@ class NovelAIClient:
         ban_mode = str(parameters.get("banlist_mode") or "soft").lower()
         bad_words = _strict_structural_banlist() if ban_mode == "strict" else _structural_banlist()
         novel_api = NovelAIAPI(logger=None)
-        async with ClientSession(headers=self.get_auth_headers()) as session:
-            novel_api.attach_session(session)
-            gen = await novel_api.high_level.generate(
-                prompt_tokens,
-                model,
-                preset,
-                global_settings,
-                bad_words,
-                bias_groups,
-                module,
-            )
+        session = runtime().session(self.api_token, self.get_auth_headers())
+        novel_api.attach_session(session)
+        gen = await novel_api.high_level.generate(
+            prompt_tokens, model, preset, global_settings, bad_words, bias_groups, module,
+        )
 
-        decoded = Tokenizer.decode(model, b64_to_tokens(gen["output"]))
-        return sanitize_novelai_reply(decoded)
+        decoded = Tokenizer.decode(model, b64_to_tokens(gen["output"], 4 if model is Model.Erato else 2))
+        if parameters.get("summary_single_line"):
+            return decoded.strip()  # Validate raw output before dialogue cleanup can hide it.
+        return sanitize_novelai_reply(decoded, cut_newline=not parameters.get("utility_summary", False))
 
+    @coordinated
     async def generate_legacy_low(
         self,
         custom_prompt: Union[str, List[int]],
@@ -610,13 +648,15 @@ class NovelAIClient:
         *,
         character: Optional[str] = None,
     ) -> str:
-        model = Model.Kayra
+        model = legacy_model(parameters)
         max_length = int(_get_param(parameters, "max_output_length", 150))
         temperature = float(_get_param(parameters, "temperature", 0.8))
         repetition_penalty = float(_get_param(parameters, "repetition_penalty", 1.35))
         top_k = int(_get_param(parameters, "top_k", 40))
         top_p = float(_get_param(parameters, "top_p", 0.9))
         stop_sequences = _legacy_stop_sequences(model, character)
+        for speaker in parameters.get("speaker_names", []):
+            stop_sequences.append(Tokenizer.encode(model, "\n" + dialogue_name(speaker) + ":"))
         params = {
             "max_length": max_length,
             "min_length": 1,
@@ -628,6 +668,11 @@ class NovelAIClient:
             "generate_until_sentence": True,
             "stop_sequences": stop_sequences,
         }
+        if parameters.get("utility_summary"):
+            params["length_penalty"] = float(_get_param(parameters, "length_penalty", 0))
+            params["stop_sequences"] += [Tokenizer.encode(model, "\n\n")]
+        if parameters.get("summary_single_line"):
+            params["stop_sequences"] += [Tokenizer.encode(model, marker) for marker in ("\n", "{")]
 
         prompt_tokens = (
             Tokenizer.encode(model, custom_prompt)
@@ -638,21 +683,22 @@ class NovelAIClient:
         prompt_b64 = tokens_to_b64(prompt_tokens, 4 if model is Model.Erato else 2)
         data = {"input": prompt_b64, "model": model.value, "parameters": params}
         url = "https://text.novelai.net/ai/generate"
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(url, headers=self.get_auth_headers(), json=data)
+        response = await runtime().http_client().post(url, headers=self.get_auth_headers(), json=data)
         if response.status_code != 200:
-            Logger.error(f"Legacy generate error {response.status_code}: {response.text}")
-            return ""
+            response.raise_for_status()
         content = response.json()
-        token_list = b64_to_tokens(content["output"])
+        token_list = b64_to_tokens(content["output"], 4 if model is Model.Erato else 2)
         decoded = Tokenizer.decode(model, token_list)
+        if parameters.get("summary_single_line"):
+            return decoded.strip()
         if character:
             decoded = decoded.split(f"\n{character}:", 1)[0]
             decoded = decoded.split(f" {character}:", 1)[0]
         decoded = decoded.split("\nUser:", 1)[0]
         decoded = decoded.split(" User:", 1)[0]
-        return sanitize_novelai_reply(decoded)
+        return sanitize_novelai_reply(decoded, cut_newline=not parameters.get("utility_summary", False))
 
+    @coordinated
     async def generate_openai_compatible(
         self,
         user_text: str,
@@ -661,6 +707,7 @@ class NovelAIClient:
         model_name: str = "xialong-v1",
         system_text: Optional[str] = None,
         history: Optional[List[HistoryEntry]] = None,
+        preserve_context: bool = False,
     ) -> str:
         messages: list[dict] = []
         if system_text:
@@ -670,7 +717,7 @@ class NovelAIClient:
             content = clean_history_content(entry.get("content") or "")
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": extract_latest_user_message(user_text)})
+        messages.append({"role": "user", "content": user_text if preserve_context else extract_latest_user_message(user_text)})
         payload = {
             "model": model_name,
             "messages": messages,
@@ -679,11 +726,9 @@ class NovelAIClient:
             "top_p": float(_get_param(parameters, "top_p", 0.9)),
         }
         url = "https://text.novelai.net/oa/v1/chat/completions"
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(url, headers=self.get_auth_headers(), json=payload)
+        response = await runtime().http_client().post(url, headers=self.get_auth_headers(), json=payload)
         if response.status_code not in (200, 201):
-            Logger.error(f"NovelAI OA error {response.status_code}: {response.text}")
-            return ""
+            response.raise_for_status()
         return sanitize_novelai_reply(response.json()["choices"][0]["message"]["content"])
 
 async def fetch_user_info(token: str) -> dict:

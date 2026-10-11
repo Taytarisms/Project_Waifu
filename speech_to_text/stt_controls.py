@@ -503,7 +503,7 @@ def build_openai_config():
     return OpenAIWhisperConfig(
         model=_setting("stt_openai_model", "gpt-4o-transcribe"),
         language=_setting("stt_language", "en") or "en",
-        chunk_seconds=float(_setting("stt_openai_chunk_seconds", 5.0)),
+        request_timeout=float(_setting("stt_openai_request_timeout", 20.0)),
     )
 
 
@@ -578,6 +578,29 @@ def start_stt(on_text=None) -> bool:
             active_core = core_cls(
                 input_device_index=device_index,
                 cfg=local_cfg,
+            )
+
+        elif engine == "OpenAI Live Transcription":
+            from files.speech_to_text.openai_live import OpenAILiveCore, LiveConfig
+            active_core = OpenAILiveCore(
+                input_device_index=device_index,
+                cfg=LiveConfig(
+                    model=str(_setting("stt_openai_live_model", "gpt-live-transcribe")),
+                    language=str(_setting("stt_language", "en") or ""),
+                    push_to_talk=_is_push_to_talk(),
+                ),
+                capture_cfg=build_capture_config(enable_partials=False),
+            )
+
+        elif engine == "Deepgram Flux":
+            from files.speech_to_text.deepgram_flux import DeepgramFluxCore, FluxConfig
+            active_core = DeepgramFluxCore(
+                input_device_index=device_index,
+                cfg=FluxConfig(
+                    model=str(_setting("stt_deepgram_model", "flux-general-en")),
+                    eot_threshold=float(_setting("stt_deepgram_eot_threshold", 0.7)),
+                    push_to_talk=_is_push_to_talk(),
+                ),
             )
 
         elif engine in ("OpenAI Whisper", "OpenAI Transcription"):

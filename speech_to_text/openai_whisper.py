@@ -2,6 +2,8 @@ from dataclasses import dataclass
 import io
 import queue
 import threading
+import time
+import httpx
 from typing import Callable, Optional
 import wave
 
@@ -12,12 +14,13 @@ from files.speech_to_text.stt_config import STTConfig
 from files.speech_to_text.utterance_capture import SAMPLE_RATE, UtteranceCapture
 from files.system_setup.settings import get_auth
 from files.system_setup.system_logger import Logger
+from files.speech_to_text.transcription_work import WorkGate, drain
 
 @dataclass
 class OpenAIWhisperConfig:
     model: str = "gpt-4o-transcribe"
     language: str = "en"
-    chunk_seconds: float = 5.0
+    request_timeout: float = 20.0
 
 class OpenAIWhisperCore:
     def __init__(
@@ -39,6 +42,7 @@ class OpenAIWhisperCore:
         self._on_text: Optional[Callable[[str, bool], None]] = None
         self._on_status: Optional[Callable[[str, str], None]] = None
         self._session = 0
+        self._work = WorkGate()
 
     def _status(self, phase: str, detail: str = "") -> None:
         if self._on_status:
@@ -53,14 +57,19 @@ class OpenAIWhisperCore:
         on_status: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         if self._worker_thread and self._worker_thread.is_alive():
+            if self._stop.is_set():
+                raise RuntimeError("Previous OpenAI transcription is still stopping.")
             return
         if not self._api_key:
             raise RuntimeError("OpenAI STT requires an OpenAI API key.")
-        self.client = OpenAI(api_key=self._api_key)
+        self.client = OpenAI(api_key=self._api_key,
+            timeout=httpx.Timeout(max(5.0, float(self.cfg.request_timeout)), connect=5.0),
+            max_retries=0)
         self._on_text = on_text
         self._on_status = on_status
         self._stop.clear()
         self._paused.clear()
+        self._work.resume()
         self._session += 1
         session = self._session
         self._status("starting", f"Opening microphone for {self.cfg.model}.")
@@ -68,12 +77,14 @@ class OpenAIWhisperCore:
         self._capture = UtteranceCapture(
             input_device_index=self.input_device_index,
             cfg=self.capture_cfg,
+            protect_pending_audio=True,
             on_final=lambda audio: self._queue_utterance(audio, session),
         )
         try:
             self._capture.start()
         except Exception:
             self._capture = None
+            self.client.close()
             self.client = None
             self._status("failed", "Could not open the selected microphone.")
             raise
@@ -90,8 +101,11 @@ class OpenAIWhisperCore:
     def _queue_utterance(self, audio: np.ndarray, session: int) -> None:
         if session != self._session or self._stop.is_set():
             return
+        work = self._work.make(audio)
+        if work is None:
+            return
         try:
-            self._jobs.put_nowait(audio)
+            self._jobs.put_nowait(work)
             return
         except queue.Full:
             pass
@@ -100,11 +114,19 @@ class OpenAIWhisperCore:
         except queue.Empty:
             pass
         try:
-            self._jobs.put_nowait(audio)
+            self._jobs.put_nowait(work)
         except queue.Full:
             Logger.warn("OpenAI STT dropped an utterance because requests are behind.")
 
     def _worker(self, session: int) -> None:
+        client = self.client
+        try:
+            self._process_jobs(session)
+        finally:
+            if client is not None:
+                client.close()
+
+    def _process_jobs(self, session: int) -> None:
         while not self._stop.is_set() and session == self._session:
             try:
                 audio = self._jobs.get(timeout=0.1)
@@ -112,14 +134,20 @@ class OpenAIWhisperCore:
                 continue
             if audio is None:
                 return
+            if not self._work.valid(audio):
+                continue
             self._status("transcribing", "Uploading a completed utterance to OpenAI.")
-            text = self._transcribe(audio)
+            started = time.perf_counter()
+            text = self._transcribe(audio.audio)
+            Logger.detail(f"STT OpenAI: queue wait={started - audio.queued_at:.3f}s, transcription={time.perf_counter() - started:.3f}s")
             if text and self._on_text and session == self._session and not self._stop.is_set():
                 try:
-                    self._on_text(text, False)
+                    self._work.deliver(audio, text, self._on_text)
                 except Exception as exc:
                     Logger.warn(f"OpenAI STT callback failed: {exc}")
-            if text is not None and session == self._session:
+            if text is None and self._work.valid(audio):
+                self._status("degraded", "OpenAI transcription failed; see the log and try again.")
+            if text is not None and session == self._session and self._work.valid(audio):
                 if self._paused.is_set() and self.capture_cfg.push_to_talk:
                     self._status("armed", "Push-to-talk is ready.")
                 elif not self._paused.is_set():
@@ -145,12 +173,13 @@ class OpenAIWhisperCore:
             )
         except Exception as exc:
             Logger.warn(f"OpenAI STT transcription failed (model={self.cfg.model!r}): {exc}")
-            self._status("degraded", f"OpenAI transcription failed: {exc}")
             return None
         return str(getattr(result, "text", "") or "").strip()
 
     def pause(self) -> None:
         self._paused.set()
+        self._work.invalidate()
+        drain(self._jobs)
         if self._capture:
             self._capture.pause(discard=True)
         self._status("paused", "Microphone capture is paused.")
@@ -165,9 +194,11 @@ class OpenAIWhisperCore:
         self._paused.clear()
         if self._capture:
             self._capture.resume()
+        self._work.resume()
         self._status("listening", "Microphone capture resumed.")
 
     def stop(self) -> None:
+        self._work.invalidate()
         self._session += 1
         self._stop.set()
         if self._capture:
@@ -186,7 +217,7 @@ class OpenAIWhisperCore:
             thread.join(timeout=2.0)
         if thread and thread.is_alive():
             Logger.warn("An OpenAI transcription request is still winding down after stop.")
-        self._worker_thread = None
+        self._worker_thread = thread if thread and thread.is_alive() else None
         self.client = None
         while True:
             try:

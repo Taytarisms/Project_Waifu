@@ -2,6 +2,7 @@ import time
 import asyncio
 import concurrent.futures
 import json
+import uuid
 import queue
 from typing import Optional
 import threading
@@ -15,18 +16,70 @@ from files.moderation.check_for_bad_words import check_for_bad_words, decode_bad
 from files.moderation.check_for_spam import is_spam_message
 from files.moderation.text_cleaner import split_message, cleaned_chat_pairings
 from files.fine_tune.fine_tune_creator import create_chat_pair
-from files.system_setup.settings import USERDATA_DIR, get_bool_setting, get_settings
+from files.system_setup.settings import USERDATA_DIR, get_bool_setting, get_settings, save_settings
 from files.system_setup.json_utils import load_json_safe
 from files.tts.narrator.backends.narrator import get_narrator
 from files.closed_captions import clear_caption, caption_coordinator, SOURCE_NARRATOR, SOURCE_USER, SOURCE_LLM
 from files.vtube_studio.hotkeys import VTSHotkeyManager
 from files.system_setup.system_logger import Logger
 from files.ui.pages.logs import LogManager
+from files import client as cc
+from files.main_loop.collab_lifecycle import CollabLifecycle
 
 CENSOR_PLACEHOLDER = "FILTERED"
 BAD_WORDS = decode_bad_words()
 UNKNOWN_USER_ID = "unknown_user"
 message_queue: "queue.Queue[tuple[str, bool, Optional[queue.Queue]]]" = queue.Queue()
+def on_collab_text(message):
+    if not _collab_lifecycle.active:
+        return
+    text = message.payload.content
+    if not isinstance(text, str) or not text.strip():
+        return
+
+    speaker = str(message.payload.name or "Collab").replace(":", "")
+    message_queue.put_nowait((
+        f"{speaker}: {text}",
+        True,
+        None,
+        {"source": "collab"},
+    ))
+
+
+collab_client = cc.CollabConnector(on_text=on_collab_text)
+
+
+def _connect_collab():
+    collab_client.connect(
+            url=cc.DEFAULT_SERVER_URL,
+            channel_id=cc.CHANNEL_ID,
+            user=cc.USER,
+            password=cc.PASS,
+            display_name=cc.DISPLAY_NAME,
+    )
+
+
+_collab_lifecycle = CollabLifecycle(collab_client, _connect_collab, Logger.warn)
+
+
+def _start_collab():
+    if get_bool_setting("COLLAB_ENABLED", default=False):
+        _collab_lifecycle.start()
+
+
+def set_collab_enabled(enabled: bool):
+    """Persist opt-in; connect only while the companion loop is running."""
+    enabled = bool(enabled)
+    save_settings("COLLAB_ENABLED", enabled)
+    if not enabled:
+        _stop_collab()
+    elif _main_future is not None and not _main_future.done():
+        _start_collab()
+
+
+def _stop_collab():
+    _collab_lifecycle.stop()
+
 async_loop = None
 _loop_thread: Optional[threading.Thread] = None
 _main_future = None
@@ -37,6 +90,8 @@ _turn_active = threading.Event()
 SAVED_CHAT = USERDATA_DIR / "conversation_context.json"
 LAST_TURNS = 3
 _persistent_context_injected = False
+_conversation_memory = None
+_ledger_session_id = str(uuid.uuid4())
 STREAM_CHAT_SOURCES = {"twitch", "youtube", "kick"}
 
 def is_turn_active() -> bool:
@@ -59,12 +114,13 @@ def save_context(turns: list[dict]) -> None:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "turns": turns[-LAST_TURNS:],
         }
-        with SAVED_CHAT.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+        from files.memory.conversation import atomic_json
+        atomic_json(SAVED_CHAT, payload)
     except Exception as e:
         Logger.warn(f"Failed to save conversation context: {e}")
 
-def _remember_completed_turn(*, source: str, speaker: str, user_text: str, assistant_text: str) -> None:
+def _remember_completed_turn(*, source: str, speaker: str, user_text: str, assistant_text: str,
+                             generation=None, assistant_name="Assistant") -> None:
     user_text = (user_text or "").strip()
     assistant_text = (assistant_text or "").strip()
     if not user_text or not assistant_text:
@@ -72,8 +128,14 @@ def _remember_completed_turn(*, source: str, speaker: str, user_text: str, assis
     if assistant_text == CENSOR_PLACEHOLDER or assistant_text.startswith(("Error:", "Turn interrupted")):
         return
 
+    memory = get_conversation_memory()
     turns = load_context()
     turns.append({
+        "id": str(uuid.uuid4()),
+        "session_id": _ledger_session_id,
+        "assistant_speaker": assistant_name or "Assistant",
+        "provider": getattr(generation, "provider", ""),
+        "model": getattr(generation, "model", ""),
         "source": source or "chat",
         "speaker": speaker or UNKNOWN_USER_ID,
         "user": user_text,
@@ -81,6 +143,37 @@ def _remember_completed_turn(*, source: str, speaker: str, user_text: str, assis
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     save_context(turns)
+    try:
+        memory.record(turns[-1])
+        from files.memory.summary_generation import generate_summary, store_summary
+        memory.schedule(generate_summary, store_summary)
+    except Exception as exc:
+        Logger.warn(f"Conversation memory could not save the completed turn: {exc}")
+
+
+def get_conversation_memory():
+    global _conversation_memory
+    if _conversation_memory is None:
+        from files.memory.conversation import ConversationMemory
+        _conversation_memory = ConversationMemory(
+            USERDATA_DIR / "conversation_memory.json", get_settings, Logger.quiet_print,
+            on_summary=Logger.memory_summary)
+        _conversation_memory.resume(load_context())
+    return _conversation_memory
+
+
+def prepare_conversation_input(llm_input):
+    memory = get_conversation_memory()
+    from files.memory.summary_generation import generate_summary, store_summary
+    available = None
+    if get_settings("chat_model") == "Local":
+        # Account conservatively for the current input, output and system/template space.
+        available = max(0, int(get_settings("local_n_ctx") or 16384)
+                        - int(get_settings("local_max_tokens") or 4096)
+                        - len(llm_input.encode("utf-8")) - 2048)
+    context = memory.request_context(available)
+    memory.schedule(generate_summary, store_summary)
+    return context
 
 def context_injection(turns: list[dict]) -> str:
     if not turns:
@@ -311,9 +404,11 @@ async def start_emotion_inf(response_text: str) -> None:
         return
     try:
         mapping = manager.load_vts_mapping()
+        emotion_mappings = (mapping.get("advanced", {}).get("emotions", {})
+                            if manager.advanced_mode else mapping.get("emotions", {}))
         mapped_emotions = [
             str(name).strip().lower()
-            for name in mapping.get("emotions", {}).keys()
+            for name in emotion_mappings.keys()
             if str(name).strip()]
 
         if len(mapped_emotions) >= 2:
@@ -359,7 +454,8 @@ async def start_emotion_inf(response_text: str) -> None:
 
     try:
         mapping = manager.load_vts_mapping()
-        mapped = mapping.get("emotions", {})
+        mapped = (mapping.get("advanced", {}).get("emotions", {})
+                  if manager.advanced_mode else mapping.get("emotions", {}))
 
         if emotion not in mapped:
             Logger.warn(
@@ -369,9 +465,11 @@ async def start_emotion_inf(response_text: str) -> None:
             manager.apply_emotion_to_idle(emotion)
             return
 
-        await manager.set_emotion_and_animate_talking(emotion)
-        Logger.print(f"Triggered VTS emotion: {emotion}")
-        _log_info(f"Triggered VTS emotion: {emotion}")
+        if await manager.set_emotion_and_animate_talking(emotion):
+            Logger.print(f"Triggered VTS emotion: {emotion}")
+            _log_info(f"Triggered VTS emotion: {emotion}")
+        else:
+            Logger.warn(f"VTS emotion sequence did not run: {emotion}")
 
     except Exception as e:
         Logger.warn(f"VTS trigger error: {e}")
@@ -473,10 +571,38 @@ async def main_loop():
                 else:
                     llm_input = f"{memory_block}\n\nCurrent Message:\n{llm_input}"
 
-            llm_input = prepend_contetx(llm_input)
             llm_start = time.perf_counter()
+            turn_assistant_name = get_settings("character_name") or "Assistant"
+            novel_character_key = None
+            if current_chat_model == "NovelAI":
+                from files.llm.boilerplate_novel import load_char_name
+                novel_character_key = gen_response._novelai_character_name()
+                turn_assistant_name = load_char_name(novel_character_key)
+            stream_text = ""
+            stream_updated = 0.0
+            def on_generation_event(event):
+                nonlocal stream_text, stream_updated
+                turn_control.raise_if_interrupted()
+                if event.kind in ("first_event", "first_answer", "first_phrase", "complete"):
+                    if event.kind == "first_event":
+                        overhead = max(0.0, time.perf_counter() - llm_start - event.elapsed)
+                        Logger.turn_metric(f"LLM preparation before stream: {overhead:.3f}s", turn_id)
+                    label = {"first_event": "first stream event", "first_answer": "first answer text", "first_phrase": "first phrase (estimated)", "complete": "stream complete"}[event.kind]
+                    Logger.turn_metric(f"LLM {label}: {event.elapsed:.2f}s", turn_id)
+                elif event.kind in ("retry", "preparation"):
+                    Logger.turn_metric(event.text, turn_id)
+                elif event.kind == "answer":
+                    stream_text += event.text
+                    # Full-response moderation must run before display when enabled.
+                    if not BAD_WORDS and time.perf_counter() - stream_updated >= 0.08:
+                        Logger.stream_answer(turn_id, turn_assistant_name, stream_text)
+                        stream_updated = time.perf_counter()
             try:
-                generation = await gen_response.send_user_text(llm_input)
+                conversation = prepare_conversation_input(llm_input)
+                if conversation is None:
+                    llm_input = prepend_contetx(llm_input)
+                generation = await gen_response.send_user_text(llm_input, conversation=conversation, on_event=on_generation_event,
+                    speaker=speaker, current_text=(meta or {}).get("llm_prompt") or text, character_key=novel_character_key)
                 response = str(getattr(generation, "text", generation) or "").strip()
                 if not response:
                     raise RuntimeError(
@@ -486,6 +612,9 @@ async def main_loop():
                 Logger.quiet_print(response)
                 llm_ms = (time.perf_counter() - llm_start) * 1000
                 _log_perf("LLM response", llm_ms, detail=f"{turn_detail}, output_chars={len(response or '')}")
+                Logger.turn_metric(f"LLM response: {llm_ms / 1000:.2f}s", turn_id)
+            except turn_control.TurnInterrupted:
+                raise
             except Exception as e:
                 response = f"Error: {e}"
                 Logger.error(f"LLM response failed: {e}")
@@ -498,6 +627,9 @@ async def main_loop():
                     Logger.warn(f"LLM Response Filtered. Detected moderation words: {filtered_words}")
                     _log_suggestion(f"LLM response filtered. speaker={speaker}, matched={filtered_words}")
                     response = CENSOR_PLACEHOLDER
+
+            if current_chat_model in ("Gemini", "OpenAI", "Claude", "Grok"):
+                Logger.stream_answer(turn_id, turn_assistant_name, response)
 
             if (
                 generation is not None
@@ -512,7 +644,8 @@ async def main_loop():
                     Logger.print("Fine-tune sample saved.")
                     _log_info(f"Fine-tune sample saved: speaker={speaker}")
 
-            if response and response != CENSOR_PLACEHOLDER and store_output_memory:
+            if (response and response != CENSOR_PLACEHOLDER and store_output_memory
+                    and not response.startswith(("Error:", "Turn interrupted"))):
                 try:
                     if is_monologue:
                         await store_ai_global_memory_main(
@@ -538,6 +671,8 @@ async def main_loop():
                 speaker=speaker,
                 user_text=text,
                 assistant_text=response or "",
+                generation=generation,
+                assistant_name=turn_assistant_name,
             )
             if (
                 is_vts_ready()
@@ -582,8 +717,11 @@ async def main_loop():
                 turn_control.raise_if_interrupted()
                 stt_suspended = _suspend_stt_for_playback()
                 try:
-                    playback = await gen_response.speak(response)
+                    Logger.print("[Collab] Starting reply TTS; send remains deferred until end of turn.")
+                    playback = await gen_response.speak(response, turn_started=execution_start_time)
+                    Logger.print("[Collab] TTS returned; waiting for reply playback to finish.")
                     await _wait_for_playback(playback)
+                    Logger.print("[Collab] Reply playback wait completed; proceeding with end-of-turn cleanup.")
                 except turn_control.TurnInterrupted:
                     raise
                 except Exception as e:
@@ -613,27 +751,43 @@ async def main_loop():
                 if (
                     emotion_task is not None
                     and is_vts_ready()
-                    and get_bool_setting("vts_emotion_reset_after_tts", default=True)
+                    and (_vts_manager.advanced_mode or get_bool_setting("vts_emotion_reset_after_tts", default=True))
                 ):
                     reset_delay = float(get_settings("vts_emotion_reset_delay") or 0.35)
                     if reset_delay > 0:
                         await asyncio.sleep(reset_delay)
-                    await _vts_manager.reset_current_emotion()
+                    if _vts_manager.advanced_mode:
+                        await _vts_manager.animate_idle()
+                    else:
+                        await _vts_manager.reset_current_emotion()
             except Exception as e:
                 Logger.warn(f"Post-turn emotion reset failed: {e}")
                 _log_error(f"Post-turn emotion reset failed: {e}", exc_info=True)
 
             execution_time = time.perf_counter() - execution_start_time
             total_execution_time = execution_time * 1000
+            Logger.turn_metric(f"Total turn (including playback): {execution_time:.2f}s", turn_id)
             if execution_time > 600:
                 formatted = time.strftime("%H:%M:%S", time.gmtime(execution_time))
                 Logger.print(f"Total Generation Time: {formatted} ({total_execution_time:.0f} ms)")
             else:
                 Logger.print(f"Total Generation Time: {execution_time:.2f} seconds ({total_execution_time:.0f} ms)")
             _log_perf("Total turn generation", total_execution_time,  detail=f"{turn_detail}, response_chars={len(response or '')}")
+            Logger.print("[Collab] End-of-turn cleanup reached caption clearing.")
             await clear_caption()
             turn_finish(msg_source, turn_id, response)
             finish_turn(resp_q, response)
+            try:
+                Logger.print(
+                    f"[Collab] Sending at end of turn: connected={collab_client.connected}, "
+                    f"characters={len(response or '')}."
+                )
+                if _collab_lifecycle.active and response and response.strip():
+                    collab_client.send_text(response)
+                    Logger.print("[Collab] Send call completed (not a peer delivery acknowledgement).")
+            except Exception as send_error:
+                Logger.warn(f"[Collab] Send failed ({type(send_error).__name__}); no automatic retry.")
+                _log_error(f"Collab end-of-turn send failed ({type(send_error).__name__}).")
 
         except turn_control.TurnInterrupted:
             response = "Turn interrupted."
@@ -657,6 +811,12 @@ async def main_loop():
             if emotion_task is not None and not emotion_task.done():
                 emotion_task.cancel()
                 await asyncio.gather(emotion_task, return_exceptions=True)
+            if (_vts_manager is not None and _vts_manager.advanced_mode
+                    and _vts_manager.advanced.phase == "talking"):
+                try:
+                    await _vts_manager.reset_current_emotion()
+                except Exception as exc:
+                    Logger.warn(f"VTS interrupted-turn cleanup failed: {exc}")
             _turn_active.clear()
             message_queue.task_done()
 
@@ -674,6 +834,8 @@ def thread_target():
             task.cancel()
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        from files.llm.novelai_runtime import close_runtime
+        loop.run_until_complete(close_runtime())
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
         async_loop = None
@@ -689,6 +851,7 @@ def start_loop():
     if not _loop_ready.wait(timeout=5.0) or async_loop is None:
         raise RuntimeError("Main async loop did not start within five seconds.")
     _main_future = asyncio.run_coroutine_threadsafe(main_loop(), async_loop)
+    _start_collab()
 
 
 def shutdown_vts_manager(timeout: float = 3.0) -> None:
@@ -711,6 +874,7 @@ def shutdown_vts_manager(timeout: float = 3.0) -> None:
 
 def stop_loop(timeout: float = 3.0) -> None:
     global _loop_thread, _main_future
+    _stop_collab()
     with _loop_lock:
         loop = async_loop
         thread = _loop_thread

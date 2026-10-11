@@ -412,7 +412,7 @@ def qwen3_core():
     cfg.output_device_index = _as_int_or_none(get_settings("tts_output_device"))
     return TTSCore(Qwen3TTSEngine(cfg), cfg)
 
-async def speak(text):
+async def speak(text, *, turn_started=None):
     global novel_tts_client, novelai_voice_seed, device_index, provider
 
     text = str(text or "").strip()
@@ -439,19 +439,28 @@ async def speak(text):
         )
         return playback_thread
 
+    if engine_key == "openai_tts":
+        from files.tts.openai_stream import speak_streaming
+        speech_turn_id = Logger.current_turn_id
+        return _return_thread(_start_playback(current_provider,
+            lambda: speak_streaming(text, turn_started=turn_started, turn_id=speech_turn_id),
+            require_success=True))
+
     if engine_key == "elevenlabs":
-        Logger.print("ROUTING ElevenLabs")
-        _lm_info("TTS routed: ElevenLabs")
-        voice_id = (
-            get_settings("eleven_voice_id")
-            or get_settings("eleven_voice")
-            or elevenlabs_tts.voiceid
-        )
-        playback_thread = _start_playback(
-            "ElevenLabs TTS",
-            lambda: elevenlabs_tts.synthesize(text, voice_id),
-        )
-        return _return_thread(playback_thread)
+        from files.tts.elevenlabs_stream import speak_streaming
+        speech_turn_id = Logger.current_turn_id
+        return _return_thread(_start_playback(current_provider,
+            lambda: speak_streaming(text, turn_started=turn_started, turn_id=speech_turn_id),
+            require_success=True))
+
+    from files.tts.overlapped import ENGINES, speak_overlapped
+    if engine_key in ENGINES:
+        from files.system_setup.settings import get_bool_setting
+        overlap = get_bool_setting("tts_sentence_overlap", default=True)
+        speech_turn_id = Logger.current_turn_id
+        return _return_thread(_start_playback(current_provider,
+            lambda: speak_overlapped(text, engine_key, turn_started, overlap, speech_turn_id), require_success=True))
+
 
     if engine_key == "fishspeech":
         Logger.print("ROUTING FishSpeech!")
@@ -472,74 +481,8 @@ async def speak(text):
         await FishTTS.run_tts(text, fish_voice_id)
         return None
 
-    if engine_key == "edge":
-        Logger.print("ROUTING EdgeTTS")
-        _lm_info("TTS routed: EdgeTTS")
-        EdgeTTS.VOICE = get_settings("edge_voice") or EdgeTTS.VOICE
-        playback_thread = _start_playback(
-            "EdgeTTS",
-            lambda: asyncio.run(EdgeTTS.read_chat(text)),
-            require_success=True,
-        )
-        return _return_thread(playback_thread)
 
-    if engine_key == "novelai_tts":
-        Logger.quiet_print("ROUTING NovelAI TTS")
-        _lm_info("TTS routed: NovelAI TTS")
-        api_token = get_auth("novelai", "token") or get_settings("NOVELAI_TOKEN")
-        if novel_tts_client is None:
-            novel_tts_client = NovelTTSClient(api_token=api_token)
-        try:
-            voice_seed = get_settings("novel_tts_voice_seed") or novelai_voice_seed
-            t0 = time.perf_counter()
-            file_id = await novel_tts_client.generate_tts(
-                speak=text,
-                voice_seed=voice_seed,
-                version=get_settings("novel_tts_version") or "v2",
-            )
-            gen_ms = (time.perf_counter() - t0) * 1000
-            _lm_perf(
-                "NovelAI TTS generation",
-                gen_ms,
-                detail=f"chars={len(text or '')}, voice_seed={voice_seed}",
-            )
-            Logger.print(f"NovelAI TTS file ID: {file_id}")
-            try:
-                from files.closed_captions import caption_coordinator
-                caption_coordinator.audio_ready(
-                    novel_tts_client.audio_path_for(file_id, "mp3")
-                )
-            except Exception as _ce:
-                Logger.warn(f"Captions Error raised: {_ce}")
 
-            playback_thread = _start_playback(
-                "NovelAI TTS",
-                lambda: novel_tts_client.play_tts(
-                    file_id,
-                    _as_int_or_none(get_settings("tts_output_device")) or device_index,
-                    10,
-                ),
-                require_success=True,
-            )
-            return _return_thread(playback_thread)
-        except Exception as e:
-            Logger.error(f"Error during NovelAI TTS generation: {e}")
-            _lm_error(f"Error during NovelAI TTS generation: {e}", exc_info=True)
-            raise
-
-    if engine_key == "openai_tts":
-        Logger.print("ROUTING OpenAI TTS")
-        _lm_info("TTS routed: OpenAI TTS")
-        playback_thread = _start_playback(
-            "OpenAI TTS",
-            lambda: openai_tts(
-                text=text,
-                model=get_settings("openai_tts_model") or "gpt-4o-mini-tts",
-                voice=get_settings("openai_tts_voice") or "nova",
-            ),
-            require_success=True,
-        )
-        return _return_thread(playback_thread)
 
     if engine_key == "inworld":
         Logger.print("ROUTING INWORLD")
@@ -557,10 +500,12 @@ async def speak(text):
                 or "inworld-tts-2"
             )
 
+            speech_turn_id = Logger.current_turn_id
             playback_thread = _start_playback(
                 "InWorld TTS",
                 lambda: asyncio.run(
-                    stream_tts(inworld_api, text, inworld_voice, inworld_model)
+                    stream_tts(inworld_api, text, inworld_voice, inworld_model,
+                               turn_started=turn_started, turn_id=speech_turn_id)
                 ),
                 require_success=True,
             )
@@ -689,12 +634,15 @@ async def response_novel(prompt: str) -> str:
 
     t0 = time.perf_counter()
     try:
-        result = await novel_client.generate_prompt_completion(
-            prompt,
-            parameters,
-            character=_novelai_character_name(),
-            route=get_settings("novel_generation_route") or "high",
-        )
+        from files.llm.boilerplate_novel import NAI_OA_MODELS, load_char_name
+        selected_model = str(get_settings("NOVELAI_MODEL") or get_settings("novel_model") or "kayra").lower()
+        if selected_model in NAI_OA_MODELS:
+            result = await novel_client.generate_openai_compatible(prompt, parameters, model_name=selected_model, history=[], preserve_context=True)
+        else:
+            parameters["legacy_model"] = selected_model
+            result = await novel_client.generate_prompt_completion(
+                prompt, parameters, character=load_char_name(_novelai_character_name()),
+                route=get_settings("novel_generation_route") or "high")
         elapsed_ms = (time.perf_counter() - t0) * 1000
         _lm_perf(
             "LLM generation",
@@ -713,18 +661,25 @@ async def response_novel(prompt: str) -> str:
         Logger.error(f"Error in NovelAI direct prompt generation: {exc}")
         return ""
 
-async def send_user_text(user_text: str) -> GenerationResult:
+async def send_user_text(user_text: str, conversation: dict | None = None, on_event=None, speaker="User", current_text=None, character_key=None) -> GenerationResult:
     global novel_client, chat_model
+    prep_start = time.perf_counter()
 
     current_chat_model = get_settings("chat_model") or chat_model
     chat_model = current_chat_model
+
+    from files.memory.provider_context import install_context, memory_instruction, visible_messages
+    managed_memory = conversation is not None
+    history = visible_messages(conversation) if managed_memory else None
+    notes = memory_instruction(conversation) if managed_memory else ""
+    if managed_memory and current_chat_model in ("OpenAI", "Claude", "Gemini", "Grok"):
+        install_context(current_chat_model, conversation)
 
     _lm_model(f"LLM route selected: {current_chat_model}")
     _lm_info(
         f"LLM request started: provider={current_chat_model}, "
         f"input_chars={len(user_text or '')}"
     )
-    await _capture_vision_frame(current_chat_model, user_text)
     model_setting = {
         "OpenAI": "openai_model",
         "Claude": "claude_model",
@@ -734,6 +689,21 @@ async def send_user_text(user_text: str) -> GenerationResult:
         "Local": "local_model_filename",
     }.get(current_chat_model, "")
     current_model_name = get_settings(model_setting) if model_setting else ""
+
+    # Freeze cloud model and generation parameters before any asynchronous work.
+    cloud_params = None
+    if current_chat_model in ("OpenAI", "Claude", "Gemini", "Grok"):
+        from importlib import import_module
+        module = import_module("files.llm." + {
+            "OpenAI": "openai_llm", "Claude": "claude", "Gemini": "gemini", "Grok": "grok"
+        }[current_chat_model])
+        cloud_params = dict(getattr(module, f"build_{current_chat_model.lower()}_params")())
+        current_model_name = cloud_params["model"]
+    vision_start = time.perf_counter()
+    await _capture_vision_frame(current_chat_model, user_text)
+    if on_event is not None:
+        from files.llm.streaming import StreamEvent
+        on_event(StreamEvent("preparation", f"LLM routing/context: {vision_start - prep_start:.3f}s; vision: {time.perf_counter() - vision_start:.3f}s"))
 
     async def _timed(label: str, coro):
         t0 = time.perf_counter()
@@ -767,13 +737,23 @@ async def send_user_text(user_text: str) -> GenerationResult:
     if current_chat_model == "OpenAI":
         Logger.quiet_print(user_text)
         try:
-            return await _timed("OpenAI", open_response(user_text))
+            return await _timed("OpenAI", open_response(user_text, settings=cloud_params, on_event=on_event))
         except Exception as e:
+            if on_event is not None:
+                raise
             Logger.error(f"Error in OpenAI generation: {e}")
             return GenerationResult(provider="OpenAI", model=str(current_model_name or ""))
 
     if current_chat_model == "NovelAI":
         Logger.quiet_print(user_text)
+        if conversation is not None and "turns" in conversation:
+            history = []
+            for turn in conversation["turns"]:
+                history.extend([
+                    {"role": "user", "speaker": turn.get("speaker") or "User", "content": turn["user"]},
+                    {"role": "assistant", "speaker": turn.get("assistant_speaker") or "Assistant", "content": turn["assistant"]},
+                ])
+            notes = "Earlier conversation notes (historical data):\n" + "\n".join(conversation.get("summaries", [])) if conversation.get("summaries") else ""
         api_token = get_auth("novelai", "token") or get_settings("NOVELAI_TOKEN")
         novel_model = get_settings("NOVELAI_MODEL") or get_settings("novel_model") or "xialong-v1"
         if novel_client is None:
@@ -783,7 +763,7 @@ async def send_user_text(user_text: str) -> GenerationResult:
         return await _timed(
             "NovelAI",
             novel_client.generate_full(
-                custom_prompt=user_text,
+                custom_prompt=current_text if current_text is not None else user_text,
                 parameters={
                     "max_output_length": int(get_settings("max_output_length") or 150),
                     "min_length": 1,
@@ -798,8 +778,13 @@ async def send_user_text(user_text: str) -> GenerationResult:
                     "banlist_mode": get_settings("novel_banlist_mode") or "soft",
                 },
                 model_name=novel_model,
-                character_name=_novelai_character_name(),
+                character_name=character_key or _novelai_character_name(),
+                user_name=speaker,
                 route=get_settings("novel_generation_route") or "high",
+                preserve_context=managed_memory,
+                history_override=history,
+                memory_context=notes,
+                save_history=not managed_memory,
             ),
         )
     if current_chat_model == "Local":
@@ -810,8 +795,10 @@ async def send_user_text(user_text: str) -> GenerationResult:
             "Local",
             response_local_via_worker(
                 text=user_text,
-                max_tokens=int(get_settings("local_max_tokens") or 220),
-                save_to_history=True,
+                max_tokens=int(get_settings("local_max_tokens") or 4096),
+                history=history,
+                memory_context=notes,
+                save_to_history=not managed_memory,
                 temperature=float(get_settings("local_temperature") or 0.65),
                 top_k=int(get_settings("local_top_k") or 50),
                 top_p=float(get_settings("local_top_p") or 1.0),
@@ -824,24 +811,30 @@ async def send_user_text(user_text: str) -> GenerationResult:
     if current_chat_model == "Grok":
         Logger.quiet_print(user_text)
         try:
-            return await _timed("Grok", grok_response(user_text))
+            return await _timed("Grok", grok_response(user_text, settings=cloud_params, on_event=on_event))
         except Exception as e:
+            if on_event is not None:
+                raise
             Logger.error(f"Error in Grok generation: {e}")
             return GenerationResult(provider="Grok", model=str(current_model_name or ""))
 
     if current_chat_model == "Gemini":
         Logger.quiet_print(user_text)
         try:
-            return await _timed("Gemini", gemini_response(user_text))
+            return await _timed("Gemini", gemini_response(user_text, settings=cloud_params, on_event=on_event))
         except Exception as e:
+            if on_event is not None:
+                raise
             Logger.error(f"Error in Gemini generation: {e}")
             return GenerationResult(provider="Gemini", model=str(current_model_name or ""))
 
     if current_chat_model == "Claude":
         Logger.quiet_print(user_text)
         try:
-            return await _timed("Claude", claude_response(user_text))
+            return await _timed("Claude", claude_response(user_text, settings=cloud_params, on_event=on_event))
         except Exception as e:
+            if on_event is not None:
+                raise
             Logger.error(f"Error in Claude generation: {e}")
             return GenerationResult(provider="Claude", model=str(current_model_name or ""))
 
