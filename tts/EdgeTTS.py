@@ -48,7 +48,7 @@ def PlayAudio(wav_file: str):
     stream.close()
     p.terminate()
 
-async def read_chat(message: str) -> bool:
+async def read_chat(message: str, *, prepare_only=False, voice=None):
     message = str(message or "").strip()
     if not message:
         Logger.warn("EdgeTTS skipped because the response text was empty.")
@@ -66,7 +66,7 @@ async def read_chat(message: str) -> bool:
         connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
         communicate = edge_tts.Communicate(
             message,
-            VOICE,
+            voice or VOICE,
             connector=connector,
         )
         await communicate.save(str(mp3_path))
@@ -75,6 +75,8 @@ async def read_chat(message: str) -> bool:
         if turn_control.is_interrupted():
             return False
         audio_content = AudioSegment.from_file(str(mp3_path), format="mp3")
+        if prepare_only:
+            return audio_content
         audio_content.export(
             str(wav_path),
             format="wav",

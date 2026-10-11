@@ -93,7 +93,7 @@ class STTPage(ctk.CTkFrame):
             common,
             "STT Engine",
             self.engine_var,
-            ["Local Whisper", "OpenAI Transcription", "Google"],
+            ["Local Whisper", "OpenAI Transcription", "OpenAI Live Transcription", "Google", "Deepgram Flux"],
             command=self._engine_changed,
         )
         self._combo_row(
@@ -175,7 +175,7 @@ class STTPage(ctk.CTkFrame):
         utterance = self._card(
             parent,
             "Utterance Detection",
-            "These shared settings define speech boundaries for every engine in Hot Mic mode.",
+            "Speech boundaries for Local Whisper, OpenAI and Google. Deepgram Flux uses its own turn detection instead.",
         )
         self._slider_row(utterance, "VAD Aggressiveness", self.vad_var, 0, 3, integer=True)
         self._slider_row(utterance, "Pre-roll ms", self.pre_speech_var, 0, 2000, integer=True)
@@ -187,7 +187,9 @@ class STTPage(ctk.CTkFrame):
         self._provider_container.pack(fill="x")
         self._build_local_settings()
         self._build_openai_settings()
+        self._build_openai_live_settings()
         self._build_google_settings()
+        self._build_deepgram_settings()
 
         ctk.CTkButton(
             parent,
@@ -195,6 +197,49 @@ class STTPage(ctk.CTkFrame):
             command=self.save_settings,
             height=38,
         ).pack(anchor="w", pady=(4, 18))
+
+    def _build_openai_live_settings(self):
+        frame = self._card(self._provider_container, "OpenAI Live Transcription",
+            "Streams microphone audio while you speak. Local utterance settings end hot-mic turns; push-to-talk release submits the turn. Only completed transcripts enter the conversation.")
+        self._provider_frames["OpenAI Live Transcription"] = frame
+        self.openai_live_model_var = ctk.StringVar(value=str(self._setting("stt_openai_live_model", "gpt-live-transcribe")))
+        self._combo_row(frame, "Live Model", self.openai_live_model_var, ["gpt-live-transcribe"])
+        self.openai_live_auth_label = ctk.CTkLabel(frame,
+            text="OpenAI API key saved." if get_auth("openai", "token") else "OpenAI API key required.",
+            text_color=theme.MUTED_TEXT)
+        self.openai_live_auth_label.pack(anchor="w", padx=16, pady=6)
+        row = ctk.CTkFrame(frame, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=6)
+        ctk.CTkButton(row, text="Set OpenAI API Key", command=self._prompt_openai_key).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(row, text="Clear Key", command=self._clear_openai_key, fg_color=theme.DANGER).pack(side="left")
+        ctk.CTkLabel(frame, text="Uses the shared OpenAI key and Language setting. Live model access is required. Stop/restart STT after changes. Pause closes the connection; resume reconnects.",
+            text_color=theme.MUTED_TEXT, wraplength=700, justify="left").pack(anchor="w", padx=16, pady=(6, 14))
+
+    def _build_deepgram_settings(self):
+        frame = self._card(self._provider_container, "Deepgram Flux",
+            "Streams microphone audio to Deepgram while listening. Flux detects completed turns; push-to-talk release ends a turn manually. Stop and restart STT after changing settings.")
+        self._provider_frames["Deepgram Flux"] = frame
+        self.deepgram_model_var = ctk.StringVar(value=str(self._setting("stt_deepgram_model", "flux-general-en")))
+        self.deepgram_eot_var = ctk.DoubleVar(value=float(self._setting("stt_deepgram_eot_threshold", 0.7)))
+        self._combo_row(frame, "Model", self.deepgram_model_var, ["flux-general-en", "flux-general-multi"])
+        self._slider_row(frame, "Turn Confidence", self.deepgram_eot_var, 0.5, 0.99)
+        ctk.CTkLabel(frame, text="Higher confidence waits longer before ending a turn. English model ignores Language; multilingual detects supported languages automatically. Eager generation is disabled.",
+            text_color=theme.MUTED_TEXT, wraplength=700, justify="left").pack(anchor="w", padx=16, pady=6)
+        self.deepgram_auth_label = ctk.CTkLabel(frame,
+            text="API key saved" if get_auth("deepgram", "token") else "API key required",
+            text_color=theme.MUTED_TEXT)
+        self.deepgram_auth_label.pack(anchor="w", padx=16)
+        row = ctk.CTkFrame(frame, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(6, 14))
+        ctk.CTkButton(row, text="Set Deepgram API Key", command=lambda: AuthTokenDialog(
+            self, title="Deepgram API Key", label="Paste your Deepgram API key for streaming transcription.",
+            on_save=self._save_deepgram_key)).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(row, text="Clear Key", fg_color=theme.DANGER,
+            command=lambda: self._save_deepgram_key("")).pack(side="left")
+
+    def _save_deepgram_key(self, token):
+        save_auth("deepgram", "token", token.strip())
+        self.deepgram_auth_label.configure(text="API key saved; restart STT." if token.strip() else "API key cleared; restart STT.")
 
     def _build_local_settings(self):
         frame = self._card(
@@ -240,6 +285,10 @@ class STTPage(ctk.CTkFrame):
             ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"],
         )
         has_key = bool(get_auth("openai", "token"))
+        self.openai_timeout_var = ctk.DoubleVar(value=float(self._setting("stt_openai_request_timeout", 20.0)))
+        self._slider_row(frame, "Request Timeout s", self.openai_timeout_var, 5, 60, integer=True)
+        ctk.CTkLabel(frame, text="Network timeout per operation; automatic retries are disabled. Increase for slow connections or long recordings.",
+            text_color=theme.MUTED_TEXT, wraplength=700, justify="left").pack(anchor="w", padx=16, pady=6)
         self.openai_auth_status_label = ctk.CTkLabel(
             frame,
             text="OpenAI API key saved." if has_key else "No OpenAI API key saved.",
@@ -284,6 +333,7 @@ class STTPage(ctk.CTkFrame):
 
     def _save_openai_key(self, token: str):
         save_auth("openai", "token", token)
+        self.openai_live_auth_label.configure(text="OpenAI API key saved; restart STT.")
         self.openai_auth_status_label.configure(
             text="OpenAI API key saved. Active LLM unchanged.",
             text_color=theme.SUCCESS,
@@ -291,6 +341,7 @@ class STTPage(ctk.CTkFrame):
 
     def _clear_openai_key(self):
         save_auth("openai", "token", "")
+        self.openai_live_auth_label.configure(text="OpenAI API key cleared; restart STT.")
         self.openai_auth_status_label.configure(
             text="OpenAI API key cleared.",
             text_color=theme.MUTED_TEXT,
@@ -448,6 +499,10 @@ class STTPage(ctk.CTkFrame):
             return
         self.device_mode_var.set("Manual")
         values = {
+            "stt_openai_live_model": self.openai_live_model_var.get().strip(),
+            "stt_openai_request_timeout": float(self.openai_timeout_var.get()),
+            "stt_deepgram_model": self.deepgram_model_var.get(),
+            "stt_deepgram_eot_threshold": round(float(self.deepgram_eot_var.get()), 2),
             "stt_device_selection_mode": "manual",
             "stt_device_id": device.stable_id,
             "stt_device_name": device.name,

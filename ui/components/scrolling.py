@@ -19,6 +19,7 @@ class AppScrollableFrame(ctk.CTkScrollableFrame):
     _DRAG_FRAME_MS = 16
 
     def __init__(self, *args, **kwargs):
+        self.on_user_scroll = kwargs.pop("on_user_scroll", None)
         self._pending_scrollbar_args = None
         self._scrollbar_after_id = None
         self._scrollbar_redraw_after_id = None
@@ -60,6 +61,11 @@ class AppScrollableFrame(ctk.CTkScrollableFrame):
         self._cancel_scrollbar_callback()
         self._apply_pending_scrollbar()
         self._scroll_view(*args)
+        self._notify_user_scroll()
+
+    def _notify_user_scroll(self):
+        if self.on_user_scroll is not None:
+            self.on_user_scroll()
 
     def _cancel_scrollbar_callback(self):
         if self._scrollbar_after_id is None:
@@ -76,6 +82,7 @@ class AppScrollableFrame(ctk.CTkScrollableFrame):
         self._pending_scrollbar_args = None
         if args is not None and self.winfo_exists():
             self._scroll_view(*args)
+            self._notify_user_scroll()
 
     def _finish_scrollbar_drag(self, _event=None):
         self._cancel_scrollbar_callback()
@@ -186,6 +193,8 @@ def set_bindings(root) -> None:
 
         if units:
             view("scroll", units, "units")
+            if not horizontal:
+                frame._notify_user_scroll()
 
     root.bind_all("<MouseWheel>", on_mousewheel, add="+")
     root.bind_all("<Button-4>", on_mousewheel, add="+")

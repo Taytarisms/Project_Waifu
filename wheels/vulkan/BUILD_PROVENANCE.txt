@@ -1,0 +1,26 @@
+Package: llama_cpp_python 0.3.49
+Wheel tag: cp313-cp313-win_amd64
+Backend: GGML CPU + Vulkan
+JamePeng commit: c31ed3038fe20aa5d43ac859ace7dd944b37f3c4
+llama.cpp commit: d230ddd763ffe27781c7ffd237ea78b639b36b6d
+Vulkan SDK used only for building: 1.4.341.0
+MSVC compiler: 19.50.35728.0
+Wheel SHA256: 0e04afc54ae04ccdce7165e906031d25075ccb5970473134cea6b76b9daf4085
+
+Local clean-environment smoke test:
+- Python 3.13.12 import passed.
+- Vulkan SDK was absent from the runtime environment.
+- ggml-vulkan enumerated local Vulkan devices.
+- llama_supports_gpu_offload() returned True.
+- Gemma3, MiniCPMv4.5, GLM-4.1V, GLM-4.6V, LFM2-VL, and Qwen3-VL
+  chat handlers were present.
+- The checksum-verified one-user install and verification scripts passed from
+  a Project Waifu-style isolated files/.venv layout.
+
+Subsequent user-reported pilot test (September 11, 2026; recorded October 7):
+- User reported successful local inference after installing diskcache>=5.6.2
+  and rerunning the pilot installer on their AMD setup.
+- Reported 16 GB VRAM; approximately 4.6 GB used during inference.
+- Exact GPU, driver, final model, and installed wheel hash were not established
+  by the supplied transcript. Current release installers were not tested there.
+- Local Whisper hot-mic crash was reported separately and remains unverified.

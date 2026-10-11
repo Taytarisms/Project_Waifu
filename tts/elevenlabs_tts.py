@@ -59,7 +59,7 @@ def _build_payload(text: str) -> dict:
     }
 
 
-def synthesize(text, voiceid=None):
+def synthesize(text, voiceid=None, *, prepare_only=False):
     turn_control.raise_if_interrupted()
     api_key = _resolve_api_key()
     if not api_key:
@@ -95,6 +95,8 @@ def synthesize(text, voiceid=None):
     final_path = OUTPUT_DIR / f"eleven_audio_{uuid.uuid4()}.wav"
 
     audio_content = AudioSegment.from_file(io.BytesIO(response.content), format="mp3")
+    if prepare_only:
+        return audio_content
     audio_content.export(str(final_path), "wav")
     Logger.print(f"Saved New File: {final_path}")
 

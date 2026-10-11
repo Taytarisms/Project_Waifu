@@ -30,7 +30,7 @@ class OpenAISettingsPage(ctk.CTkFrame):
 
         self.model_var = ctk.StringVar(value=self._setting("openai_model", "gpt-5.6-luna"))
         self.temperature_var = ctk.DoubleVar(value=float(self._setting("openai_temperature", 0.7)))
-        self.max_tokens_var = ctk.DoubleVar(value=float(self._setting("openai_max_tokens", 512)))
+        self.max_tokens_var = ctk.DoubleVar(value=float(self._setting("openai_max_tokens", 4096)))
         self.top_p_var = ctk.DoubleVar(value=float(self._setting("openai_top_p", 1.0)))
         self.reasoning_effort_var = ctk.StringVar(
             value=self._setting("openai_reasoning_effort", "medium")

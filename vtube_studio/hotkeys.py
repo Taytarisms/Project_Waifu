@@ -59,6 +59,8 @@ class VTSHotkeyManager:
         self.settings = settings or VTSSettings()
         self._lock = asyncio.Lock()
         self._emotion_transition_lock = asyncio.Lock()
+        from files.vtube_studio.advanced import AdvancedActions
+        self.advanced = AdvancedActions(self)
         self._storage_lock = threading.RLock()
         self._client: Optional[VTSRawClient] = None
         self._connected = False
@@ -294,8 +296,41 @@ class VTSHotkeyManager:
             return False
 
     async def close(self) -> None:
+        try:
+            if self.advanced.emotion or self.advanced.owned_expressions:
+                await self.advanced.reset()
+        finally:
+            async with self._lock:
+                await self._close_locked()
+
+    @property
+    def advanced_mode(self):
+        return self.load_vts_mapping().get("control_mode", "simple") == "advanced"
+
+    async def set_control_mode(self, mode):
+        if mode not in ("simple", "advanced"):
+            raise ValueError("Unknown VTS control mode.")
+        if self.advanced_mode:
+            await self.advanced.reset()
+        elif self.get_current_emotion():
+            if not await self.reset_current_emotion():
+                raise RuntimeError("Could not reset the current emotion before switching modes.")
+        from files.vtube_studio.advanced import initial_advanced
+        with self._storage_lock:
+            mapping = self.load_vts_mapping()
+            if mode == "advanced" and "advanced" not in mapping:
+                mapping["advanced"] = initial_advanced(mapping)
+            mapping["control_mode"] = mode
+            self.save_vts_mapping(mapping)
+
+    async def list_expressions(self):
         async with self._lock:
-            await self._close_locked()
+            if not await self._connect_locked():
+                return []
+            response = await self._request_locked("ExpressionStateRequest", {"details": False})
+            if not response or response.get("messageType") == "APIError":
+                raise RuntimeError("VTube Studio could not list expressions.")
+            return response.get("data", {}).get("expressions", [])
 
     async def _close_locked(self) -> None:
         if self._idle_engine is not None:
@@ -697,6 +732,8 @@ class VTSHotkeyManager:
         payload = {
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "model_id": mapping.get("model_id", ""),
+            "control_mode": mapping.get("control_mode", "simple"),
+            **({"advanced": mapping["advanced"]} if "advanced" in mapping else {}),
             "model_name": mapping.get("model_name", ""),
             "current_emotion": mapping.get("current_emotion", ""),
             "full_reset_hotkey_sequence": mapping.get("full_reset_hotkey_sequence", []),
@@ -860,7 +897,7 @@ class VTSHotkeyManager:
             self.logger(f"Tried to play undefined emotion: {emotion_name}")
             return False
         key = f"{sequence_type}_hotkey_sequence"
-        sequence = emotion_config.get(key, [])
+        sequence = emotion_config.get(key, [])[:1]
         return await self.trigger_hotkey_sequence(
             sequence,
             label=f"{emotion_name}.{key}",
@@ -868,6 +905,8 @@ class VTSHotkeyManager:
         )
 
     async def set_emotion_and_animate_talking(self, emotion_name: str) -> bool:
+        if self.advanced_mode:
+            return await self.advanced.talking((emotion_name or "").strip().lower())
         async with self._emotion_transition_lock:
             return await self._set_emotion_and_animate_talking_locked(emotion_name)
 
@@ -905,7 +944,7 @@ class VTSHotkeyManager:
                 return False
             self._clear_current_emotion_local()
             await asyncio.sleep(0.08)
-        sequence = emotion_config.get("talking_hotkey_sequence", [])
+        sequence = emotion_config.get("talking_hotkey_sequence", [])[:1]
         if sequence:
             if not await self.play_sequence_for_emotion(emotion_name, "talking"):
                 self._last_emotion_action = "trigger_failed"
@@ -928,9 +967,13 @@ class VTSHotkeyManager:
             self.logger("No current emotion set for talking animation.")
             return False
 
+        if self.advanced_mode:
+            return await self.advanced.talking(current)
         return await self.play_sequence_for_emotion(current, "talking")
 
     async def animate_idle(self) -> bool:
+        if self.advanced_mode:
+            return await self.advanced.finish()
         current = self.get_current_emotion()
         if not current:
             self.logger("No current emotion set for idle animation.")
@@ -939,6 +982,8 @@ class VTSHotkeyManager:
         return await self.play_sequence_for_emotion(current, "idle")
     
     async def reset_current_emotion(self) -> bool:
+        if self.advanced_mode:
+            return await self.advanced.reset()
         async with self._emotion_transition_lock:
             return await self._reset_current_emotion_locked()
 
@@ -966,12 +1011,14 @@ class VTSHotkeyManager:
         return True
 
     async def full_reset(self) -> bool:
+        if self.advanced_mode:
+            return await self.advanced.reset(full=True)
         async with self._emotion_transition_lock:
             return await self._full_reset_locked()
 
     async def _full_reset_locked(self) -> bool:
         mapping = self.load_vts_mapping()
-        sequence = mapping.get("full_reset_hotkey_sequence", [])
+        sequence = mapping.get("full_reset_hotkey_sequence", [])[:1]
         if not sequence:
             self.logger("No full reset hotkey sequence is mapped.")
             return False

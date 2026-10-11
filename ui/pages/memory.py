@@ -52,8 +52,105 @@ class MemoryPage(ctk.CTkFrame):
         right.pack(fill="both", expand=True)
         self._build_recall_panel(left)
         self._build_live_recall_panel(right)
+        self._build_summary_panel(right)
         self._build_import_panel(right)
         self._build_store_panel(right)
+
+    def _build_summary_panel(self, parent):
+        from files.memory.conversation import DEFAULTS
+        ctk.CTkLabel(parent, text="Conversation Summaries",
+                     font=ctk.CTkFont(size=20, weight="bold")).pack(anchor="w", padx=18, pady=(18, 6))
+        ctk.CTkLabel(parent, text=("Keep recent dialogue exact; summarize older batches.\n"
+                    "One interaction is a user/assistant pair.\n"
+                    "The restart briefing still keeps three pairs.\n"
+                    "Disable summaries to use exact recent context only; saved memories are kept.\n"
+                    "Token budgets use conservative byte estimates."),
+                    justify="left", wraplength=320).pack(anchor="w", padx=18, pady=6)
+        from files.memory.summary_generation import PROVIDERS, SAME_PROVIDER
+        self.summary_provider_var = ctk.StringVar(value=get_settings("summary_provider") or SAME_PROVIDER)
+        self.summary_model_vars = {
+            provider: ctk.StringVar(value=get_settings(f"summary_model_{provider.lower()}") or "")
+            for provider in PROVIDERS if provider != "Local"
+        }
+        ctk.CTkLabel(parent, text="Summarizer provider").pack(anchor="w", padx=18)
+        ctk.CTkOptionMenu(parent, variable=self.summary_provider_var,
+                          values=[SAME_PROVIDER, *PROVIDERS],
+                          command=self._update_summary_model).pack(fill="x", padx=18, pady=(0, 6))
+        self.summary_model_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.summary_model_frame.pack(fill="x", padx=18)
+        self.summary_model_label = ctk.CTkLabel(self.summary_model_frame, text="")
+        self.summary_model_label.pack(anchor="w")
+        self.summary_model_entry = ctk.CTkEntry(self.summary_model_frame)
+        self.summary_model_entry.pack(fill="x")
+        self.summary_model_hint = ctk.CTkLabel(parent, text="", wraplength=320, justify="left")
+        self.summary_model_hint.pack(anchor="w", padx=18, pady=6)
+        self._update_summary_model()
+        self.summary_vars = {}
+        labels = {
+            "summary_enabled": "Enable self-summarization",
+            "summary_recent_turns": "Recent interactions",
+            "summary_batch_turns": "Summarize after this many older interactions",
+            "summary_recent_count": "Recent summaries included",
+            "summary_context_tokens": "Conversation token budget (estimated)",
+            "summary_batch_tokens": "Summary input budget (estimated)",
+            "summary_words": "Summary target words",
+            "summary_generation_tokens": "Summary generation tokens (includes thinking)",
+            "summary_store_vectors": "Store single-user summaries for recall",
+        }
+        for key, default in DEFAULTS.items():
+            current = get_settings(key) if get_settings else None
+            if current is None or current == "":
+                current = default
+            if isinstance(default, bool):
+                variable = ctk.BooleanVar(value=str(current).lower() in ("true", "1", "yes", "on"))
+                ctk.CTkCheckBox(parent, text=labels[key], variable=variable).pack(anchor="w", padx=18, pady=6)
+            else:
+                variable = ctk.StringVar(value=str(current))
+                ctk.CTkLabel(parent, text=labels[key], wraplength=310, justify="left").pack(
+                    anchor="w", padx=18, pady=(6, 0))
+                ctk.CTkEntry(parent, textvariable=variable).pack(fill="x", padx=18, pady=(0, 5))
+            self.summary_vars[key] = variable
+        ctk.CTkButton(parent, text="Save Summary Settings", command=self._save_summary_settings).pack(
+            fill="x", padx=18, pady=10)
+        self.summary_status = ctk.CTkLabel(parent, text="", wraplength=320, justify="left")
+        self.summary_status.pack(anchor="w", padx=18, pady=4)
+
+    def _update_summary_model(self, *_):
+        from files.memory.summary_generation import SAME_PROVIDER
+        provider = self.summary_provider_var.get()
+        if provider == SAME_PROVIDER:
+            self.summary_model_frame.pack_forget()
+            hint = "Follows the conversation provider and its saved summary model override. Select a provider to edit its override."
+        elif provider == "Local":
+            self.summary_model_frame.pack_forget()
+            hint = "Uses the currently loaded local model and its existing worker."
+        else:
+            self.summary_model_frame.pack(fill="x", padx=18, before=self.summary_model_hint)
+            self.summary_model_label.configure(text=f"{provider} summary model ID (optional)")
+            self.summary_model_entry.configure(textvariable=self.summary_model_vars[provider])
+            hint = "Blank uses this provider's configured model. Uses existing API credentials; conversation model stays unchanged."
+            if provider == "NovelAI":
+                hint += " Kayra summaries remain experimental."
+        self.summary_model_hint.configure(text=hint)
+
+    def _save_summary_settings(self):
+        from files.memory.conversation import DEFAULTS
+        try:
+            values = {key: var.get() if isinstance(DEFAULTS[key], bool) else int(var.get())
+                      for key, var in self.summary_vars.items()}
+            for key, value in values.items():
+                if not isinstance(DEFAULTS[key], bool) and not 1 <= value <= 1000000:
+                    raise ValueError("Numeric values must be between 1 and 1,000,000.")
+            if not save_settings:
+                raise ValueError("Settings backend unavailable.")
+            for key, value in values.items():
+                save_settings(key, value)
+            save_settings("summary_provider", self.summary_provider_var.get())
+            for provider, variable in self.summary_model_vars.items():
+                save_settings(f"summary_model_{provider.lower()}", variable.get().strip())
+            self.summary_status.configure(text="Saved. Applies to subsequent turns. Summary results appear in logs.")
+        except (TypeError, ValueError) as exc:
+            self.summary_status.configure(text=str(exc))
 
     def _build_recall_panel(self, parent):
         ctk.CTkLabel(

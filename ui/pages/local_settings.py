@@ -195,7 +195,7 @@ class LocalSettingsPage(ctk.CTkFrame):
         self._section("Generation", row); row += 1
 
         self.temperature_var   = ctk.DoubleVar(value=float(self._setting("local_temperature",   0.5)))
-        self.max_tokens_var    = ctk.DoubleVar(value=float(self._setting("local_max_tokens",    256)))
+        self.max_tokens_var    = ctk.DoubleVar(value=float(self._setting("local_max_tokens",    4096)))
         self.top_k_var         = ctk.DoubleVar(value=float(self._setting("local_top_k",         40)))
         self.top_p_var         = ctk.DoubleVar(value=float(self._setting("local_top_p",         0.95)))
         self.min_p_var         = ctk.DoubleVar(value=float(self._setting("local_min_p",         0.05)))

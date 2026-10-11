@@ -34,7 +34,7 @@ class GeminiSettingsPage(ctk.CTkFrame):
             )
         )
         self.temperature_var = ctk.DoubleVar(value=float(self._setting("gemini_temperature", 1.0)))
-        self.max_tokens_var  = ctk.DoubleVar(value=float(self._setting("gemini_max_tokens",  1024)))
+        self.max_tokens_var  = ctk.DoubleVar(value=float(self._setting("gemini_max_tokens",  4096)))
         self.top_p_var       = ctk.DoubleVar(value=float(self._setting("gemini_top_p",       1.0)))
         self.top_k_var       = ctk.DoubleVar(value=float(self._setting("gemini_top_k",       0)))
         self.thinking_level_var = ctk.StringVar(

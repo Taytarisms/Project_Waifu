@@ -138,6 +138,16 @@ class TTSHomePage(ctk.CTkFrame):
         )
         self.active_label.pack(anchor="w", padx=24, pady=(0, 28))
 
+        from files.system_setup.settings import get_bool_setting
+        self.sentence_overlap_var = ctk.BooleanVar(value=get_bool_setting("tts_sentence_overlap", default=True))
+        ctk.CTkCheckBox(self, text="Prepare the next sentence while speaking",
+            variable=self.sentence_overlap_var,
+            command=lambda: save_settings("tts_sentence_overlap", self.sentence_overlap_var.get())
+        ).pack(anchor="w", padx=24, pady=(0, 6))
+        ctk.CTkLabel(self, text="Edge and NovelAI. OpenAI, ElevenLabs and InWorld stream audio directly.",
+                     text_color=theme.MUTED_TEXT, wraplength=650, justify="left"
+        ).pack(anchor="w", padx=24, pady=(0, 8))
+
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(anchor="center", pady=20)
 
@@ -1060,12 +1070,9 @@ class InWorldTTSSettings(BaseTTSSettings):
 
         self._slider_row("Temperature", self.temperature_var, 0.1, 2.0, row); row += 1
 
-        self._combo_row(
-            "Audio Encoding",
-            self.audio_encoding_var,
-            ["MP3", "PCM", "LINEAR16"],
-            row,
-        ); row += 1
+        ctk.CTkLabel(self, text="Live Audio: LINEAR16 streaming").grid(
+            row=row, column=0, sticky="w", padx=18, pady=6)
+        row += 1
 
         self._slider_row("Sample Rate", self.sample_rate_var, 8000, 48000, row, is_int=True); row += 1
         self._entry_row("Language / Locale", self.language_var, row); row += 1
@@ -1078,15 +1085,15 @@ class InWorldTTSSettings(BaseTTSSettings):
         ); row += 1
 
         self._checkbox_row("Apply Text Normalization", self.text_normalization_var, row); row += 1
-        self._checkbox_row("Warmup Connection Before Request", self.warmup_var, row); row += 1
+
 
         ctk.CTkLabel(
             self,
             text=(
                 "Voice ID can be a built-in voice like Sarah/Dennis or a custom/cloned "
                 "voiceId returned by InWorld's Voices API. TTS-2 sends Delivery Mode "
-                "and omits Temperature; older models do the reverse. Warmup generates "
-                "a real extra clip, so it is off by default."
+                "and omits Temperature; older models do the reverse. Live playback uses "
+                "streamed LINEAR16 audio regardless of the saved encoding. No warmup clip is generated."
             ),
             text_color=theme.MUTED_TEXT,
             wraplength=560,

@@ -98,8 +98,53 @@ def _active_model_id(fallback: Optional[str] = None) -> str:
     ).strip()
 
 
-def _build_payload(text: str, voice_id: Optional[str] = None, model_id: Optional[str] = None) -> dict[str, Any]:
+_VOICE_CACHE: dict[str, dict[str, str]] = {}
+
+
+def _fetch_voice_catalog(api_key: str) -> dict[str, str]:
+    cached = _VOICE_CACHE.get(api_key)
+    if cached is not None:
+        return cached
+    catalog: dict[str, str] = {}
+    try:
+        resp = requests.get(
+            "https://api.inworld.ai/tts/v1/voices",
+            headers={"Authorization": f"Basic {api_key}"},
+            timeout=15,
+        )
+        if resp.ok:
+            for entry in resp.json().get("voices", []):
+                vid = str(entry.get("voiceId") or "").strip()
+                name = str(entry.get("displayName") or "").strip()
+                if vid:
+                    catalog[vid.lower()] = vid
+                    if name:
+                        catalog.setdefault(name.lower(), vid)
+        else:
+            Logger.warn(f"InWorld voice list HTTP {resp.status_code}: {resp.text or '<empty body>'}")
+    except Exception as exc:
+        Logger.warn(f"InWorld voice list failed: {exc}")
+    _VOICE_CACHE[api_key] = catalog
+    return catalog
+
+
+def _resolve_voice_id(api_key: str, requested: str) -> str:
+    catalog = _fetch_voice_catalog(api_key)
+    if not catalog:
+        return requested
+    resolved = catalog.get(requested.lower())
+    if resolved is None:
+        Logger.warn(f"InWorld voice {requested!r} not found in this workspace's voice list.")
+        return requested
+    if resolved != requested:
+        Logger.notify(f"InWorld voice {requested!r} resolved to voiceId {resolved!r}.")
+    return resolved
+
+
+def _build_payload(text: str, voice_id: Optional[str] = None, model_id: Optional[str] = None, api_key: Optional[str] = None) -> dict[str, Any]:
     voice = _active_voice_id(voice_id)
+    if api_key:
+        voice = _resolve_voice_id(api_key, voice)
     model = _active_model_id(model_id)
 
     audio_encoding = str(_setting("inworld_tts_audio_encoding", DEFAULT_AUDIO_ENCODING)).strip() or DEFAULT_AUDIO_ENCODING
@@ -177,7 +222,6 @@ def _audio_segment_from_bytes(audio_bytes: bytes, payload: dict[str, Any]) -> Au
             channels=1,
         )
 
-    # MP3 and other encoded formats are delegated to ffmpeg/pydub.
     fmt = "mp3" if encoding in {"MP3", "MPEG"} else None
     return AudioSegment.from_file(BytesIO(audio_bytes), format=fmt)
 
@@ -227,106 +271,126 @@ def _notify_captions(audio_segment: AudioSegment) -> None:
             pass
 
 
-def _stream_tts_sync(api_key: str, text: str, voice_id: Optional[str], model_id: Optional[str]) -> Optional[dict[str, Any]]:
-    if turn_control.is_interrupted():
-        return None
-    url = "https://api.inworld.ai/tts/v1/voice:stream"
+def _stream_tts_sync(api_key, text, voice_id, model_id, turn_started=None, turn_id=None):
+    from files.tts.pcm_stream import PCMDecoder, prefetched
+    from files.closed_captions import caption_coordinator
+    started = time.perf_counter()
+    turn_control.raise_if_interrupted()
+    api_key = api_key.strip()
+    if api_key.lower().startswith("basic "):
+        api_key = api_key[6:].strip()
+    # Use saved IDs directly, or an already cached display-name mapping. No
+    # catalog lookup or paid warmup belongs on the time-to-speech path.
+    payload = _build_payload(text, voice_id, model_id)
+    payload["voiceId"] = _VOICE_CACHE.get(api_key, {}).get(
+        payload["voiceId"].lower(), payload["voiceId"])
+    payload["audioConfig"]["audioEncoding"] = "LINEAR16"
+    rate = payload["audioConfig"].get("sampleRateHertz", DEFAULT_SAMPLE_RATE)
+    decoder = PCMDecoder(rate)
+    stream = None
+    received_at = None
+    written_at = None
+    total = 0
+    events = 0
+    completed = False
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Basic {api_key}",
-    }
+    def caption(action, *args):
+        try:
+            getattr(caption_coordinator, action)(*args)
+        except Exception as exc:
+            Logger.warn(f"InWorld caption update failed: {exc}")
 
-    payload = _build_payload(text=text, voice_id=voice_id, model_id=model_id)
+    def check():
+        turn_control.raise_if_interrupted()
+        while turn_control.is_paused():
+            turn_control.raise_if_interrupted()
+            time.sleep(0.025)
 
-    use_warmup = _as_bool(_setting("inworld_tts_warmup", False), False)
-
-    session = requests.Session()
-    session.headers.update(headers)
+    def write(pcm):
+        nonlocal stream, written_at, total
+        for offset in range(0, len(pcm), max(2, int(rate * 0.025) * 2)):
+            check()
+            if stream is None:
+                stream = _AUDIO.open(format=pyaudio.paInt16, channels=1, rate=rate,
+                                     output=True, output_device_index=_output_device())
+                # The final duration is unknown while streaming. Existing typed
+                # captions use an estimate, completed when playback ends.
+                caption("audio_ready_with_duration", max(600, int(len(text) / 15 * 1000)))
+            block = pcm[offset:offset + max(2, int(rate * 0.025) * 2)]
+            stream.write(block)
+            total += len(block)
+            if written_at is None:
+                written_at = time.perf_counter()
+                Logger.turn_metric(f"InWorld first audio write: {written_at - started:.2f}s since speech request", turn_id)
+                if turn_started is not None:
+                    Logger.turn_metric(f"Turn to first assistant audio write: {written_at - turn_started:.2f}s", turn_id)
 
     try:
-        if use_warmup:
-            warmup_payload = dict(payload)
-            warmup_payload["text"] = "hi"
-            try:
-                session.post(url, json=warmup_payload, timeout=15)
-            except Exception:
-                pass
-
-        start_time = time.time()
-        ttfb = None
-        audio_bytes = bytearray()
-        event_count = 0
-
-        with session.post(url, json=payload, stream=True, timeout=90) as response:
-            response.raise_for_status()
-
-            for raw_line in response.iter_lines(decode_unicode=True):
-                if turn_control.is_interrupted():
-                    return None
-                if not raw_line:
-                    continue
-
-                line = raw_line.strip()
-                if line.startswith("data:"):
-                    line = line[len("data:"):].strip()
-
+        with requests.Session() as session:
+            with session.post("https://api.inworld.ai/tts/v1/voice:stream",
+                              headers={"Authorization": f"Basic {api_key}", "Content-Type": "application/json"},
+                              json=payload, stream=True, timeout=(10, 30)) as response:
+                response.raise_for_status()
+                response.encoding = "utf-8"
+                def blocks():
+                    nonlocal received_at, events
+                    # Consume available HTTP chunks without an extra fixed-size
+                    for raw in response.iter_lines(chunk_size=None, decode_unicode=True):
+                        if not raw:
+                            continue
+                        line = raw.strip()
+                        if line.startswith("data:"):
+                            line = line[5:].strip()
+                        if line == "[DONE]":
+                            break
+                        event = json.loads(line)
+                        if event.get("error"):
+                            raise RuntimeError(f"InWorld stream error: {event['error']}")
+                        audio = _extract_audio_from_event(event)
+                        if not audio:
+                            continue
+                        events += 1
+                        if received_at is None:
+                            received_at = time.perf_counter()
+                            Logger.turn_metric(f"InWorld first audio received: {received_at - started:.2f}s since speech request", turn_id)
+                        pcm = decoder.feed_event(audio)
+                        for offset in range(0, len(pcm), 4096):
+                            yield pcm[offset:offset + 4096]
+                    tail = decoder.finish()
+                    if tail:
+                        yield tail
+                incoming = prefetched(blocks(), check, response.close)
                 try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                chunk = _extract_audio_from_event(event)
-                if not chunk:
-                    continue
-
-                if ttfb is None:
-                    ttfb = time.time() - start_time
-
-                event_count += 1
-                audio_bytes.extend(chunk)
-
-        total_time = time.time() - start_time
-
-        if not audio_bytes:
-            Logger.warn("InWorld TTS returned no audio bytes.")
-            return None
-
-        audio_segment = _audio_segment_from_bytes(bytes(audio_bytes), payload)
-        _notify_captions(audio_segment)
-        _play_audio_segment(audio_segment)
-
-        return {
-            "ttfb": ttfb,
-            "total_time": total_time,
-            "audio_bytes": len(audio_bytes),
-            "events": event_count,
-            "voice_id": payload.get("voiceId"),
-            "model_id": payload.get("modelId"),
-            "duration_ms": len(audio_segment),
-        }
-
-    except requests.exceptions.RequestException as e:
-        Logger.warn(f"InWorld HTTP error: {e}")
-        if getattr(e, "response", None) is not None:
-            try:
-                Logger.warn(f"InWorld error details: {e.response.json()}")
-            except Exception:
-                Logger.warn(f"InWorld response text: {e.response.text}")
-        return None
-    except Exception as e:
-        Logger.warn(f"InWorld TTS failed: {e}")
-        return None
+                    for block in incoming:
+                        write(block)
+                finally:
+                    incoming.close()
+        if not total:
+            raise RuntimeError("InWorld returned no playable audio")
+        Logger.detail(f"InWorld stream: {events} audio events, {decoder.headers_removed} WAV headers removed")
+        completed = True
+        return {"ttfb": received_at - started, "total_time": time.perf_counter() - started,
+                "audio_bytes": total, "events": events, "duration_ms": total / (rate * 2) * 1000,
+                "voice_id": payload["voiceId"], "model_id": payload["modelId"]}
     finally:
-        session.close()
+        try:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                finally:
+                    stream.close()
+        finally:
+            if completed:
+                caption("finish_pending")
+            else:
+                caption("cancel_pending")
 
 
-async def stream_tts(api_key: Optional[str], text: str, voice_id: Optional[str] = None, model_id: Optional[str] = None):
+async def stream_tts(api_key, text, voice_id=None, model_id=None, *, turn_started=None, turn_id=None):
     api_key = api_key or check_api_key()
     if not api_key:
         return None
-
-    return await asyncio.to_thread(_stream_tts_sync, api_key, text, voice_id, model_id)
+    return await asyncio.to_thread(_stream_tts_sync, api_key, text, voice_id, model_id, turn_started, turn_id)
 
 
 def main():

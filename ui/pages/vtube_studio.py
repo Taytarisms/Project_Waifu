@@ -15,6 +15,7 @@ from files.vtube_studio.idle_animations import IDLE_PROFILES
 from files.main_loop import main_loop as app_loop
 from files.system_setup.settings import get_settings, save_settings, get_bool_setting
 from files.system_setup.json_utils import load_json_safe, write_json_atomic
+from files.llm.emotion_request import classification_provider, PROVIDERS, SAME_PROVIDER
 
 DEFAULT_ACTION_SLOTS = [
     "neutral", "happy", "sad", "angry", "confused",
@@ -81,6 +82,7 @@ class VTubeStudioPage(ctk.CTkFrame):
         self.slot_dropdowns = {}
         self._preserved_unavailable_entries = {}
         self._active_hotkey_test_future = None
+        self.advanced_editor = None
         self._page_active = False
         self._runtime_status_after_id = None
         ac = _load_autoconnect()
@@ -199,7 +201,7 @@ class VTubeStudioPage(ctk.CTkFrame):
         ctk.CTkButton(controls, text="Refresh Hotkeys", command=self.refresh_hotkeys_clicked).pack(side="left", padx=(0, 12), pady=12)
         ctk.CTkButton(controls, text="Register Parameters", command=self.register_params_clicked).pack(side="left", padx=(0, 12), pady=12)
         ctk.CTkButton(controls, text="Save Mapping", command=self.save_mapping_clicked).pack(side="left", padx=(0, 12), pady=12)
-        ctk.CTkButton(controls, text="Test First Mapped", command=self.test_selected_clicked).pack(side="left", padx=(0, 12), pady=12)
+        ctk.CTkButton(controls, text="Test Mapping", command=self.test_selected_clicked).pack(side="left", padx=(0, 12), pady=12)
         ctk.CTkButton(controls, text="Full Reset", command=self.full_reset_clicked, fg_color=getattr(theme, "DANGER", "#8b2f2f")).pack(side="left", padx=(0, 12), pady=12)
         port_row = ctk.CTkFrame(outer, fg_color=card_bg(), corner_radius=10)
         port_row.pack(fill="x", pady=(0, 18))
@@ -241,12 +243,23 @@ class VTubeStudioPage(ctk.CTkFrame):
         self._build_emotion_panel(scroll_container)
         self._build_idle_panel(scroll_container)
 
+        mode_row = ctk.CTkFrame(scroll_container, fg_color=card_bg())
+        mode_row.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(mode_row, text="Control mode", font=ctk.CTkFont(size=16, weight="bold")).pack(side="left", padx=12, pady=12)
+        self.control_mode_var = ctk.StringVar(value="Advanced" if self.manager.advanced_mode else "Simple")
+        self.control_mode_switch = ctk.CTkSegmentedButton(mode_row, values=["Simple", "Advanced"],
+            variable=self.control_mode_var, command=self._change_control_mode)
+        self.control_mode_switch.pack(side="left", padx=12, pady=12)
+        ctk.CTkLabel(mode_row, text="Simple: one hotkey per emotion. Advanced: multi-hotkey instances/idle anims.",
+                     wraplength=400, justify="left").pack(side="left", padx=12)
+
         mapping_panel = ctk.CTkFrame(
             scroll_container,
             fg_color=card_bg(),
             corner_radius=10,
         )
         mapping_panel.pack(fill="x", pady=(0, 4))
+        self.mapping_panel = mapping_panel
         ctk.CTkLabel(
             mapping_panel,
             text="Action Mapping",
@@ -256,6 +269,27 @@ class VTubeStudioPage(ctk.CTkFrame):
         self.mapping_frame = ctk.CTkFrame(mapping_panel, fg_color="transparent")
         self.mapping_frame.pack(fill="x", pady=(0, 8))
         self.mapping_frame.grid_columnconfigure(0, weight=1)
+
+    def _change_control_mode(self, label):
+        previous = "Advanced" if self.manager.advanced_mode else "Simple"
+        if self._hotkey_test_in_progress() or app_loop.is_turn_active():
+            self.control_mode_var.set(previous)
+            self._log("Wait for the current turn or preview before changing VTS mode.")
+            return
+        self.control_mode_switch.configure(state="disabled")
+        async def change():
+            try:
+                await self.manager.set_control_mode(label.lower())
+                self._ui(self.refresh_from_cache)
+                self._ui(lambda: self._log(f"VTS {label} mode enabled. Simple and advanced mappings are saved separately."))
+            except Exception as exc:
+                self._ui(lambda message=str(exc): self._log(f"Mode switch failed: {message}"))
+                self._ui(lambda: self.control_mode_var.set(previous))
+            finally:
+                self._ui(lambda: self.control_mode_switch.configure(state="normal"))
+        if not self._start_hotkey_test(change):
+            self.control_mode_switch.configure(state="normal")
+            self.control_mode_var.set(previous)
 
     def _on_port_change(self, new_port_str: str):
         try:
@@ -371,6 +405,7 @@ class VTubeStudioPage(ctk.CTkFrame):
             return
 
     def on_show(self):
+        self._on_classifier_provider_change(self.emotion_provider_var.get())
         if self._page_active:
             return
         self._page_active = True
@@ -401,7 +436,7 @@ class VTubeStudioPage(ctk.CTkFrame):
             emotion_frame,
             text=(
                 "Decide how the VTS expression is chosen after each reply. "
-                "LLM is most accurate but adds a second API call per turn; "
+                "LLM makes a separate classification request per turn; "
                 "Heuristic is keyword-based (free and instant); Off skips it entirely."
             ),
             text_color=theme.MUTED_TEXT,
@@ -434,6 +469,84 @@ class VTubeStudioPage(ctk.CTkFrame):
             text_color=theme.MUTED_TEXT,
         ).pack(side="left")
 
+        self.classifier_settings_expanded = False
+        self.classifier_settings_toggle = ctk.CTkButton(
+            emotion_frame, text="Show classifier settings", width=180,
+            command=self._toggle_classifier_settings)
+        self.classifier_settings_frame = ctk.CTkFrame(emotion_frame, fg_color="transparent")
+        self.emotion_model_drafts = {}
+        self.emotion_provider_var = ctk.StringVar(value=get_settings("vts_emotion_provider") or SAME_PROVIDER)
+        ctk.CTkLabel(self.classifier_settings_frame, text="Classification provider").pack(anchor="w", padx=12)
+        ctk.CTkOptionMenu(self.classifier_settings_frame, variable=self.emotion_provider_var,
+                         values=[SAME_PROVIDER, *PROVIDERS],
+                         command=self._on_classifier_provider_change).pack(anchor="w", padx=12, pady=6)
+        provider = classification_provider(self.emotion_provider_var.get())
+        self.emotion_model_label = ctk.CTkLabel(self.classifier_settings_frame, text=f"Classification model ({provider})", anchor="w")
+        self.emotion_model_label.pack(fill="x", padx=12)
+        self.emotion_model_provider = provider
+        self.emotion_model_var = ctk.StringVar(value=str(get_settings(f"vts_emotion_model_{provider.lower()}") or ""))
+        model_entry = ctk.CTkEntry(self.classifier_settings_frame, textvariable=self.emotion_model_var,
+                                   placeholder_text="Automatic (blank)")
+        model_entry.pack(fill="x", padx=12, pady=6)
+        self.emotion_model_entry = model_entry
+        if provider == "Local":
+            model_entry.configure(state="disabled")
+        ctk.CTkLabel(self.classifier_settings_frame, text=(
+            "Blank uses the selected provider's configured model; OpenAI ft: models use their base model. "
+            "Set that provider's credentials in LLM settings. Save to apply changes. "
+            "Local uses the loaded model. Classification has its own prompt and no chat history."),
+            wraplength=720, justify="left", text_color=theme.MUTED_TEXT).pack(anchor="w", padx=12)
+        ctk.CTkLabel(self.classifier_settings_frame, text="Classification generation budget (includes thinking)").pack(anchor="w", padx=12, pady=(8, 0))
+        self.emotion_budget_var = ctk.StringVar(value=str(get_settings("vts_emotion_max_tokens") or 4096))
+        ctk.CTkEntry(self.classifier_settings_frame, textvariable=self.emotion_budget_var).pack(anchor="w", padx=12, pady=6)
+        ctk.CTkButton(self.classifier_settings_frame, text="Save classification settings", command=self._save_classification_settings).pack(anchor="w", padx=12, pady=(0, 12))
+
+        self._refresh_classifier_settings_visibility()
+
+    def _toggle_classifier_settings(self):
+        self.classifier_settings_expanded = not self.classifier_settings_expanded
+        self._refresh_classifier_settings_visibility()
+
+    def _refresh_classifier_settings_visibility(self):
+        self.classifier_settings_frame.pack_forget()
+        self.classifier_settings_toggle.pack_forget()
+        if self._resolve_emotion_mode() != "llm":
+            self.classifier_settings_expanded = False
+            return
+        self.classifier_settings_toggle.configure(
+            text="Hide classifier settings" if self.classifier_settings_expanded else "Show classifier settings")
+        self.classifier_settings_toggle.pack(anchor="w", padx=12, pady=(0, 12))
+        if self.classifier_settings_expanded:
+            self.classifier_settings_frame.pack(fill="x")
+
+    def _on_classifier_provider_change(self, selection):
+        provider = classification_provider(selection)
+        if provider == self.emotion_model_provider:
+            return
+        self.emotion_model_drafts[self.emotion_model_provider] = self.emotion_model_var.get().strip()
+        self.emotion_model_provider = provider
+        self.emotion_model_label.configure(text=f"Classification model ({provider})")
+        self.emotion_model_entry.configure(state="disabled" if provider == "Local" else "normal")
+        self.emotion_model_var.set(self.emotion_model_drafts.get(provider,
+            str(get_settings(f"vts_emotion_model_{provider.lower()}") or "")))
+
+    def _save_classification_settings(self):
+        try:
+            budget = int(self.emotion_budget_var.get())
+            if not 64 <= budget <= 32768:
+                raise ValueError()
+        except ValueError:
+            self._log("Classification budget must be a whole number from 64 to 32768.")
+            return
+        self._on_classifier_provider_change(self.emotion_provider_var.get())
+        self.emotion_model_drafts[self.emotion_model_provider] = self.emotion_model_var.get().strip()
+        for provider, model in self.emotion_model_drafts.items():
+            if provider != "Local":
+                save_settings(f"vts_emotion_model_{provider.lower()}", model)
+        save_settings("vts_emotion_provider", self.emotion_provider_var.get())
+        save_settings("vts_emotion_max_tokens", budget)
+        self._log(f"Classification settings saved for {self.emotion_model_provider}.")
+
     @staticmethod
     def _resolve_emotion_mode() -> str:
         raw = get_settings("vts_emotion_mode")
@@ -464,6 +577,7 @@ class VTubeStudioPage(ctk.CTkFrame):
         save_settings("vts_emotion_mode", mode)
         save_settings("enable_vts_emotion_inference", mode != "off")
         self.emotion_mode_status_var.set(self._emotion_mode_status_text())
+        self._refresh_classifier_settings_visibility()
         self._log(f"Emotion inference set to: {mode}")
 
     def _build_idle_panel(self, parent):
@@ -774,6 +888,17 @@ class VTubeStudioPage(ctk.CTkFrame):
         self._ui(update_ui)
 
     def _build_mapping_rows(self, hotkey_names):
+        if self.manager.advanced_mode:
+            self.mapping_frame.pack_forget()
+            if self.advanced_editor is None:
+                from files.ui.components.vts_advanced import AdvancedVTSEditor
+                self.advanced_editor = AdvancedVTSEditor(self.mapping_panel, self, DEFAULT_ACTION_SLOTS)
+            self.advanced_editor.hotkey_menu.configure(values=hotkey_names or ["Refresh hotkeys first"])
+            self.advanced_editor.pack(fill="x")
+            return
+        if self.advanced_editor is not None:
+            self.advanced_editor.pack_forget()
+        self.mapping_frame.pack(fill="x", pady=(0, 8))
         for child in self.mapping_frame.winfo_children():
             child.destroy()
         self.slot_dropdowns.clear()
@@ -821,6 +946,9 @@ class VTubeStudioPage(ctk.CTkFrame):
         self._build_mapping_rows(hotkey_names)
 
     def save_mapping_clicked(self):
+        if self.manager.advanced_mode and self.advanced_editor is not None:
+            self.advanced_editor.save()
+            return
         if not self.manager.load_cached_hotkeys():
             self._log("Cannot save mappings until hotkeys have been refreshed for the current model.")
             return
@@ -850,6 +978,9 @@ class VTubeStudioPage(ctk.CTkFrame):
         self._log(f"Saved {mapped_count} VTS emotion mappings without changing advanced sequences.")
 
     def test_selected_clicked(self):
+        if self.manager.advanced_mode and self.advanced_editor is not None:
+            self.advanced_editor.preview()
+            return
         for slot, dropdown in self.slot_dropdowns.items():
             selected_name = dropdown.get()
             if selected_name and selected_name != "No cached hotkeys found" and selected_name != UNMAPPED_OPTION:

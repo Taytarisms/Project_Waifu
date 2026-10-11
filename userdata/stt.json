@@ -1,6 +1,6 @@
 {
     "stt_mode": "Push To Talk",
-    "stt_engine": "OpenAI Transcription",
+    "stt_engine": "Local Whisper",
     "stt_openai_model": "gpt-4o-transcribe",
     "stt_openai_chunk_seconds": 5.0,
     "stt_device_index": "1",
@@ -28,5 +28,9 @@
     "stt_device_preferred_patterns": "CABLE Output\nVB-Audio",
     "stt_pause_during_playback": true,
     "stt_partial_interval_ms": 500,
-    "stt_beam_size": 1
+    "stt_beam_size": 1,
+    "stt_openai_live_model": "gpt-live-transcribe",
+    "stt_openai_request_timeout": 20.0,
+    "stt_deepgram_model": "flux-general-en",
+    "stt_deepgram_eot_threshold": 0.7
 }

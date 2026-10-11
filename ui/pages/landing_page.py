@@ -9,7 +9,7 @@ import uuid
 from files.ui.components.LabelMaker import ChatBubble
 from files.system_setup.system_logger import Logger
 from files.speech_to_text import stt_controls
-from files.system_setup.settings import save_settings, get_settings
+from files.system_setup.settings import save_settings, get_settings, get_bool_setting
 from files.ui.components.quota_checker import ActiveProviderStatusBar
 from files.ui.components.VisionPanel import VisionPanel
 from files.ui.components.captionpreviewpanel import CaptionPreviewPanel
@@ -69,6 +69,9 @@ class ConsolePage(ctk.CTkFrame):
         self.app = app
         self.turn_logs = {}
         self._open_log_close_fn = None
+        self._follow_chat = True
+        self._chat_scroll_after_id = None
+        self._card_anchor = None
         self.max_turn_logs = 50
         self.max_rendered_chat_items = 240
         self._rendered_chat_items = []
@@ -100,6 +103,11 @@ class ConsolePage(ctk.CTkFrame):
         ).pack(side="left", padx=(12, 0), pady=(8, 0))
 
         status_strip = ctk.CTkFrame(shell, fg_color="transparent")
+        self.collab_enabled_var = ctk.BooleanVar(value=get_bool_setting("COLLAB_ENABLED", default=False))
+        ctk.CTkSwitch(
+            title_row, text="Collab On / Off", variable=self.collab_enabled_var,
+            command=self._toggle_collab,
+        ).pack(side="right", padx=(12, 0))
         status_strip.pack(fill="x", pady=(0, 12))
         self.llm_status_chip = self._status_chip(
             status_strip, "LLM", lambda: self.app.show_page("LLM")
@@ -134,9 +142,14 @@ class ConsolePage(ctk.CTkFrame):
             font=ctk.CTkFont(size=12),
         )
         self.conversation_state_label.pack(side="right")
+        self.new_activity_button = ctk.CTkButton(
+            conversation_header, text="New activity ↓", width=112, height=26,
+            command=self._jump_to_latest,
+        )
 
         self.chat_frame = AppScrollableFrame(
             left,
+            on_user_scroll=self._on_chat_scroll,
             fg_color="#0e141b",
             corner_radius=8,
         )
@@ -227,6 +240,14 @@ class ConsolePage(ctk.CTkFrame):
         self._build_tools_view(self.tools_view)
         self.rail_selector.set("Session")
         self._show_rail_view("Session")
+
+    def _toggle_collab(self):
+        from files.main_loop.main_loop import set_collab_enabled
+        try:
+            set_collab_enabled(self.collab_enabled_var.get())
+        except Exception as exc:
+            self.collab_enabled_var.set(get_bool_setting("COLLAB_ENABLED", default=False))
+            Logger.warn(f"Could not change Collab setting ({type(exc).__name__}).")
 
     def _status_chip(self, parent, label, command):
         chip = ctk.CTkButton(
@@ -679,7 +700,13 @@ class ConsolePage(ctk.CTkFrame):
 
     def clear_chat_display(self):
         for widget in self.chat_frame.winfo_children():
+            cleanup = getattr(widget, "_before_chat_trim", None)
+            if callable(cleanup):
+                cleanup()
             widget.destroy()
+        self._follow_chat = True
+        self._card_anchor = None
+        self.new_activity_button.pack_forget()
         self._rendered_chat_items.clear()
         self.turn_logs.clear()
         self._external_turns_started.clear()
@@ -807,7 +834,7 @@ class ConsolePage(ctk.CTkFrame):
             try:
                 response = resp_q.get(timeout=180)
                 def render():
-                    self.add_bubble(self._current_ai_name(), response, "ai")
+                    self.finish_stream_answer(turn_id, response)
                     self.append_turn_log(turn_id)
                 self.after(150, render)
             except queue.Empty:
@@ -866,7 +893,30 @@ class ConsolePage(ctk.CTkFrame):
         anchor = "e" if bubble_role in ("user", "twitch", "youtube", "kick", "external") else "w"
         bubble.pack(anchor=anchor, padx=10, pady=5)
         self._track_chat_item(bubble)
-        self.after(150, self._scroll_chat_to_bottom)
+        self._chat_activity_added()
+        return bubble
+
+    def stream_answer(self, turn_id, speaker, text):
+        if turn_id not in self.turn_logs:
+            return  # Ignore callbacks from before a chat reset.
+        if not hasattr(self, "_stream_bubbles"):
+            self._stream_bubbles = {}
+        bubble = self._stream_bubbles.get(turn_id)
+        if bubble is None:
+            bubble = self.add_bubble(speaker, text, "ai")
+            self._stream_bubbles[turn_id] = bubble
+            bubble._before_chat_trim = lambda: self._stream_bubbles.pop(turn_id, None)
+        else:
+            bubble.label.configure(text=f"{speaker}: {text}" if speaker else text)
+            self._chat_activity_added()
+
+    def finish_stream_answer(self, turn_id, response):
+        bubble = getattr(self, "_stream_bubbles", {}).pop(turn_id, None)
+        if bubble is not None:
+            bubble.label.configure(text=f"{bubble.sender}: {response}")
+            self._chat_activity_added()
+        else:
+            self.add_bubble(self._current_ai_name(), response, "ai")
 
     def _track_chat_item(self, widget):
         self._rendered_chat_items.append(widget)
@@ -901,11 +951,13 @@ class ConsolePage(ctk.CTkFrame):
         if turn_id not in self._external_turns_started:
             self._external_turns_started.add(turn_id)
             self.turn_logs.setdefault(turn_id, [])
-        self.add_bubble(self._current_ai_name(), response or "", "ai")
+        self.finish_stream_answer(turn_id, response or "")
         self.append_turn_log(turn_id)
 
     def destroy(self):
         self.on_hide()
+        if self._chat_scroll_after_id is not None:
+            self.after_cancel(self._chat_scroll_after_id)
         Logger.unbind_ui()
         super().destroy()
 
@@ -925,12 +977,43 @@ class ConsolePage(ctk.CTkFrame):
             self._monitor_after_id = None
 
     def _scroll_chat_to_bottom(self):
-        try:
-            canvas = self.chat_frame._parent_canvas
-            if canvas.yview()[1] >= 0.85:
-                canvas.yview_moveto(1.0)
-        except Exception:
-            pass
+        self._chat_scroll_after_id = None
+        if self._follow_chat:
+            self.chat_frame._parent_canvas.yview_moveto(1.0)
+
+    def _on_chat_scroll(self):
+        canvas = self.chat_frame._parent_canvas
+        bounds = canvas.bbox("all")
+        height = bounds[3] - bounds[1] if bounds else 0
+        self._follow_chat = (1.0 - canvas.yview()[1]) * height <= 24
+        self._card_anchor = None
+        if self._follow_chat:
+            self.new_activity_button.pack_forget()
+
+    def _chat_activity_added(self):
+        if self._follow_chat:
+            if self._chat_scroll_after_id is not None:
+                self.after_cancel(self._chat_scroll_after_id)
+            self._chat_scroll_after_id = self.after(50, self._scroll_chat_to_bottom)
+        else:
+            self.new_activity_button.pack(side="right", padx=10)
+
+    def _jump_to_latest(self):
+        self._follow_chat = True
+        self._card_anchor = None
+        self.new_activity_button.pack_forget()
+        self._chat_activity_added()
+
+    def _restore_card_anchor(self):
+        anchor = self._card_anchor
+        if anchor is None or not anchor[0].winfo_exists():
+            return
+        canvas = self.chat_frame._parent_canvas
+        canvas.update_idletasks()
+        delta = anchor[0].winfo_rooty() - anchor[1]
+        bounds = canvas.bbox("all")
+        if bounds and bounds[3] > bounds[1]:
+            canvas.yview_moveto(canvas.yview()[0] + delta / (bounds[3] - bounds[1]))
 
     def log_status(self, text, turn_id=None):
         if turn_id and turn_id in self.turn_logs:
@@ -1030,19 +1113,33 @@ class ConsolePage(ctk.CTkFrame):
         self.queue_box.insert("0.0", "\n".join(lines))
         self.queue_box.configure(state="disabled")
 
+    def show_memory_summary(self, payload):
+        seen = getattr(self, "_displayed_summary_ids", set())
+        if payload["id"] in seen:
+            return
+        seen.add(payload["id"])
+        self._displayed_summary_ids = seen
+        self._append_activity_card(
+            f"Memory summary · {payload['count']} older interactions",
+            payload["text"], summary=True)
+
     def append_turn_log(self, turn_id):
         turn_logs = list(self.turn_logs.get(turn_id, []))
         if not turn_logs:
             return
+        self._append_activity_card(
+            f"Turn Logs ({len(turn_logs)})",
+            "\n".join(f"> {m.strip()}" for m in turn_logs if m.strip()))
+
+    def _append_activity_card(self, title, text, *, summary=False):
         group = ctk.CTkFrame(self.chat_frame, fg_color="transparent")
         group.pack(fill="x", padx=10, pady=4)
-        count = len(turn_logs)
         header = ctk.CTkButton(
             group,
-            text=f"> Turn Logs ({count})",
-            fg_color="#182430",
-            hover_color="#223348",
-            text_color=theme.MUTED_TEXT,
+            text=f"> {title}",
+            fg_color="#293852" if summary else "#182430",
+            hover_color="#364d70" if summary else "#223348",
+            text_color="#c4d8ff" if summary else theme.MUTED_TEXT,
             anchor="w",
         )
         header.pack(fill="x")
@@ -1054,46 +1151,43 @@ class ConsolePage(ctk.CTkFrame):
             text_color=theme.MUTED_TEXT,
             wrap="word",
         )
-        body.insert("0.0", "\n".join(f"> {m.strip()}" for m in turn_logs if m.strip()))
+        body.insert("0.0", text)
         body.configure(state="disabled")
 
         state = {"open": False, "animating": False}
 
         def close_this_log():
-            if state["open"] and not state["animating"]:
+            if state["open"]:
                 state["open"] = False
                 state["animating"] = True
-                header.configure(text=f"> Turn Logs ({count})")
+                header.configure(text=f"> {title}")
                 self.after(16, lambda: _animate_close(body, step=12))
 
         def _animate_open(widget, target, step):
-            if not state["animating"]:
+            if not state["animating"] or not state["open"] or not widget.winfo_exists():
                 return
-            canvas = self.chat_frame._parent_canvas
-            scroll_pos = canvas.yview()[0]
             current = widget.cget("height")
-            next_h = min(current + step, target)
+            next_h = min(current + max(4, int((target - current) * 0.35)), target)
             widget.configure(height=next_h)
-            canvas.yview_moveto(scroll_pos)
+            self._restore_card_anchor()
             if next_h < target:
                 self.after(16, lambda: _animate_open(widget, target, step))
             else:
                 state["animating"] = False
 
         def _animate_close(widget, step):
-            if not state["animating"]:
+            if not state["animating"] or state["open"] or not widget.winfo_exists():
                 return
-            canvas = self.chat_frame._parent_canvas
-            scroll_pos = canvas.yview()[0]
             current = int(widget.cget("height"))
-            next_h = max(current - step, 0)
+            next_h = max(current - max(4, int(current * 0.35)), 0)
             widget.configure(height=next_h)
-            canvas.yview_moveto(scroll_pos)
+            self._restore_card_anchor()
             if next_h > 0:
                 self.after(16, lambda: _animate_close(widget, step))
             else:
                 widget.pack_forget()
                 widget.configure(height=0)
+                self._restore_card_anchor()
                 state["animating"] = False
 
                 if self._open_log_close_fn == close_this_log:
@@ -1102,6 +1196,9 @@ class ConsolePage(ctk.CTkFrame):
         def toggle():
             if state["animating"]:
                 return
+
+            self._follow_chat = False
+            self._card_anchor = (header, header.winfo_rooty())
 
             if not state["open"]:
                 if self._open_log_close_fn and self._open_log_close_fn != close_this_log:
@@ -1112,12 +1209,22 @@ class ConsolePage(ctk.CTkFrame):
             state["open"] = not state["open"]
             state["animating"] = True
 
-            header.configure(text=f"{'˅' if state['open'] else '>'} Turn Logs ({count})")
+            header.configure(text=f"{'˅' if state['open'] else '>'} {title}")
 
             if state["open"]:
                 body.configure(height=0)
                 body.pack(fill="x", pady=(4, 0))
-                self.after(16, lambda: _animate_open(body, target=120, step=12))
+                target = 120
+                if summary:
+                    # Measure wrapped display lines at the actual card width, not
+                    # source newlines; CTk height is in unscaled logical pixels.
+                    body.update_idletasks()
+                    from tkinter import font as tkfont
+                    lines = body._textbox.count("1.0", "end-1c", "displaylines")
+                    line_count = (lines[0] if lines else 0) + 1
+                    line_height = tkfont.Font(font=body._textbox.cget("font")).metrics("linespace")
+                    target = max(48, min(240, int(body._reverse_widget_scaling(line_count * line_height + 20))))
+                self.after(16, lambda: _animate_open(body, target=target, step=12))
             else:
                 if self._open_log_close_fn == close_this_log:
                     self._open_log_close_fn = None
@@ -1132,4 +1239,4 @@ class ConsolePage(ctk.CTkFrame):
 
         group._before_chat_trim = before_trim
         self._track_chat_item(group)
-        self.after(150, self._scroll_chat_to_bottom)
+        self._chat_activity_added()

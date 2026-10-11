@@ -29,7 +29,7 @@ class GrokSettingsPage(ctk.CTkFrame):
 
         self.model_var       = ctk.StringVar(value=self._setting("grok_model",       "grok-4.5"))
         self.temperature_var = ctk.DoubleVar(value=float(self._setting("grok_temperature", 1.0)))
-        self.max_tokens_var  = ctk.DoubleVar(value=float(self._setting("grok_max_tokens",  1024)))
+        self.max_tokens_var  = ctk.DoubleVar(value=float(self._setting("grok_max_tokens",  4096)))
         self.reasoning_effort_var = ctk.StringVar(
             value=self._setting("grok_reasoning_effort", "medium")
         )

@@ -1,5 +1,7 @@
 from datetime import datetime
 from pathlib import Path
+import queue
+import threading
 import customtkinter as ctk
 
 from files.ui.components.scrolling import AppScrollableFrame
@@ -54,11 +56,17 @@ class StreamChatPage(LegacyTwitchPage):
         self._page_active = False
         self._chat_paused = bool(get_settings("STREAM_CHAT_PAUSED"))
         self.policy_var = ctk.StringVar(value=self.hub.policy)
+        self.cooldown_var = ctk.BooleanVar(value=self.hub.cooldown_enabled)
+        self.cooldown_seconds_var = ctk.StringVar(value=f"{self.hub.cooldown_seconds:g}")
         self.paused_var = ctk.BooleanVar(value=self._chat_paused)
         self.ignore_commands_var = ctk.BooleanVar(
             value=get_bool_setting("STREAM_CHAT_IGNORE_COMMANDS", default=False)
         )
         self.channel_var = ctk.StringVar(value=get_auth("twitch", "channel_name") or "")
+        self.redeem_only_var = ctk.BooleanVar(value=get_bool_setting("TWITCH_REDEEM_ONLY", default=False))
+        self.input_reward_var = ctk.StringVar(value=get_settings("TWITCH_INPUT_REWARD_ID") or "")
+        self._reward_choices = {}
+        self._reward_loading = False
         self.youtube_video_var = ctk.StringVar(value=get_settings("YOUTUBE_VIDEO_ID") or "")
         self.youtube_auto_var = ctk.BooleanVar(value=bool(get_settings("YOUTUBE_AUTO_CONNECT")))
         self.youtube_monitor_var = ctk.BooleanVar(value=bool(get_settings("YOUTUBE_AUTO_MONITOR")))
@@ -302,6 +310,16 @@ class StreamChatPage(LegacyTwitchPage):
         ).pack(anchor="w", padx=14, pady=(12, 6))
 
         policy_row = ctk.CTkFrame(card, fg_color="transparent")
+        cooldown_row = ctk.CTkFrame(card, fg_color="transparent")
+        cooldown_row.pack(fill="x", padx=14, pady=6)
+        ctk.CTkSwitch(cooldown_row, text="Universal cooldown", variable=self.cooldown_var,
+                      command=self._save_cooldown).pack(side="left")
+        ctk.CTkEntry(cooldown_row, textvariable=self.cooldown_seconds_var, width=75).pack(side="left", padx=8)
+        ctk.CTkLabel(cooldown_row, text="seconds").pack(side="left")
+        ctk.CTkButton(cooldown_row, text="Apply", width=65, command=self._save_cooldown).pack(side="left", padx=8)
+        self.cooldown_status = ctk.CTkLabel(card, text="Shared by all providers and events; wait begins after each AI turn.",
+                                           text_color=theme.MUTED_TEXT, wraplength=420)
+        self.cooldown_status.pack(anchor="w", padx=14)
         policy_row.pack(fill="x", padx=14, pady=4)
         ctk.CTkLabel(policy_row, text="Message policy", width=150, anchor="w", text_color=theme.TEXT).pack(side="left")
         ctk.CTkComboBox(
@@ -370,6 +388,22 @@ class StreamChatPage(LegacyTwitchPage):
         )
 
         connection = ctk.CTkFrame(parent, fg_color=theme.CARD_BG, corner_radius=8)
+        rewards = ctk.CTkFrame(parent, fg_color=theme.CARD_BG, corner_radius=8)
+        rewards.pack(fill="x", pady=5)
+        ctk.CTkSwitch(rewards, text="Twitch redeem-only AI input", variable=self.redeem_only_var,
+                      command=self._save_redeem_mode).pack(anchor="w", padx=14, pady=8)
+        ctk.CTkLabel(rewards, text="Choose the reward viewers use to talk to the AI").pack(anchor="w", padx=14)
+        self.reward_choice = ctk.CTkComboBox(rewards, values=["Load rewards to choose"], state="readonly",
+                                            command=self._select_input_reward)
+        self.reward_choice.pack(fill="x", padx=14, pady=5)
+        self.reward_choice.set("Saved reward — load to view name" if self.input_reward_var.get() else "Load rewards to choose")
+        self.load_rewards_button = ctk.CTkButton(rewards, text="Load Twitch Rewards", command=self._load_twitch_rewards)
+        self.load_rewards_button.pack(anchor="w", padx=14, pady=5)
+        ctk.CTkEntry(rewards, textvariable=self.input_reward_var, state="readonly").pack(fill="x", padx=14, pady=5)
+        ctk.CTkButton(rewards, text="Save Reward Settings", command=self._save_redeem_mode).pack(anchor="e", padx=14)
+        self.reward_status = ctk.CTkLabel(rewards, wraplength=430,
+            text="Require viewer text on the Twitch reward. Only its redeems reach the AI while enabled; other Twitch events stay visible. YouTube/Kick are unchanged.")
+        self.reward_status.pack(fill="x", padx=14, pady=8)
         connection.pack(fill="x", pady=5)
         ctk.CTkLabel(
             connection,
@@ -681,7 +715,100 @@ class StreamChatPage(LegacyTwitchPage):
         get_kick_provider().start()
         self.refresh_platform_status()
 
+    def _load_twitch_rewards(self):
+        if self._reward_loading:
+            return
+        from files.twitch_chat.rewards import fetch_rewards
+        owner = str(get_auth("twitch", "owner_id") or "")
+        token = get_auth("twitch", "channel_access_token") or ""
+        if not token and owner and owner == str(get_auth("twitch", "bot_id") or ""):
+            token = get_auth("twitch", "access_token") or ""
+        client = get_auth("twitch", "client_id") or ""
+        results = queue.Queue(maxsize=1)
+        self._reward_loading = True
+        self.load_rewards_button.configure(state="disabled")
+        self.reward_status.configure(text="Loading rewards from Twitch...")
+        def worker():
+            try:
+                results.put((fetch_rewards(client, owner, token), None))
+            except Exception as exc:
+                results.put(([], str(exc) if isinstance(exc, ValueError) else "Unable to load rewards. Please try again."))
+        threading.Thread(target=worker, daemon=True, name="twitch-rewards").start()
+        def poll():
+            try:
+                items, error = results.get_nowait()
+            except queue.Empty:
+                self.after(100, poll)
+                return
+            self._reward_loading = False
+            self.load_rewards_button.configure(state="normal")
+            if owner != str(get_auth("twitch", "owner_id") or ""):
+                self.reward_status.configure(text="Broadcaster changed. Load rewards again.")
+                return
+            if error:
+                self.reward_status.configure(text=error)
+                return
+            self._reward_choices = {}
+            for index, item in enumerate(items, 1):
+                note = "" if item.get("is_user_input_required") else " — text input disabled"
+                if not item.get("is_enabled", True):
+                    note += " — reward disabled"
+                label = f"{index}. {item.get('title', 'Unnamed reward')} ({item.get('cost', 0)} points){note}"
+                self._reward_choices[label] = item
+            labels = list(self._reward_choices)
+            self.reward_choice.configure(values=labels or ["No rewards found"])
+            selected = next((label for label, item in self._reward_choices.items()
+                             if item.get("id") == self.input_reward_var.get()), None)
+            self.reward_choice.set(selected or "Choose a reward" if labels else "No rewards found")
+            self.reward_status.configure(text="Choose a reward requiring viewer text, then Save Reward Settings."
+                                         if labels else "No custom rewards found. Create a Channel Points reward in Twitch with viewer text required, then reload.")
+        self.after(100, poll)
+
+    def _select_input_reward(self, label):
+        reward = self._reward_choices.get(label)
+        if not reward:
+            return
+        if not reward.get("is_user_input_required") or not reward.get("is_enabled", True):
+            self.reward_status.configure(text="Enable this reward and Require Viewer to Enter Text in Twitch, then reload rewards.")
+            self.input_reward_var.set("")
+            return
+        self.input_reward_var.set(str(reward["id"]))
+        self.reward_status.configure(text="Reward selected. Save Reward Settings to apply.")
+
+    def _save_redeem_mode(self):
+        import uuid
+        reward_id = self.input_reward_var.get().strip()
+        enabled = bool(self.redeem_only_var.get())
+        if enabled:
+            try:
+                reward_id = str(uuid.UUID(reward_id))
+            except ValueError:
+                self.redeem_only_var.set(get_bool_setting("TWITCH_REDEEM_ONLY", default=False))
+                self.reward_status.configure(text="Load Twitch Rewards and select a reward requiring viewer text first.")
+                return
+        save_settings("TWITCH_INPUT_REWARD_ID", reward_id)
+        save_settings("TWITCH_REDEEM_ONLY", enabled)
+        self.input_reward_var.set(reward_id)
+        self.reward_status.configure(text="Redeem-only enabled. Requires broadcaster redemption authorization; shared cooldown applies. No automatic refunds."
+                                     if enabled else "Redeem-only disabled. Normal Twitch AI input restored.")
+
+    def _save_cooldown(self):
+        try:
+            # Switching off must work even if the seconds field is unfinished.
+            seconds = self.cooldown_seconds_var.get() if self.cooldown_var.get() else self.hub.cooldown_seconds
+            self.hub.set_cooldown(self.cooldown_var.get(), seconds)
+            self.cooldown_seconds_var.set(f"{self.hub.cooldown_seconds:g}")
+            self.cooldown_status.configure(text=(f"On: wait {self.hub.cooldown_seconds:g}s after each stream-chat turn."
+                                                if self.hub.cooldown_enabled else "Off: no additional wait between stream-chat turns."))
+            return True
+        except (ValueError, TypeError):
+            self.cooldown_var.set(self.hub.cooldown_enabled)
+            self.cooldown_status.configure(text="Enter a positive, finite number of seconds.")
+            return False
+
     def save_shared_settings(self):
+        if not self._save_cooldown():
+            return
         ignored = self.ignored_prefixes_box.get("0.0", "end-1c").strip()
         policy = self.hub.set_policy(self.policy_var.get())
         save_settings("STREAM_CHAT_IGNORE_COMMANDS", bool(self.ignore_commands_var.get()))

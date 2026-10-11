@@ -5,7 +5,7 @@ import uuid
 from itertools import count
 from threading import RLock, Thread
 
-from files.system_setup.settings import get_auth, get_settings
+from files.system_setup.settings import get_auth, get_settings, get_bool_setting
 from files.system_setup.system_logger import Logger
 from files.system_setup.networking import configure_dns
 from files.stream_chat import StreamChatEvent, StreamChatMessage, get_stream_chat_hub
@@ -312,6 +312,9 @@ class Bot(_commands.Bot):
         if getattr(chatter, "is_first", False):
             _push_event("first_msg", author)
         reward = getattr(payload, "channel_points_custom_reward_id", None)
+        if get_bool_setting("TWITCH_REDEEM_ONLY", default=False):
+            # Display chat, but EventSub is the sole source of AI input here.
+            return
         if reward:
             reward_title = getattr(getattr(payload, "channel_points_custom_reward", None), "title", "Channel Point Reward")
             _push_event("redemption", author, reward_title)
@@ -394,6 +397,25 @@ class Bot(_commands.Bot):
                 or "Channel Point Reward"
             )
 
+            if get_bool_setting("TWITCH_REDEEM_ONLY", default=False):
+                hub = get_stream_chat_hub()
+                hub.emit_event(StreamChatEvent(provider="twitch", event_type="redemption",
+                                               username=username, detail=reward_title))
+                reward_id = str(getattr(reward, "id", "") or "")
+                selected = str(get_settings("TWITCH_INPUT_REWARD_ID") or "").strip()
+                text = str(getattr(payload, "user_input", "") or "").strip()
+                redemption_id = str(getattr(payload, "id", "") or "")
+                if not selected or reward_id != selected or not text or not redemption_id:
+                    return
+                item = StreamChatMessage(
+                    provider="twitch", native_id=f"redemption:{redemption_id}",
+                    author_name=username, author_id=str(getattr(user, "id", "") or ""),
+                    text=text, priority=True, kind="message", event_type="input_redemption",
+                    raw={"reward_id": reward_id},
+                )
+                # Shared queue handles duplicate IDs, moderation and cooldown.
+                hub.enqueue(item)
+                return
             _push_event("redemption", username, reward_title)
             Logger.notify(f"Redemption user={username!r} reward={reward_title!r}")
 

@@ -66,7 +66,7 @@ def build_openai_tts_request(text: str, model: str, voice: str) -> dict:
     return request
 
 
-def openai_tts(text, model: str, voice: str):
+def openai_tts(text, model: str, voice: str, *, prepare_only=False):
     client = get_openai_tts_client()
     speech_file_path = _OUTPUT_DIR / f"speech_{uuid.uuid4().hex}.mp3"
     try:
@@ -75,6 +75,9 @@ def openai_tts(text, model: str, voice: str):
         ) as response:
             response.stream_to_file(speech_file_path)
             print("File Saved!")
+
+        if prepare_only:
+            return AudioSegment.from_mp3(speech_file_path)
 
         try:
             from files.closed_captions import caption_coordinator

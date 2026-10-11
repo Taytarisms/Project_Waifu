@@ -52,9 +52,6 @@ class _OAuthCallback(http.server.BaseHTTPRequestHandler):
 
 
 def _create_oauth_callback_server(expected_state: str) -> http.server.HTTPServer:
-    # This must remain synchronous. ThreadingHTTPServer.handle_request() returns
-    # before its handler thread has stored the callback, which races the state
-    # check in _authorize_worker.
     server = http.server.HTTPServer(("localhost", 0), _OAuthCallback)
     server.oauth_expected_state = expected_state
     server.oauth_result = {}
