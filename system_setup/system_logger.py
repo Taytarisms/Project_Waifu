@@ -1,5 +1,13 @@
 import sys
+from collections import deque
 from datetime import datetime, timezone
+from files.ui.dispatch import post
+
+
+def performance_logging_enabled():
+    """Follow the live Collab switch; do not cache it across turns."""
+    from files.system_setup.settings import get_bool_setting
+    return get_bool_setting("COLLAB_ENABLED", default=False)
 
 ## Creates instances of colored text for the terminal and makes things more noticeable/readable.
 ## As well as ensuring that you know what you get from logging from basic prints to error logging.
@@ -7,7 +15,7 @@ from datetime import datetime, timezone
 
 class Logger:
     ui_ref = None
-    log_buffer = []
+    log_buffer = deque(maxlen=5000)
     current_turn_id = None
 
     @classmethod
@@ -23,7 +31,7 @@ class Logger:
         ui = cls.ui_ref
         if ui is not None and turn_id:
             try:
-                ui.after(0, lambda: ui.stream_answer(turn_id, speaker, text))
+                post(ui, ui.stream_answer, turn_id, speaker, text)
             except Exception:
                 pass
 
@@ -33,16 +41,20 @@ class Logger:
 
     @classmethod
     def turn_metric(cls, text, turn_id):
+        if not performance_logging_enabled():
+            return
         cls.quiet_print(text)
         ui = cls.ui_ref
         if ui is not None and turn_id:
             try:
-                ui.after(0, lambda: ui.log_status(text, turn_id))
+                post(ui, ui.log_status, text, turn_id)
             except Exception:
                 pass
 
     @classmethod
     def detail(cls, text):
+        if not performance_logging_enabled():
+            return
         cls.quiet_print(text)
         try:
             from files.ui.pages.logs import LogManager
@@ -57,7 +69,7 @@ class Logger:
             payload = {"id": summary["id"], "text": summary["text"],
                        "count": len(summary.get("turn_ids", [])),
                        "created_at": summary.get("created_at")}
-            ui.after(0, lambda: ui.show_memory_summary(payload))
+            post(ui, ui.show_memory_summary, payload)
 
     @classmethod
     def unbind_ui(cls):
@@ -109,7 +121,8 @@ class Logger:
     def _forward_to_ui(cls, result):
         if cls.ui_ref is not None:
             try:
-                cls.ui_ref.after(0,lambda r=result, tid=cls.current_turn_id: cls.ui_ref.log_status(r, tid))
+                ui = cls.ui_ref
+                post(ui, ui.log_status, result, cls.current_turn_id)
             except Exception as e:
                 sys.stdout.write(f"[Logger UI bind failed] {e}\n")
 

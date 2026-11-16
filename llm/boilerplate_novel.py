@@ -46,7 +46,7 @@ except Exception:
 
 PROJECT_ROOT  = Path(__file__).resolve().parent.parent
 CHARACTER_DIR = PROJECT_ROOT / "characters"
-DEFAULT_CHARACTER = "Abby"
+DEFAULT_CHARACTER = ""
 
 NAI_OA_MODELS = {"xialong-v1", "glm-4-6"}
 NAI_LEGACY_MODELS = {"kayra", "erato", "clio"}
@@ -158,7 +158,9 @@ def clean_history_content(text: str) -> str:
 def _safe_character_name(name: str | None = None) -> str:
     name = (name or "").strip()
     if not name or name.lower() == "none":
-        return DEFAULT_CHARACTER
+        raise ValueError("Select a NovelAI character and click 'Use this character' before chatting.")
+    if Path(name).name != name or "/" in name or "\\" in name:
+        raise ValueError("NovelAI character must be a filename in the characters folder.")
     return name.removesuffix(".json")
 
 def load_character(name: str | None = DEFAULT_CHARACTER) -> dict:
@@ -166,20 +168,34 @@ def load_character(name: str | None = DEFAULT_CHARACTER) -> dict:
     path = CHARACTER_DIR / f"{name}.json"
 
     if not path.exists():
-        Logger.warn(f"Character file not found: {path}")
-        return {}
+        raise ValueError(f"NovelAI character file '{path.name}' is missing. Select an existing character and click 'Use this character'.")
 
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            card = json.load(f)
+            if not isinstance(card, dict) or not card:
+                raise ValueError("Character card must be a non-empty JSON object.")
+            return card
     except Exception as e:
-        Logger.error(f"Failed to load character {name}: {e}")
-        return {}
+        raise ValueError(f"Failed to load character {name}: {e}") from e
 
 def load_char_name(character_key: str | None = DEFAULT_CHARACTER) -> str:
     character_key = _safe_character_name(character_key)
     character = load_character(character_key)
     return character.get("char_name") or character.get("name") or character_key or "Assistant"
+
+
+def history_for_character(conversation: dict, character_key: str) -> list[dict]:
+    selected = _safe_character_name(character_key).casefold()
+    history = []
+    for turn in conversation.get('turns', []):
+        if str(turn.get('character_key') or '').casefold() != selected:
+            continue
+        history.extend([
+            {'role': 'user', 'speaker': turn.get('speaker') or 'User', 'content': turn['user']},
+            {'role': 'assistant', 'speaker': turn.get('assistant_speaker') or 'Assistant', 'content': turn['assistant']},
+        ])
+    return history
 
 
 def legacy_model(parameters):
@@ -502,6 +518,10 @@ class NovelAIClient:
         history_override: Optional[List[HistoryEntry]] = None,
         memory_context: str = "",
     ) -> str:
+        character_key = _safe_character_name(character_name).casefold()
+        if getattr(self, '_history_character', None) != character_key:
+            self.clear_history()
+            self._history_character = character_key
         self.trim_history(max_history_turns)
 
         model_key = (model_name or "kayra").lower()
@@ -513,6 +533,13 @@ class NovelAIClient:
             system_text = "\n\n".join(filter(None, [system_text, memory_context]))
 
         if model_key in NAI_OA_MODELS:
+            card = normalize_character_card(load_character(character_name))
+            profile = "\n".join(filter(None, [
+                f"You are {card['name']}. Stay in character.",
+                card['persona'], card['personality'],
+                f"Example dialogue:\n{card['example_dialogue']}" if card['example_dialogue'] else "",
+            ]))
+            system_text = "\n\n".join(filter(None, [profile, system_text]))
             reply = await self.generate_openai_compatible(
                 user_text=user_text,
                 parameters=parameters,

@@ -14,7 +14,7 @@ def public_exchange(turn, assistant_name="Assistant"):
             "assistant_speaker": clean(turn.get("assistant_speaker")) or assistant_name or "Assistant",
             "user": user, "assistant": assistant,
             **{key: clean(turn.get(key)) for key in
-               ("source", "provider", "model", "session_id", "created_at")}}
+               ("source", "provider", "model", "session_id", "created_at", "character_key")}}
 
 
 def exchange_messages(turn):

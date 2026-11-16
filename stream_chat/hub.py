@@ -11,6 +11,7 @@ from files.stream_chat.models import ProviderStatus, StreamChatEvent, StreamChat
 from files.stream_chat.policies import normalize_policy, select_next
 from files.system_setup.settings import get_bool_setting, get_settings, save_settings
 from files.system_setup.system_logger import Logger
+from files.ui.dispatch import post
 
 _STREAM_PROVIDERS = {"twitch", "youtube", "kick"}
 _LOCAL_IGNORE_PATH = Path(__file__).resolve().parents[1] / "twitch_chat" / "blacklist.txt"
@@ -124,7 +125,7 @@ class StreamChatHub:
             return
         try:
             if hasattr(page, "push_stream_message"):
-                page.after(0, page.push_stream_message, message)
+                post(page, page.push_stream_message, message)
             elif message.provider == "twitch" and hasattr(page, "push_chat_message"):
                 tags = {
                     "color": "",
@@ -133,7 +134,7 @@ class StreamChatHub:
                     "badges": "broadcaster" if message.role == "broadcaster" else "",
                     "user-id": message.author_id,
                 }
-                page.after(0, page.push_chat_message, message.author_name, tags, message.text)
+                post(page, page.push_chat_message, message.author_name, tags, message.text)
         except Exception as exc:
             Logger.warn(f"Failed rendering {message.provider} chat: {exc}")
 
@@ -148,9 +149,9 @@ class StreamChatHub:
             return True
         try:
             if hasattr(page, "push_stream_event"):
-                page.after(0, page.push_stream_event, event)
+                post(page, page.push_stream_event, event)
             elif event.provider == "twitch" and hasattr(page, "push_event"):
-                page.after(0, page.push_event, event.event_type, event.username, event.detail)
+                post(page, page.push_event, event.event_type, event.username, event.detail)
         except Exception as exc:
             Logger.warn(f"Failed rendering {event.provider} event: {exc}")
         return True
@@ -379,7 +380,7 @@ class StreamChatHub:
         callbacks = list(self._queue_listeners)
         page = self._ui_page
         if page is not None and hasattr(page, "refresh_queue_panel"):
-            callbacks.append(lambda: page.after(0, page.refresh_queue_panel))
+            callbacks.append(lambda: post(page, page.refresh_queue_panel))
         for callback in callbacks:
             try:
                 callback()
@@ -390,7 +391,7 @@ class StreamChatHub:
         callbacks = list(self._status_listeners)
         page = self._ui_page
         if page is not None and hasattr(page, "refresh_platform_status"):
-            callbacks.append(lambda: page.after(0, page.refresh_platform_status))
+            callbacks.append(lambda: post(page, page.refresh_platform_status))
         for callback in callbacks:
             try:
                 callback()

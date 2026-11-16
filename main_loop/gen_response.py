@@ -8,7 +8,7 @@ from files.system_setup.system_logger import Logger
 from files.ui.pages.logs import LogManager
 
 from files.llm.openai_llm import open_response
-from files.llm.boilerplate_novel import NovelAIClient
+from files.llm.boilerplate_novel import NovelAIClient, history_for_character
 from files.llm.grok import grok_response
 from files.llm.claude import claude_response
 from files.llm.gemini import gemini_response
@@ -212,12 +212,11 @@ def _novelai_character_name() -> str:
     raw = (
         character
         or get_settings("active_novelai_character")
-        or get_settings("character_name")
         or ""
     )
     name = str(raw or "").strip()
     if not name or name.lower() in ("none", "character", "default"):
-        return "Abby"
+        return ""
     return name.removesuffix(".json")
 
 def set_character(name: str | None) -> None:
@@ -746,14 +745,10 @@ async def send_user_text(user_text: str, conversation: dict | None = None, on_ev
 
     if current_chat_model == "NovelAI":
         Logger.quiet_print(user_text)
-        if conversation is not None and "turns" in conversation:
-            history = []
-            for turn in conversation["turns"]:
-                history.extend([
-                    {"role": "user", "speaker": turn.get("speaker") or "User", "content": turn["user"]},
-                    {"role": "assistant", "speaker": turn.get("assistant_speaker") or "Assistant", "content": turn["assistant"]},
-                ])
-            notes = "Earlier conversation notes (historical data):\n" + "\n".join(conversation.get("summaries", [])) if conversation.get("summaries") else ""
+        selected_character = character_key or _novelai_character_name()
+        # Shared summaries/untagged historical turns may describe another persona although not a set piece given a persona change.
+        history = history_for_character(conversation, selected_character) if managed_memory else None
+        notes = ""
         api_token = get_auth("novelai", "token") or get_settings("NOVELAI_TOKEN")
         novel_model = get_settings("NOVELAI_MODEL") or get_settings("novel_model") or "xialong-v1"
         if novel_client is None:
@@ -778,7 +773,7 @@ async def send_user_text(user_text: str, conversation: dict | None = None, on_ev
                     "banlist_mode": get_settings("novel_banlist_mode") or "soft",
                 },
                 model_name=novel_model,
-                character_name=character_key or _novelai_character_name(),
+                character_name=selected_character,
                 user_name=speaker,
                 route=get_settings("novel_generation_route") or "high",
                 preserve_context=managed_memory,

@@ -23,6 +23,7 @@ from files.closed_captions import clear_caption, caption_coordinator, SOURCE_NAR
 from files.vtube_studio.hotkeys import VTSHotkeyManager
 from files.system_setup.system_logger import Logger
 from files.ui.pages.logs import LogManager
+from files.ui.dispatch import post
 from files import client as cc
 from files.main_loop.collab_lifecycle import CollabLifecycle
 
@@ -120,7 +121,7 @@ def save_context(turns: list[dict]) -> None:
         Logger.warn(f"Failed to save conversation context: {e}")
 
 def _remember_completed_turn(*, source: str, speaker: str, user_text: str, assistant_text: str,
-                             generation=None, assistant_name="Assistant") -> None:
+                             generation=None, assistant_name="Assistant", character_key="") -> None:
     user_text = (user_text or "").strip()
     assistant_text = (assistant_text or "").strip()
     if not user_text or not assistant_text:
@@ -134,6 +135,7 @@ def _remember_completed_turn(*, source: str, speaker: str, user_text: str, assis
         "id": str(uuid.uuid4()),
         "session_id": _ledger_session_id,
         "assistant_speaker": assistant_name or "Assistant",
+        "character_key": character_key or "",
         "provider": getattr(generation, "provider", ""),
         "model": getattr(generation, "model", ""),
         "source": source or "chat",
@@ -271,7 +273,7 @@ def turn_start(source: str, turn_id: str | None, speaker: str, text: str) -> Non
     if ui is None or not hasattr(ui, "outside_chat"):
         return
     try:
-        ui.after(0, ui.outside_chat, turn_id, speaker, text, source)
+        post(ui, ui.outside_chat, turn_id, speaker, text, source)
     except Exception as e:
         Logger.warn(f"Failed to render {source} turn start: {e}")
 
@@ -282,7 +284,7 @@ def turn_finish(source: str, turn_id: str | None, response: Optional[str]) -> No
     if ui is None or not hasattr(ui, "outside_chat_finish"):
         return
     try:
-        ui.after(0, ui.outside_chat_finish, turn_id, response or "", source)
+        post(ui, ui.outside_chat_finish, turn_id, response or "", source)
     except Exception as e:
         Logger.warn(f"Failed to render {source} turn finish: {e}")
 
@@ -303,7 +305,7 @@ def publish_reasoning(turn_id: str | None, result) -> None:
         "usage": dict(getattr(result, "usage", {}) or {}),
     }
     try:
-        ui.after(0, ui.show_reasoning, payload)
+        post(ui, ui.show_reasoning, payload)
     except Exception as e:
         Logger.warn(f"Failed to render model reasoning: {e}")
 
@@ -498,6 +500,11 @@ async def main_loop():
         else:
             message, needs_llm, resp_q, meta = raw, True, None, {}
 
+        if isinstance(meta, dict) and meta.get("source") == "collab" and not _collab_lifecycle.active:
+            finish_turn(resp_q, "Input skipped because Collab is disabled.")
+            message_queue.task_done()
+            continue
+
         turn_id = (meta or {}).get("turn_id")
         Logger.set_turn_id(turn_id)
         gen_response.clear_interrupt()
@@ -574,10 +581,6 @@ async def main_loop():
             llm_start = time.perf_counter()
             turn_assistant_name = get_settings("character_name") or "Assistant"
             novel_character_key = None
-            if current_chat_model == "NovelAI":
-                from files.llm.boilerplate_novel import load_char_name
-                novel_character_key = gen_response._novelai_character_name()
-                turn_assistant_name = load_char_name(novel_character_key)
             stream_text = ""
             stream_updated = 0.0
             def on_generation_event(event):
@@ -598,6 +601,10 @@ async def main_loop():
                         Logger.stream_answer(turn_id, turn_assistant_name, stream_text)
                         stream_updated = time.perf_counter()
             try:
+                if current_chat_model == "NovelAI":
+                    from files.llm.boilerplate_novel import load_char_name
+                    novel_character_key = gen_response._novelai_character_name()
+                    turn_assistant_name = load_char_name(novel_character_key)
                 conversation = prepare_conversation_input(llm_input)
                 if conversation is None:
                     llm_input = prepend_contetx(llm_input)
@@ -673,6 +680,7 @@ async def main_loop():
                 assistant_text=response or "",
                 generation=generation,
                 assistant_name=turn_assistant_name,
+                character_key=novel_character_key,
             )
             if (
                 is_vts_ready()
@@ -717,11 +725,14 @@ async def main_loop():
                 turn_control.raise_if_interrupted()
                 stt_suspended = _suspend_stt_for_playback()
                 try:
-                    Logger.print("[Collab] Starting reply TTS; send remains deferred until end of turn.")
+                    if _collab_lifecycle.active:
+                        Logger.print("[Collab] Starting reply TTS; send remains deferred until end of turn.")
                     playback = await gen_response.speak(response, turn_started=execution_start_time)
-                    Logger.print("[Collab] TTS returned; waiting for reply playback to finish.")
+                    if _collab_lifecycle.active:
+                        Logger.print("[Collab] TTS returned; waiting for reply playback to finish.")
                     await _wait_for_playback(playback)
-                    Logger.print("[Collab] Reply playback wait completed; proceeding with end-of-turn cleanup.")
+                    if _collab_lifecycle.active:
+                        Logger.print("[Collab] Reply playback wait completed; proceeding with end-of-turn cleanup.")
                 except turn_control.TurnInterrupted:
                     raise
                 except Exception as e:
@@ -773,16 +784,14 @@ async def main_loop():
             else:
                 Logger.print(f"Total Generation Time: {execution_time:.2f} seconds ({total_execution_time:.0f} ms)")
             _log_perf("Total turn generation", total_execution_time,  detail=f"{turn_detail}, response_chars={len(response or '')}")
-            Logger.print("[Collab] End-of-turn cleanup reached caption clearing.")
+            if _collab_lifecycle.active:
+                Logger.print("[Collab] End-of-turn cleanup reached caption clearing.")
             await clear_caption()
             turn_finish(msg_source, turn_id, response)
             finish_turn(resp_q, response)
             try:
-                Logger.print(
-                    f"[Collab] Sending at end of turn: connected={collab_client.connected}, "
-                    f"characters={len(response or '')}."
-                )
                 if _collab_lifecycle.active and response and response.strip():
+                    Logger.print(f"[Collab] Sending at end of turn: characters={len(response)}.")
                     collab_client.send_text(response)
                     Logger.print("[Collab] Send call completed (not a peer delivery acknowledgement).")
             except Exception as send_error:

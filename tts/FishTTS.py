@@ -23,6 +23,9 @@ PCM_FORMAT = pyaudio.paInt16
 CHANNELS = 2
 RATE = 24000
 _CAPTION_CHARS_PER_SEC = 15.0
+_PLAYBACK_STALL_SECONDS = 15.0
+_REQUEST_TIMEOUT_SECONDS = 180.0
+_playback_guard = threading.Lock()
 
 FISH_TOKEN = get_auth("fishspeech", "token")
 MODEL = "s2-pro"
@@ -50,7 +53,9 @@ def normalize_model(value: Optional[str]) -> str:
     return normalized
 
 
-def playback(pcm_queue: queue.Queue, started_at: Optional[float] = None):
+def playback(pcm_queue: queue.Queue, started_at: Optional[float] = None, *, stop=None, progress=None):
+    stop = stop or threading.Event()
+    progress = progress if progress is not None else [time.monotonic()]
     p = pyaudio.PyAudio()
     stream = None
     first_write = True
@@ -64,13 +69,14 @@ def playback(pcm_queue: queue.Queue, started_at: Optional[float] = None):
             output_device_index=OUTPUT_DEVICE,
         )
         while True:
-            chunk = pcm_queue.get()
+            if stop.is_set() or turn_control.is_interrupted():
+                return
             try:
-                if chunk is None or turn_control.is_interrupted():
-                    return
-                while turn_control.is_paused() and not turn_control.is_interrupted():
-                    time.sleep(0.05)
-                if turn_control.is_interrupted():
+                chunk = pcm_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if chunk is None or stop.is_set() or turn_control.is_interrupted():
                     return
                 if first_write:
                     first_write = False
@@ -79,7 +85,14 @@ def playback(pcm_queue: queue.Queue, started_at: Optional[float] = None):
                             "FishSpeech playback started in "
                             f"{(time.perf_counter() - started_at) * 1000:.0f} ms"
                         )
-                stream.write(chunk)
+                for offset in range(0, len(chunk), CHUNK_DATA):
+                    while turn_control.is_paused() and not turn_control.is_interrupted() and not stop.is_set():
+                        progress[0] = time.monotonic()
+                        stop.wait(0.05)
+                    if stop.is_set() or turn_control.is_interrupted():
+                        return
+                    stream.write(chunk[offset:offset + CHUNK_DATA])
+                    progress[0] = time.monotonic()
             finally:
                 pcm_queue.task_done()
 
@@ -101,7 +114,10 @@ async def _close_stdin(proc) -> None:
         if not writer.is_closing():
             writer.close()
     with contextlib.suppress(BrokenPipeError, ConnectionResetError, RuntimeError):
-        await writer.wait_closed()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def _stop_process(proc) -> None:
@@ -115,7 +131,7 @@ async def _stop_process(proc) -> None:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
             with contextlib.suppress(Exception):
-                await proc.wait()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
     await asyncio.sleep(0)
 
 
@@ -334,11 +350,23 @@ async def fish_stream(
             with contextlib.suppress(Exception):
                 stderr_data = await stderr_task
 
+async def _wait_playback(thread, stop, progress):
+    while thread.is_alive():
+        if turn_control.is_interrupted():
+            stop.set()
+        if time.monotonic() - progress[0] > _PLAYBACK_STALL_SECONDS:
+            stop.set()
+            raise RuntimeError('FishSpeech audio device stopped responding. Check the output device; restart the app if it remains busy.')
+        await asyncio.sleep(0.05)
+
+
 async def run_tts(message: str, voice_id: Optional[str] = None):
     if turn_control.is_interrupted():
         return
     if not (get_auth("fishspeech", "token") or FISH_TOKEN):
         raise RuntimeError("FishSpeech API token is missing.")
+    if not _playback_guard.acquire(blocking=False):
+        raise RuntimeError('FishSpeech playback is already running or its audio device is still blocked.')
     try:
         from files.closed_captions import caption_coordinator
         est_ms = max(500, int(len(message or "") / _CAPTION_CHARS_PER_SEC * 1000))
@@ -349,33 +377,45 @@ async def run_tts(message: str, voice_id: Optional[str] = None):
     started_at = time.perf_counter()
     pcm_queue = queue.Queue()
     playback_errors = []
+    stop = threading.Event()
+    progress = [time.monotonic()]
 
     def playback_worker():
         try:
-            playback(pcm_queue, started_at)
+            playback(pcm_queue, started_at, stop=stop, progress=progress)
         except Exception as exc:
             playback_errors.append(exc)
+        finally:
+            _playback_guard.release()
 
     playback_thread = threading.Thread(
         target=playback_worker,
         daemon=True,
         name="fishspeech_playback",
     )
-    playback_thread.start()
     try:
-        await fish_stream(
-            message=message,
-            voice_id=voice_id,
-            pcm_queue=pcm_queue,
-            started_at=started_at,
-        )
+        playback_thread.start()
+    except BaseException:
+        _playback_guard.release()
+        raise
+    try:
+        async with asyncio.timeout(_REQUEST_TIMEOUT_SECONDS):
+            await fish_stream(
+                message=message,
+                voice_id=voice_id,
+                pcm_queue=pcm_queue,
+                started_at=started_at,
+            )
+    except asyncio.CancelledError:
+        stop.set()
+        raise
     except Exception as exc:
+        stop.set()
         Logger.error(f"FishSpeech TTS failed: {exc}")
         raise
     finally:
         pcm_queue.put(None)
-        if playback_thread.is_alive():
-            await asyncio.to_thread(playback_thread.join)
+        await _wait_playback(playback_thread, stop, progress)
 
     if playback_errors:
         raise RuntimeError(f"FishSpeech playback failed: {playback_errors[0]}")
