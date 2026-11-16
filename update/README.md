@@ -55,7 +55,9 @@ For a custom prompt stored elsewhere or with a different extension, pass
 Stable release updates additionally protect `system_setup/update_app.py` and
 the entire `update/` directory, so choosing an older release cannot downgrade
 the newer updater infrastructure. A release/tag label must also match the
-`APP_VERSION` inside its source archive. Mismatched release metadata is rejected
+`APP_VERSION` inside its source archive. For the `Patch-09` release, both the
+GitHub tag and `APP_VERSION` must be `Patch-09`. Create that tag from the commit
+containing these changes. Mismatched release metadata is rejected
 instead of risking a mixed-version installation.
 
 ## Command-line recovery

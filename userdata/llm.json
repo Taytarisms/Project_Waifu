@@ -1,5 +1,5 @@
 {
-    "chat_model": "OpenAI",
+    "chat_model": "NovelAI",
     "openai_model": "gpt-4.1-nano",
     "openai_temperature": 0.7,
     "openai_max_tokens": 392,
@@ -12,7 +12,7 @@
     "novel_max_tokens": 512,
     "novel_top_p": 0.9,
     "novel_top_k": 50,
-    "active_novelai_character": "character",
+    "active_novelai_character": "Tay",
     "NOVELAI_MODEL": "kayra",
     "max_output_length": "150",
     "temperature": "0.8",
