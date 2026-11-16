@@ -1,5 +1,6 @@
 import customtkinter as ctk
 from files.ui import theme
+from files.ui.dispatch import post
 from files.closed_captions import (
     caption_controls,
     subscribe,
@@ -59,7 +60,7 @@ class CaptionPreviewPanel(ctk.CTkFrame):
 
     def _on_caption_changed(self, text: str) -> None:
         try:
-            self.after(0, lambda: self._apply_caption(text))
+            post(self, self._apply_caption, text)
         except Exception:
             pass
 

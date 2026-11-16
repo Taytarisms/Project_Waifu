@@ -5,6 +5,7 @@ from typing import Optional
 
 import customtkinter as ctk
 import requests
+from files.ui.dispatch import post
 
 try:
     from files.ui import theme
@@ -133,13 +134,11 @@ class _BaseCard(ctk.CTkFrame):
         except Exception as exc:
             self._set_status(f"Error: {exc}", DANGER)
         finally:
-            if self._alive():
-                self.after(0, lambda: self._refresh_btn.configure(state="normal") if self._alive() else None)
+            post(self, lambda: self._refresh_btn.configure(state="normal") if self._alive() else None)
             self._stamp()
 
     def _set_status(self, text: str, color: str = TEXT):
-        if self._alive():
-            self.after(0, lambda: self._status.configure(text=text, text_color=color) if self._alive() else None)
+        post(self, lambda: self._status.configure(text=text, text_color=color) if self._alive() else None)
 
     def _set_progress(self, value: float, color: Optional[str] = None):
         c = color or _pct_color(value)
@@ -149,17 +148,14 @@ class _BaseCard(ctk.CTkFrame):
             self._bar.set(value)
             self._bar.configure(progress_color=c)
             self._bar.pack(fill="x", padx=14, pady=(2, 12))
-        if self._alive():
-            self.after(0, _apply)
+        post(self, _apply)
 
     def _hide_progress(self):
-        if self._alive():
-            self.after(0, lambda: self._bar.pack_forget() if self._alive() else None)
+        post(self, lambda: self._bar.pack_forget() if self._alive() else None)
 
     def _stamp(self):
         ts = time.strftime("%H:%M:%S")
-        if self._alive():
-            self.after(0, lambda: self._ts_label.configure(text=f"Last updated {ts}") if self._alive() else None)
+        post(self, lambda: self._ts_label.configure(text=f"Last updated {ts}") if self._alive() else None)
 
     def _set_dot(self, color: str): pass
 
@@ -268,19 +264,15 @@ class _MiniCard(ctk.CTkFrame):
             self._fetch()
         except Exception as exc:
             self._set_status(f"Error: {exc}", DANGER)
-            if self._alive():
-                self.after(0, lambda: self._dot.configure(text_color=DANGER) if self._alive() else None)
+            post(self, lambda: self._dot.configure(text_color=DANGER) if self._alive() else None)
         finally:
-            if self._alive():
-                self.after(0, lambda: self._refresh_btn.configure(state="normal") if self._alive() else None)
+            post(self, lambda: self._refresh_btn.configure(state="normal") if self._alive() else None)
 
     def _set_status(self, text: str, color: str = TEXT):
-        if self._alive():
-            self.after(0, lambda: self._status.configure(text=text, text_color=color) if self._alive() else None)
+        post(self, lambda: self._status.configure(text=text, text_color=color) if self._alive() else None)
 
     def _set_dot(self, color: str):
-        if self._alive():
-            self.after(0, lambda: self._dot.configure(text_color=color) if self._alive() else None)
+        post(self, lambda: self._dot.configure(text_color=color) if self._alive() else None)
 
     def _set_progress(self, value: float, color: Optional[str] = None):
         c = color or _pct_color(value)
@@ -290,12 +282,10 @@ class _MiniCard(ctk.CTkFrame):
             self._bar.set(value)
             self._bar.configure(progress_color=c)
             self._bar.pack(fill="x", padx=10, pady=(0, 8))
-        if self._alive():
-            self.after(0, _apply)
+        post(self, _apply)
 
     def _hide_progress(self):
-        if self._alive():
-            self.after(0, lambda: self._bar.pack_forget() if self._alive() else None)
+        post(self, lambda: self._bar.pack_forget() if self._alive() else None)
 
     def _stamp(self): pass
 

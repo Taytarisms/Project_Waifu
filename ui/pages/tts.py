@@ -5,6 +5,7 @@ from files.ui.components.scrolling import AppScrollableFrame
 from tkinter import filedialog
 import threading
 import asyncio
+from files.ui.dispatch import post
 
 from files.ui import theme
 from files.ui.components.cards import ProviderCard
@@ -531,7 +532,7 @@ class TTSProviderPage(ctk.CTkFrame):
                 message = f"Test speak completed for {provider_name}."
             except Exception as e:
                 message = f"Test speak failed: {e}"
-            self.after(0, self._set_test_status, message)
+            post(self, self._set_test_status, message)
 
         threading.Thread(target=runner, daemon=True).start()
 

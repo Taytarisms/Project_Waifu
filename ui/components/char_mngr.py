@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 import customtkinter as ctk
 from files.ui import theme
+from files.system_setup.settings import get_settings, save_settings
 
 
 class NovelAICharacterManager(ctk.CTkFrame):
@@ -67,6 +68,13 @@ class NovelAICharacterManager(ctk.CTkFrame):
             command=self.delete_character,
         ).grid(row=1, column=1, padx=2, pady=2, sticky="ew")
 
+        ctk.CTkButton(
+            btn_row, text="Use this character", command=self.activate_character
+        ).grid(row=2, column=0, columnspan=2, padx=2, pady=2, sticky="ew")
+        self.active_label = ctk.CTkLabel(btn_row, text="", text_color=theme.MUTED_TEXT)
+        self.active_label.grid(row=3, column=0, columnspan=2, sticky="w")
+        self._refresh_active_label()
+
         row = 3
         for key, label in self.FIELDS.items():
             ctk.CTkLabel(
@@ -105,10 +113,38 @@ class NovelAICharacterManager(ctk.CTkFrame):
         files = sorted(self.characters_dir.glob("*.json"))
         return [file.name for file in files] or ["No characters found"]
 
+    def _refresh_active_label(self):
+        active = str(get_settings("active_novelai_character") or "").removesuffix(".json")
+        if active.lower() in ("", "none", "character", "default"):
+            self.active_label.configure(text="Active: none — choose a character")
+        else:
+            missing = " (file missing)" if not (self.characters_dir / f"{active}.json").is_file() else ""
+            self.active_label.configure(text=f"Active: {active}{missing}")
+
+    def activate_character(self):
+        path = self._selected_path()
+        try:
+            if path is None:
+                raise ValueError("Choose a saved character first.")
+            from files.llm.boilerplate_novel import load_character
+            load_character(path.stem)
+            save_settings("active_novelai_character", path.stem)
+            from files.main_loop import gen_response
+            gen_response.set_character(None)
+            if gen_response.novel_client is not None:
+                gen_response.novel_client.clear_history()
+        except Exception as exc:
+            self.status_label.configure(text=f"Could not activate: {exc}")
+            return
+        self._refresh_active_label()
+        self.status_label.configure(text=f"Active: {path.name}. Saved card used; unsaved edits are not applied.")
+
     def _selected_path(self):
         name = self.character_var.get().strip()
 
         if name in ("", "Select character", "No characters found"):
+            return None
+        if Path(name).name != name or "/" in name or "\\" in name:
             return None
 
         if not name.endswith(".json"):
@@ -234,6 +270,10 @@ class NovelAICharacterManager(ctk.CTkFrame):
 
         deleted_name = path.name
         path.unlink()
+        active = str(get_settings("active_novelai_character") or "").removesuffix(".json")
+        if active.casefold() == path.stem.casefold():
+            save_settings("active_novelai_character", "")
+        self._refresh_active_label()
 
         self.clear_form()
         self._loaded_path = None

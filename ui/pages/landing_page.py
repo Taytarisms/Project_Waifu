@@ -8,6 +8,7 @@ import threading
 import uuid
 from files.ui.components.LabelMaker import ChatBubble
 from files.system_setup.system_logger import Logger
+from files.ui.dispatch import post
 from files.speech_to_text import stt_controls
 from files.system_setup.settings import save_settings, get_settings, get_bool_setting
 from files.ui.components.quota_checker import ActiveProviderStatusBar
@@ -836,12 +837,12 @@ class ConsolePage(ctk.CTkFrame):
                 def render():
                     self.finish_stream_answer(turn_id, response)
                     self.append_turn_log(turn_id)
-                self.after(150, render)
+                post(self, render)
             except queue.Empty:
                 def render_timeout():
                     self.log_status("No response returned before timeout.", turn_id=turn_id)
                     self.append_turn_log(turn_id)
-                self.after(150, render_timeout)
+                post(self, render_timeout)
         threading.Thread(target=wait_for_response, daemon=True).start()
 
     def send_message(self):
@@ -870,7 +871,7 @@ class ConsolePage(ctk.CTkFrame):
                 source="stt",
             )
 
-        self.after(0, update_ui)
+        post(self, update_ui)
 
     def toggle_finetune_sampling(self):
         enabled = bool(self.finetune_sampling_var.get())
@@ -1049,7 +1050,7 @@ class ConsolePage(ctk.CTkFrame):
                 psutil.disk_usage("/").percent,
                 self.get_gpu_usage(),
             )
-            self.after(0, lambda values=sample: self._apply_resource_usage(values))
+            post(self, self._apply_resource_usage, sample)
         except Exception:
             self._monitor_sample_in_flight = False
 

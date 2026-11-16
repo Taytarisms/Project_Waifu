@@ -13,6 +13,9 @@ configure_dns()
 import multiprocessing
 import threading
 import customtkinter as ctk
+from files.ui.dispatch import install
+from files.system_setup.runtime_diagnostics import RuntimeDiagnostics
+from files.system_setup.app_version import APP_VERSION
 
 from files.ui import theme
 from files.ui.components.navigation import TopNav
@@ -118,8 +121,9 @@ class WaifuCenter(ctk.CTk):
     def __init__(self):
         super().__init__()
         self._closing = False
+        self._ui_dispatcher = install(self)
 
-        self.title("Project Waifu!")
+        self.title(f"Project Waifu! - {APP_VERSION}")
         self.geometry("1180x760")
         self.minsize(1160, 700)
         self.configure(fg_color=theme.APP_BG)
@@ -211,17 +215,46 @@ class WaifuCenter(ctk.CTk):
         self._closing = True
         self._call_page_hook(self.dynamic_page, "on_hide")
         self._call_page_hook(self.pages.get(self.active_page_name), "on_hide")
-        _cleanup_backend()
-        self.destroy()
+        finished = threading.Event()
+        def cleanup():
+            try:
+                _cleanup_backend()
+            finally:
+                finished.set()
+        threading.Thread(target=cleanup, name="app-shutdown", daemon=True).start()
+        def poll():
+            if finished.is_set():
+                self.destroy()
+            else:
+                self.after(100, poll)
+        poll()
+
+    def report_callback_exception(self, exc_type, exc_value, exc_traceback):
+        import traceback
+        from files.ui.pages.logs import LogManager
+        LogManager.record("EXCEPTION", ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback)))
+
+    def destroy(self):
+        self._ui_dispatcher.close()
+        super().destroy()
 
 
 def main():
     multiprocessing.freeze_support()
     ctk.set_appearance_mode("dark")
 
-    app = WaifuCenter()
-    app.bootstrap_backend()
-    app.mainloop()
+    diagnostics = RuntimeDiagnostics()
+    try:
+        app = WaifuCenter()
+        diagnostics.attach(app)
+        print(f"Runtime diagnostics: {diagnostics.path}")
+        app.bootstrap_backend()
+        app.mainloop()
+    except BaseException:
+        diagnostics.exception('MAIN_EXCEPTION', *sys.exc_info())
+        raise
+    finally:
+        diagnostics.close()
 
 
 if __name__ == "__main__":

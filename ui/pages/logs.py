@@ -9,6 +9,8 @@ from datetime import datetime, date
 from typing import Optional
 import customtkinter as ctk
 from files.ui import theme
+from files.system_setup.system_logger import performance_logging_enabled
+from files.ui.dispatch import post
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 LOG_DIR  = ROOT_DIR / "logs"
@@ -58,29 +60,31 @@ class UILogStream:
         self.original_stream = original_stream
         self.callback = callback
         self.level = level
-        self.buffer = ""
+        self._state = threading.local()
 
     def write(self, text):
         self.original_stream.write(text)
         self.original_stream.flush()
         if not text:
-            return
-        self.buffer += text
-        while "\n" in self.buffer:
-            line, self.buffer = self.buffer.split("\n", 1)
+            return 0
+        buffer = getattr(self._state, 'buffer', '') + text
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
             line = line.strip()
             if line:
                 try:
                     self.callback(self.level, line)
                 except Exception:
                     pass
+        self._state.buffer = buffer
+        return len(text)
 
     def flush(self):
         self.original_stream.flush()
 
 class LogManager:
     _lock = threading.Lock()
-    _recording = False
+    _state = threading.local()
     _viewer: Optional["LogsPage"] = None
 
     @classmethod
@@ -96,6 +100,8 @@ class LogManager:
     @classmethod
     def perf(cls, label: str, *, duration_ms: float | None = None,
              detail: str = ""):
+        if not performance_logging_enabled():
+            return
         parts = [label]
         if duration_ms is not None:
             parts.append(f"{duration_ms:.1f} ms")
@@ -113,10 +119,9 @@ class LogManager:
 
     @classmethod
     def record(cls, level: str, text: str):
-        with cls._lock:
-            if cls._recording:
-                return
-            cls._recording = True
+        if getattr(cls._state, 'recording', False):
+            return
+        cls._state.recording = True
 
         try:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -126,7 +131,7 @@ class LogManager:
             path = _log_path(cat)
 
             try:
-                with path.open("a", encoding="utf-8") as fh:
+                with cls._lock, path.open("a", encoding="utf-8") as fh:
                     fh.write(entry)
             except OSError:
                 pass  # last resort iff anything, we're gonna do nothing!
@@ -134,14 +139,13 @@ class LogManager:
             viewer = cls._viewer
             if viewer is not None:
                 try:
-                    viewer.after(0, lambda c=cat, e=entry, v=viewer: v._on_new_entry(c, e))
+                    post(viewer, viewer._on_new_entry, cat, entry)
                 except RuntimeError:
                     pass
                 except Exception:
                     pass
         finally:
-            with cls._lock:
-                cls._recording = False
+            cls._state.recording = False
 
     @classmethod
     def set_viewer(cls, viewer: "LogsPage"):
