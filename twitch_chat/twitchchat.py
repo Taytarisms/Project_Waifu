@@ -7,6 +7,7 @@ from threading import RLock, Thread
 
 from files.system_setup.settings import get_auth, get_settings, get_bool_setting
 from files.system_setup.system_logger import Logger
+from files.ui.dispatch import post
 from files.system_setup.networking import configure_dns
 from files.stream_chat import StreamChatEvent, StreamChatMessage, get_stream_chat_hub
 from twitchio.ext import commands as _commands
@@ -84,7 +85,7 @@ def _push_queue_update() -> None:
     page = _ui_page
     if page is not None and hasattr(page, "refresh_queue_panel"):
         try:
-            page.after(0, page.refresh_queue_panel)
+            post(page, page.refresh_queue_panel)
         except Exception:
             pass
 
