@@ -6,6 +6,9 @@
 I will to the best of my abilities create mini-README's so that you can set-up the program as *you* need it
 as well as setting up some more complicated things like the VTubeStudio integration or Multi-Platform setups.
 
+Link to the original video:
+https://youtu.be/XPfJxWVGhZw
+
 ## Overview
 Project Waifu is a project made for people to use as an on-stream companion or personal use offline companion!
 - Host your own AI Vtuber stream. The AI can respond to stream chat on up to three different platforms with integrations in place for Twitch, YouTube and Kick!
